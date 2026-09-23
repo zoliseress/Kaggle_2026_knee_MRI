@@ -1,0 +1,46 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Python: Train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/train.py",
+            // "args": [],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${fileDirname}",
+            "purpose": [
+                "debug-in-terminal"
+            ]
+        },
+        {
+            "name": "Python: Metric Calculator",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/metric_calculator/evaluate_labeling_metrics.py",
+            "args": [
+                "--predictions","f:/Kaggle/llm_labeling/output/GT_v1/runs/19acf5be8b9faed41b518b5bf788198f34ff1282aa6f064334ee385ae626a511/labels_predictions.csv",
+                "--reference","f:/Kaggle/llm_labeling/input/train_labeled_58_reference.csv",
+                "--statuses", "f:/Kaggle/llm_labeling/output/GT_v1/runs/19acf5be8b9faed41b518b5bf788198f34ff1282aa6f064334ee385ae626a511/labels_statuses.csv",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "purpose": [
+                "debug-in-terminal"
+            ]
+        },
+    ],
+}

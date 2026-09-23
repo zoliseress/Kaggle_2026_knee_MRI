@@ -1,0 +1,20 @@
+# Verified with Python 3.11 on Windows (conda env: kaggle_2026).
+# Install torch/torchvision with the index URL that matches YOUR CUDA runtime, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# Tested versions: torch 2.13.0+cu130, torchvision 0.28.0+cu130.
+torch>=2.4
+torchvision>=0.19
+numpy>=1.26
+pandas>=2.0
+pydicom>=3.0
+scikit-learn>=1.3
+matplotlib>=3.8
+PyYAML>=6.0
+
+# Optional, only needed for compressed DICOM transfer syntaxes:
+# pylibjpeg
+# pylibjpeg-libjpeg
+# python-gdcm
+
+# Optional, for running src/tests with pytest:
+# pytest

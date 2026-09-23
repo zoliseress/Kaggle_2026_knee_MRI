@@ -1,0 +1,16 @@
+# Runs, checkpoints, stats, etc.
+work/
+
+# Notebook outputs
+notebooks/1_inventory_outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+
+# IDE (optional)
+# .vscode/

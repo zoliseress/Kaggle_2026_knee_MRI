@@ -1,0 +1,71 @@
+
+Label kinyeres
+
+1. Atnezni a Discussion-t otletekert, problemak felderiteseert
+
+2. Milyen statisztikat kellene osszeallitani a train datasetbol?
+
+3. Chatgpt-vel feldolgozni a csv-t, és riportot generálni --> !!!
+
+4. Átnézni az érdekes eseteket
+
+5. Hogyan lehet elerni a Qwent API-n keresztul?
+
+		https://huggingface.co/Qwen/Qwen3.8-27B-FP8
+		
+6. Megszerkeszteni a megfelelo promtot az LLM-nek
+
+7. Inferalas az LLM-mel
+
+	- az eredeti riportokkal
+	- angol forditassal
+
+and send disagreements for review.
+
+8. Andrew atnezi az 58 study-t
+
+Manualis labelezes
+	
+1. Andrew labelezzen kepeket
+
+2. Valasszuk szet a train datasetet: train + val
+
+
+
+------
+INPUT:
+
+B P S 3 H W
+
+Batch = 1   (hany study egyszerre)
+Plane = 3   (a sikok fix sorrendben: saggital, coronal, axial)
+Slices = 24 (szelet minták egy sorozatból, ez a "bag")
+
+
+Fontos:
+
+	- a 2 hibas szelet le van kezelve
+	
+	- az 5 series-bol 2 kiesik, mert 3 sik van definialva es kotott sorrendben: sagittal, coronal, axial
+
+
+Kiprobalni:
+
+	1. Normalizalas utani statisztikak:
+	--set data.encoder_normalization=mri_scalar : az ImageNet mean es std helyett ezzel sulyoz (mean: 0.5, std: 0.25)
+	
+	2. Input size novelese:
+	data.image_size: 224 → 288
+	
+	
+	
+	
+669 / 200
+
+anatomical_regions.html
+
+	body mask (CT alapú, morfológia, hole filling, ágy nincs rajta)
+	hot mask, csont mask, fem mask
+	
+	marginok
+	randomizálás

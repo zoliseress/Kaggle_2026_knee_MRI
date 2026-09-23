@@ -1,0 +1,141 @@
+# RSNA knee MRI - EfficientNet-B0 2.5D MIL baseline.
+# These values are starting hypotheses, not tuned optima.
+# Every key can be overridden from the CLI, e.g.: --set data.image_size=288
+
+seed: 42
+
+paths:
+  # Root of the competition export. All *_csv / dicom_root entries below default
+  # to the usual layout under this root when left as null.
+  data_root: "F:/Kaggle/data"
+  dicom_root: null                 # default: <data_root>/train_series
+  train_csv: "F:/Kaggle/data/train_v1.csv"   # default lenne: <data_root>/train.csv
+  train_series_csv: null           # default: <data_root>/train_series.csv
+
+  # Report-extraction exports (optional; see README "Label adapters").
+  labels_details_csv: null                       # preferred: one row per (study, target) + status
+  labels_statuses_csv: null                      # wide text-status export
+  labels_predictions_csv: null                   # wide numeric export
+  labels_predictions_exclude_borderline_csv: null
+  # Small radiologist reference set. Held out from training by default.
+  reference_csv: "notebooks/train_labeled_58_reference.csv"
+  # Validation reference frozen once by `freeze-reference` (from train_v1.csv). Every
+  # training-label experiment is scored against this same file; null = derive it from
+  # the current label table, which then moves with the label policy.
+  frozen_reference_csv: "work/labels/frozen_reference.csv"
+
+  work_dir: "work"
+  cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
+  output_dir: null                 # default: <work_dir>/runs
+
+manifest:
+  # Probe-decode one file per candidate volume while building the manifest.
+  decode_probe: true
+  # A volume with fewer usable slices than this is unusable as a slot.
+  min_slices: 4
+  # Tolerance for assigning a plane from the slice normal (degrees off-axis).
+  obliquity_tolerance_deg: 35.0
+  # Neighbouring slices whose centre-to-centre distance exceeds
+  # median_spacing * max_gap_ratio are flagged as unsuitable 2.5D neighbours.
+  max_gap_ratio: 1.75
+  workers: 8
+
+selection:
+  # Ranking heuristic for "one usable series per slot". Image-side information only.
+  prefer_fluid_sensitive: true
+  localizer_patterns: ["localiz", "localis", "scout", "survey", "loc_", "3-pl", "3pl", "plan"]
+  weights:
+    fluid_sensitive: 3.0
+    fat_suppression: 0.5
+    te_pd_t2: 2.0
+    slice_count: 1.0
+    inplane_resolution: 0.5
+    plane_confidence: 1.0
+    quality_penalty: 2.0
+
+data:
+  image_size: 224
+  fov_mm: 150.0
+  series_slots: ["sagittal", "coronal", "axial"]
+  centers_per_series: 24
+  adjacent_slices: 3
+  crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)
+  intensity_percentiles: [1.0, 99.0]
+  encoder_normalization: "mri_scalar"  # imagenet|mri_scalar
+  monochrome1_policy: "invert"       # invert|keep
+  cache_dtype: "float16"
+  # Data-quality gate: studies with no usable series at all.
+  allow_all_missing_studies: false
+
+augment:
+  enabled: true
+  # Where the transform runs. cuda keeps the DataLoader workers on decode-and-gather only
+  # and augments the whole micro-batch on the GPU; cpu augments inside the workers.
+  # auto = cuda when one is visible. Training only - validation never augments.
+  device: "auto"                   # auto|cpu|cuda
+  rotation_deg: 10.0
+  translate_frac: 0.05
+  scale_range: [0.9, 1.1]
+  intensity_gain: 0.1              # multiplicative jitter, +-gain
+  intensity_bias: 0.05             # additive jitter, +-bias
+  gamma_range: [0.85, 1.18]
+  noise_std: 0.01
+
+model:
+  weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth
+  head_dropout: 0.2
+  head_hidden: 256
+  freeze_bn_running_stats: true
+  encoder_chunk_size: 0            # 0 = no chunking (see README memory notes)
+  # How one slice's feature map becomes a vector (see model.py):
+  # avg = global average (original) | avgmax = average + maximum | attention = learned weights
+  spatial_pool: "avg"
+
+labels:
+  source: "auto"                   # auto|details|wide|train_csv
+  borderline_policy: "exclude"     # exclude|as_negative
+  unmentioned_weight: 0.0          # 0.0 | 0.2 | 1.0 (weak negative ablations)
+  # Per-target override of unmentioned_weight, e.g. {Synovitis: 0.0, Fracture: 0.2}.
+  # Needs a source that keeps not_mentioned apart (labels.source=details).
+  unmentioned_weight_per_target: {}
+  uncertain_weight: 0.0
+  allow_soft_targets: false        # only for explicitly supplied soft targets
+  # Minimum labelled coverage / class support required for a full training run.
+  min_labeled_studies: 500
+  min_positives_per_target: 10
+
+split:
+  n_folds: 3
+  fold: 0
+  grouping: "auto"                 # auto|patient|study
+  holdout_reference: false         # false: the 58 reference studies train too (no independent audit set)
+  max_studies_per_patient_id: 20   # above this an ID is treated as site-reused, not a patient
+
+train:
+  microbatch_studies: 1
+  accumulation_steps: 8
+  # microbatch: class-normalise each micro-batch (original; label weights only act as 0/non-0)
+  # window: normalise by the whole window's valid-label counts (see loss.py) - experiment L1
+  # global: fixed per-class denominators from the training set (see loss.py) - needed for weak labels
+  loss_normalization: "global"
+  max_epochs: 25
+  warmup_epochs: 2
+  early_stopping_patience: 5
+  encoder_lr: 0.0001
+  head_lr: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  num_workers: 8                   # 8 for Windows, 0 by default
+  prefetch_factor: 4               # 4 for Windows, null by default
+  # Validation loader budget (null = same as the training loader). Its workers are never
+  # persistent, so they do not hold memory through the training epoch.
+  eval_num_workers: 4
+  eval_prefetch_factor: 2
+  amp: "auto"                      # auto|bf16|fp16|fp32
+  eval_batch_studies: 2
+  log_every: 20
+  resume: null                     # path to last.pt
+
+eval:
+  threshold: 0.5
+  min_class_support: 1             # known positives AND negatives needed for AUC

@@ -1,0 +1,43 @@
+Az üres mezők kezelésének két nagyon eltérő következménye lehet:
+
+Ha Claude minden üreset negatívvá alakított: összemosódott a „nincs eltérés”,
+a „nincs megemlítve” és a „nem eldönthető”. Ez hibás negatív tanítócímkéket hozhat létre.
+Ha a korábbi javaslat szerint minden üreset kihagyott a lossból: synovitisre az LLM-adatok
+között mindössze 43 negatív maradt. Háromfoldos felosztásban egy modell tanítórészére ebből
+körülbelül 29 jut. Ráadásul a kifejezetten megemlített esetek nem feltétlenül reprezentálják
+az összes vizsgálatot.
+
+A korábbi, óvatos maszkolási alapbeállítás tehát nem tekinthető ezen az adathalmazon már
+igazoltan jó megoldásnak. Ugyanakkor az összes üres mező automatikus nullázása sem indokolt.
+
+Én ebben a sorrendben folytatnám:
+
+1. Ellenőrizzük a tényleges implementációt és az osztályonkénti eredményeket.
+Kell minden osztályra validációs AUC, pozitív/negatív darabszám és a kizárt címkék száma.
+Emellett ellenőrizném a címkesorrendet, a loss maszkolását, a legjobb checkpoint betöltését
+és a három modell predikcióinak átlagolását. Az AUC-t folytonos predikciókból kell számolni;
+a döntési küszöb állítgatása nem oldja meg az alacsony AUC-t. (Scikit-learn dokumentáció)
+
+2. Készítsünk célzott címkeauditot a leletek alapján.
+Kezdetnek körülbelül 100 lelet: egy véletlen részhalmaz, mellé synovitis-, MCL- és sok üres
+címkét tartalmazó esetek. Minden döntéshez legyen visszakereshető leletrészlet. Különítsük
+el az LLM félreolvasását, a verseny definíciójának hibás alkalmazását és azt, amikor a
+leletből valóban nem dönthető el a címke. Egy második LLM véleménye ellenőrzési segítség
+lehet, de önmagában nem hiteles referencia.
+
+3. Válasszuk külön a „nem említett” és a „bizonytalan” státuszt.
+A mostani üres CSV-mezőből ezt már nem lehet megkülönböztetni; szükség van a részletes címkéző
+kimenetre. Az audit után összehasonlítható a teljes maszkolás azzal, hogy bizonyos, nem
+említett eltérések kis súlyú negatív tanítójelként szerepelnek. Ez kísérlet legyen,
+osztályonként indokolva. A validáció referenciacímkéit közben tartsuk változatlanul.
+
+4. Nézzük meg a modell tényleges képbemenetét.
+Egy 20–30 vizsgálatból álló képgalérián ellenőrizhető, hogy helyesek-e a síkok, a szeletsorrend,
+a szomszédos szeletek, az intenzitások és a kivágás. Különösen fontos, hogy a kivágás
+megtartja-e az értékelendő anatómiai területeket, és az inferencia ugyanazt az előfeldolgozást
+használja-e.
+
+5. Először egy rögzített foldon mérjünk, egyszerre egy változtatással.
+Maradjon az EfficientNet-B0 az összehasonlítás alapja. Így látható lesz, hogy a címkejavítás,
+a hiányzó címkék kezelése vagy a képfeldolgozás módosítása hoz javulást. Az ígéretes változatot
+ezután érdemes újra három foldon tanítani.
