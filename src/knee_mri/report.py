@@ -36,10 +36,16 @@ def plot_learning_curves(history: pd.DataFrame, out_path: Path) -> Path:
     axes[0].set_xlabel("epoch")
     axes[0].grid(alpha=0.3)
 
-    finite = history[np.isfinite(history["val_macro_roc_auc"])]
-    axes[1].plot(finite["epoch"], finite["val_macro_roc_auc"], marker="o", color="tab:green")
+    # Older runs have no val_selection_score column; their selection score was macro ROC-AUC.
+    column = "val_selection_score" if "val_selection_score" in history else "val_macro_roc_auc"
+    finite = history[np.isfinite(history[column])]
+    axes[1].plot(finite["epoch"], finite[column], marker="o", color="tab:green", label="selection score")
+    if column != "val_macro_roc_auc":
+        hard = history[np.isfinite(history["val_macro_roc_auc"])]
+        axes[1].plot(hard["epoch"], hard["val_macro_roc_auc"], marker="s", color="tab:blue", label="ROC-AUC (0/1 cells)")
+        axes[1].legend()
     axes[1].axhline(0.5, ls="--", c="grey", lw=1)
-    axes[1].set_title("Validation macro ROC-AUC (evaluable targets)")
+    axes[1].set_title("Validation macro score (evaluable targets)")
     axes[1].set_xlabel("epoch")
     axes[1].grid(alpha=0.3)
 
@@ -144,9 +150,12 @@ def build_html_report(
 
     sections = [
         f"<h2>Run summary</h2><pre>{html.escape(json.dumps(summary, indent=2, default=str))}</pre>",
-        "<h2>Metric scope</h2><p>Local, evaluable-target macro ROC-AUC on the frozen binary reference. "
-        "Targets without both classes are reported as <code>NA</code>, never as 0.5. This is not a verified "
-        "official competition metric.</p>",
+        "<h2>Metric scope</h2><p>Local, evaluable-target macros on the frozen reference. ROC-AUC uses the "
+        "0/1 cells; soft ROC-AUC uses every valid cell, continuous ones included, and equals ROC-AUC on a "
+        "binary reference. The run selects on <code>"
+        + html.escape(str(summary.get("selection_metric", "macro_roc_auc")))
+        + "</code>. Targets without both classes are reported as <code>NA</code>, never as 0.5. This is not a "
+        "verified official competition metric.</p>",
     ]
     if label_counts is not None and len(label_counts):
         sections.append("<h2>Label counts per target</h2>" + _table_html(label_counts, "{:.3f}"))

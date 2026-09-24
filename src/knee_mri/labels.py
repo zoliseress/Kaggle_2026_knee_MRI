@@ -104,6 +104,15 @@ class LabelTable:
         values = np.where(self.targets >= 0.5, 1.0, 0.0)
         return values.astype(np.float32), valid
 
+    def continuous_reference(self) -> tuple[np.ndarray, np.ndarray]:
+        """The evaluation reference with soft cells kept: (values in [0, 1], validity mask).
+
+        Hard positives/negatives carry 1.0/0.0 and soft cells their supplied value; borderline,
+        uncertain, not-mentioned and zero-weight cells stay excluded, as in `binary_reference`.
+        """
+        valid = np.isin(self.kinds, [KIND_POSITIVE, KIND_NEGATIVE, KIND_SOFT]) & (self.weights > 0)
+        return self.targets.astype(np.float32), valid
+
     def to_frame(self) -> pd.DataFrame:
         frames = {STUDY_ID: self.study_ids}
         for c, target in enumerate(TARGETS):
@@ -113,9 +122,14 @@ class LabelTable:
         return pd.DataFrame(frames)
 
     def counts_frame(self) -> pd.DataFrame:
-        """Known/unknown, positive/negative, borderline and weighted counts per target."""
+        """Known/unknown, positive/negative, borderline and weighted counts per target.
+
+        `eff_positive`/`eff_negative` are the positive and negative mass (sum y, sum 1 - y)
+        of the evaluable cells, soft ones included; on hard labels they equal the counts.
+        """
         rows = []
         binary_values, binary_valid = self.binary_reference()
+        soft_values, soft_valid = self.continuous_reference()
         for c, target in enumerate(TARGETS):
             kinds = self.kinds[:, c]
             weights = self.weights[:, c]
@@ -134,6 +148,8 @@ class LabelTable:
                     "total_weight": float(weights.sum()),
                     "n_eval_positive": int(((binary_values[:, c] == 1) & binary_valid[:, c]).sum()),
                     "n_eval_negative": int(((binary_values[:, c] == 0) & binary_valid[:, c]).sum()),
+                    "eff_positive": float(soft_values[soft_valid[:, c], c].sum()),
+                    "eff_negative": float((1.0 - soft_values[soft_valid[:, c], c]).sum()),
                 }
             )
         df = pd.DataFrame(rows)
@@ -470,17 +486,18 @@ def check_training_readiness(cfg: Config, table: LabelTable, n_total_studies: in
         )
 
     min_pos = int(cfg.labels.min_positives_per_target)
-    weak = counts[(counts["n_eval_positive"] < min_pos) | (counts["n_eval_negative"] < min_pos)]
+    # Positive/negative mass, so continuous targets count with their value.
+    weak = counts[(counts["eff_positive"] < min_pos) | (counts["eff_negative"] < min_pos)]
     if len(weak) == len(TARGETS):
         reasons.append(
-            f"no target reaches {min_pos} known positives and {min_pos} known negatives; "
+            f"no target reaches a positive and a negative mass of {min_pos}; "
             "nothing is learnable or evaluable yet."
         )
     elif len(weak):
         LOG.warning(
-            "Targets without usable support (min %d pos/neg): %s",
+            "Targets without usable support (min %d pos/neg mass): %s",
             min_pos,
-            ", ".join(f"{r.target}(+{r.n_eval_positive}/-{r.n_eval_negative})" for r in weak.itertuples()),
+            ", ".join(f"{r.target}(+{r.eff_positive:.1f}/-{r.eff_negative:.1f})" for r in weak.itertuples()),
         )
 
     dead = counts[counts["n_supervised"] == 0]

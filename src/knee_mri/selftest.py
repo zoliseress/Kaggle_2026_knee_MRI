@@ -43,7 +43,7 @@ from .loss import (
     masked_class_normalized_bce,
     window_normalized_bce,
 )
-from .metrics import evaluate_predictions
+from .metrics import evaluate_predictions, soft_roc_auc
 from .model import EfficientNetB0MIL, masked_max, masked_mean
 from .splits import assert_group_disjoint, make_splits
 from .train import window_sizes
@@ -837,6 +837,104 @@ def check_frozen_reference_roundtrip(tmp_dir) -> str:
     return "frozen reference reloads key-aligned and refuses unknown studies"
 
 
+def check_soft_auc_matches_roc_auc() -> str:
+    """On a binary reference the soft ROC-AUC is exactly sklearn's ROC-AUC, ties included."""
+    from sklearn.metrics import roc_auc_score
+
+    for seed in range(5):
+        rng = np.random.default_rng(seed)
+        y = rng.integers(0, 2, size=60).astype(float)
+        y[:2] = (0.0, 1.0)
+        scores = rng.integers(0, 8, size=60) / 7.0  # coarse grid -> many tied scores
+        assert math.isclose(soft_roc_auc(y, scores), roc_auc_score(y.astype(int), scores), abs_tol=1e-12)
+    assert np.isnan(soft_roc_auc(np.ones(5), np.arange(5.0))), "a single-class reference must be NA"
+    return "soft ROC-AUC equals ROC-AUC on binary references, NA on a single class"
+
+
+def check_soft_auc_bruteforce() -> str:
+    """Continuous reference: the O(n log n) formula matches the explicit pair sum."""
+    rng = np.random.default_rng(1)
+    cases = [
+        (np.array([0.0, 0.3, 0.7, 1.0, 0.5, 0.5]), np.array([0.1, 0.4, 0.4, 0.9, 0.2, 0.6])),
+        (rng.integers(0, 5, size=40) / 4.0, rng.integers(0, 6, size=40) / 5.0),  # ties on both sides
+    ]
+    for y, scores in cases:
+        numerator = denominator = 0.0
+        for i in range(len(y)):
+            for j in range(len(y)):
+                pair = max(y[i] - y[j], 0.0)
+                step = 1.0 if scores[i] > scores[j] else 0.5 if scores[i] == scores[j] else 0.0
+                numerator += pair * step
+                denominator += pair
+        assert math.isclose(soft_roc_auc(y, scores), numerator / denominator, abs_tol=1e-9)
+    perfect = rng.random(30)
+    assert math.isclose(soft_roc_auc(perfect, perfect), 1.0), "a score equal to the reference must rank perfectly"
+    assert math.isclose(soft_roc_auc(perfect, -perfect), 0.0), "a reversed score must rank at 0"
+    return "soft ROC-AUC matches the brute-force pair sum on a continuous reference"
+
+
+def check_soft_reference() -> str:
+    """Continuous wide-export values become soft cells that the evaluation reference keeps."""
+    from .labels import KIND_SOFT
+    from .train import EvaluationReference
+
+    cfg = load_config(resolve=False)
+    cfg.labels.allow_soft_targets = True
+    ids = [f"s{i}" for i in range(6)]
+    column = [0.0, 0.3, 0.7, 1.0, np.nan, 0.5]
+    frame = pd.DataFrame({STUDY_ID: ids, **{t: column for t in TARGETS}})
+    table = build_from_wide_numeric(frame, ids, cfg, source="unit-test")
+    assert table.kinds[1, 0] == KIND_SOFT and table.targets[1, 0] == np.float32(0.3) and table.weights[1, 0] == 1.0
+
+    _, binary_valid = table.binary_reference()
+    values, valid = table.continuous_reference()
+    assert not binary_valid[1, 0] and valid[1, 0] and not valid[4, 0], "soft kept, unknown excluded"
+    reference = EvaluationReference.from_table(table, ids)
+    assert np.array_equal(reference.values, values) and np.array_equal(reference.valid, valid)
+
+    counts = table.counts_frame().iloc[0]
+    assert int(counts["n_soft"]) == 3 and math.isclose(counts["eff_positive"], 2.5, abs_tol=1e-6)
+
+    scores = np.tile(np.array([0.1, 0.35, 0.8, 0.9, 0.5, 0.6])[:, None], (1, N_TARGETS))
+    metrics, summary = evaluate_predictions(scores, reference.values, reference.valid)
+    assert int(metrics.loc[0, "n_soft"]) == 3 and summary["n_soft_cells"] == 3 * N_TARGETS
+    assert math.isclose(metrics.loc[0, "soft_auc"], 1.0) and math.isclose(summary["macro_soft_auc"], 1.0)
+    assert math.isclose(metrics.loc[0, "roc_auc"], 1.0) and int(metrics.loc[0, "n_known"]) == 5
+
+    cfg.labels.allow_soft_targets = False
+    try:
+        build_from_wide_numeric(frame, ids, cfg, source="unit-test")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("continuous values must be refused while labels.allow_soft_targets is off")
+    return "continuous targets become soft cells, enter the reference and the soft ROC-AUC"
+
+
+def check_bootstrap_keeps_soft() -> str:
+    """The bootstrap must not truncate a 0.7 reference to 0."""
+    from .evaluate import bootstrap_intervals
+
+    rng = np.random.default_rng(2)
+    ids = [f"s{i}" for i in range(40)]
+    reference = rng.random(len(ids))
+    predictions = pd.DataFrame(
+        {
+            STUDY_ID: ids,
+            "target": TARGETS[0],
+            "score": reference + rng.normal(0.0, 0.1, len(ids)),
+            "reference": reference,
+            "reference_valid": True,
+        }
+    )
+    splits = pd.DataFrame({STUDY_ID: ids, "group": ids})
+    result = bootstrap_intervals(predictions, splits, n_boot=20, seed=0).set_index("target")
+    expected = soft_roc_auc(reference, predictions["score"].to_numpy())
+    assert math.isclose(result.loc[TARGETS[0], "soft_auc"], expected), "bootstrap point estimate truncated the reference"
+    assert result.loc[TARGETS[0], "ci_low"] <= expected <= result.loc[TARGETS[0], "ci_high"]
+    return "bootstrap scores continuous references without truncation"
+
+
 def check_crop_edge_fill() -> str:
     """Tissue touching one border band must register on exactly that edge."""
     from .qc import edge_fill_fractions
@@ -1011,6 +1109,42 @@ def check_float16_transport(cfg: Config) -> str:
     assert val.transport_dtype == torch.float32, "the validation path normalises in the worker"
     mb = packed.element_size() * packed.numel() / 1024**2
     return f"deferred bags float16 and bit-identical ({mb:.1f} MB/study instead of {2 * mb:.1f}); CPU and val paths float32"
+
+
+def check_explicit_run_selection() -> str:
+    """`--runs` names the runs; the prefix form cannot separate a second seed from a fold."""
+    import tempfile
+    from pathlib import Path
+
+    from .diagnose import resolve_run_dirs
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_runs_") as tmp:
+        root = Path(tmp)
+        names = ["g_fold0_s42", "g_fold0_s43", "g_fold1_s42", "g_fold2_s42"]
+        for name in names:
+            (root / name).mkdir()
+            (root / name / "validation_predictions.csv").write_text("StudyInstanceUID,target,score\n", encoding="utf-8")
+        (root / "empty_fold3").mkdir()  # no predictions: never selected
+
+        by_prefix = [p.name for p in resolve_run_dirs(root / "g")]
+        assert by_prefix == names, by_prefix  # both fold-0 seeds, which is what breaks the OOF
+
+        chosen = ["g_fold0_s42", "g_fold1_s42", "g_fold2_s42"]
+        explicit = [p.name for p in resolve_run_dirs(None, [root / n for n in chosen])]
+        assert explicit == chosen, explicit
+        assert [p.name for p in resolve_run_dirs(root / "g_fold1_s42")] == ["g_fold1_s42"]
+
+        for bad, exc in (
+            ([root / "empty_fold3"], FileNotFoundError),
+            ([root / "g_fold0_s42", root / "g_fold0_s42"], ValueError),
+            (None, ValueError),
+        ):
+            try:
+                resolve_run_dirs(None, bad)
+            except exc:
+                continue
+            raise AssertionError(f"resolve_run_dirs should have raised {exc.__name__} for {bad}")
+    return "prefix takes all 4 runs (2 seeds of fold 0); --runs takes exactly the 3 named; bad lists rejected"
 
 
 def check_eval_loader_budget(cfg: Config) -> str:
@@ -1231,6 +1365,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("global_loss_matches_formula", check_global_loss_matches_formula),
             ("global_no_dilution", check_global_no_dilution),
             ("eval_loader_budget", lambda: check_eval_loader_budget(cfg)),
+            ("explicit_run_selection", check_explicit_run_selection),
             ("attention_pool_starts_as_average", lambda: check_attention_pool_starts_as_average(small)),
             ("spatial_pool_shapes", lambda: check_spatial_pool_shapes(small)),
             ("focal_signal_survives_pooling", lambda: check_focal_signal_survives_pooling(small)),
@@ -1239,6 +1374,10 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("empty_numeric_is_unknown", check_empty_numeric_is_unknown),
             ("unmentioned_weight_per_target", check_unmentioned_weight_per_target),
             ("frozen_reference_roundtrip", lambda: check_frozen_reference_roundtrip(tmp_dir)),
+            ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
+            ("soft_auc_bruteforce", check_soft_auc_bruteforce),
+            ("soft_reference", check_soft_reference),
+            ("bootstrap_keeps_soft", check_bootstrap_keeps_soft),
             ("crop_edge_fill", check_crop_edge_fill),
             ("foreground_extent_center", check_foreground_extent_center),
             ("patient_group_separation", lambda: check_group_separation(tmp_dir)),

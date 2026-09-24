@@ -82,8 +82,13 @@ real extraction export to unlock fold training.
 Placeholders are always finite: `NaN * 0` is not a safe way to mask a loss. A wide numeric
 export cannot express borderline status, and lost status information is never
 reconstructed from a binary value — to exclude borderline cases, use the matching export.
-Soft targets in [0, 1] are accepted only with `labels.allow_soft_targets=true`, are kept
-separate from confidence weights, and are excluded from the binary evaluation reference.
+Soft (continuous) targets in [0, 1] are accepted only with `labels.allow_soft_targets=true`
+and are kept separate from confidence weights. The BCE loss takes them as they are. They
+enter the evaluation reference (`LabelTable.continuous_reference`, `freeze-reference`) and are
+scored by the soft ROC-AUC (`metrics.soft_roc_auc`): a weighted concordance index where a
+pair counts with weight (y_i − y_j)+. It equals ROC-AUC exactly on a binary reference.
+`eval.selection_metric` (`macro_soft_auc` by default, or `macro_roc_auc`) selects the
+checkpoint. ROC-AUC, AP and the threshold counts keep using the hard 0/1 cells only.
 
 ## Pipeline
 

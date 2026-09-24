@@ -26,6 +26,7 @@ import pandas as pd
 
 from .config import Config, load_config
 from .constants import STUDY_ID, TARGETS
+from .metrics import soft_roc_auc
 from .schema import read_id_csv
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
@@ -39,25 +40,41 @@ NOTEBOOK_BUILDER = Path(__file__).resolve().parents[2] / "notebooks" / "build_04
 # --------------------------------------------------------------------------------------
 
 
-def resolve_run_dirs(target: str | Path) -> list[Path]:
-    """A run directory, or a run-group prefix whose `<prefix>_fold<N>` directories exist."""
+def resolve_run_dirs(target: str | Path | None, runs: Sequence[str | Path] | None = None) -> list[Path]:
+    """An explicit list of run directories, a single run directory, or a `<prefix>_fold<N>` group.
+
+    The prefix form takes every matching directory, and it cannot tell a second seed
+    (`..._fold0_s43`) from another fold, which then breaks the OOF. Name the runs with
+    `runs=` (CLI: `--runs`) whenever one fold has several runs.
+    """
+    if runs:
+        resolved = [Path(r).resolve() for r in runs]
+        missing = [str(r) for r in resolved if not (r / "validation_predictions.csv").exists()]
+        if missing:
+            raise FileNotFoundError(f"No validation_predictions.csv in: {missing}")
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("the same run directory was listed twice")
+        return resolved
+    if target is None:
+        raise ValueError("pass a run directory / group prefix, or an explicit --runs list")
     target = Path(target).resolve()
     if (target / "validation_predictions.csv").exists():
         return [target]
-    runs = sorted(
+    found = sorted(
         p for p in target.parent.glob(f"{target.name}_fold*") if (p / "validation_predictions.csv").exists()
     )
-    if not runs:
+    if not found:
         raise FileNotFoundError(f"No run directory with validation_predictions.csv at {target} or {target}_fold*")
-    return runs
+    return found
 
 
 def _auc(y: np.ndarray, s: np.ndarray) -> float:
-    from sklearn.metrics import roc_auc_score
+    """ROC-AUC on a binary reference, soft ROC-AUC on a continuous one (never truncated to int)."""
+    return soft_roc_auc(np.asarray(y, dtype=float), np.asarray(s, dtype=float))
 
-    if len(y) == 0 or len(np.unique(y)) < 2:
-        return float("nan")
-    return float(roc_auc_score(y.astype(int), s.astype(float)))
+
+def _hard(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    return frame[frame[column].isin((0.0, 1.0))]
 
 
 def _load_status_lookup(details_csv: str | Path | None) -> pd.DataFrame | None:
@@ -93,13 +110,16 @@ def per_class_rows(
         g = preds[preds["target"] == target]
         valid = g[g["reference_valid"]]
         excluded = g[~g["reference_valid"]]
+        hard = _hard(valid, "reference")
         row = {
             "run": name,
             "target": target,
             "n_studies": len(g),
-            "roc_auc": _auc(valid["reference"].to_numpy(), valid["score"].to_numpy()),
+            "roc_auc": _auc(hard["reference"].to_numpy(), hard["score"].to_numpy()),
+            "soft_auc": _auc(valid["reference"].to_numpy(), valid["score"].to_numpy()),
             "n_pos": int((valid["reference"] == 1).sum()),
             "n_neg": int((valid["reference"] == 0).sum()),
+            "n_soft": len(valid) - len(hard),
             "n_excluded": len(excluded),
         }
         if statuses is not None:
@@ -182,7 +202,12 @@ def check_best_epoch(checks: Checks, run: Path, payload: dict | None) -> None:
         return
     history = pd.read_csv(history_path)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    best_row = history.loc[history["val_macro_roc_auc"].idxmax()]
+    # Runs from before eval.selection_metric existed logged the selection score as val_macro_roc_auc.
+    if "val_selection_score" in history:
+        column, key = "val_selection_score", (payload or {}).get("selection_metric", "macro_soft_auc")
+    else:
+        column, key = "val_macro_roc_auc", "macro_roc_auc"
+    best_row = history.loc[history[column].idxmax()]
     epochs = {
         "history_argmax": int(best_row["epoch"]),
         "val_summary": int(summary["epoch"]),
@@ -191,12 +216,12 @@ def check_best_epoch(checks: Checks, run: Path, payload: dict | None) -> None:
         epochs["best.pt epoch"] = int(payload.get("epoch", -1))
         epochs["best.pt best_epoch"] = int(payload.get("best_epoch", -1))
     agree = len(set(epochs.values())) == 1
-    score_gap = abs(float(best_row["val_macro_roc_auc"]) - float(summary["macro_roc_auc"]))
+    score_gap = abs(float(best_row[column]) - float(summary[key]))
     checks.add(
         "best_checkpoint",
         run.name,
         "PASS" if agree and score_gap < 1e-9 else "FAIL",
-        f"{epochs}; history max {best_row['val_macro_roc_auc']:.4f} vs val_summary {summary['macro_roc_auc']:.4f}",
+        f"{epochs}; history max {key} {best_row[column]:.4f} vs val_summary {summary[key]:.4f}",
     )
 
     first, best, last = history.iloc[0], best_row, history.iloc[-1]
@@ -207,7 +232,7 @@ def check_best_epoch(checks: Checks, run: Path, payload: dict | None) -> None:
         "WARN" if ratio < 0.05 else "INFO",
         f"train loss epoch0 {first['train_loss']:.4f} -> best epoch {int(best['epoch'])} {best['train_loss']:.4f} "
         f"-> last epoch {int(last['epoch'])} {last['train_loss']:.4f} (x{ratio:.3f}); "
-        f"val AUC at last epoch {last['val_macro_roc_auc']:.4f}",
+        f"val {key} at last epoch {last[column]:.4f}",
     )
     if "train_empty_microbatches" in history:
         checks.add(
@@ -374,16 +399,18 @@ def check_checkpoint_agreement(checks: Checks, runs: Sequence[Path], reference_i
 
 def diagnose(
     cfg: Config,
-    target: str | Path,
+    target: str | Path | None = None,
     out_dir: str | Path | None = None,
     details_csv: str | Path | None = None,
     deep: bool = False,
     n_reload_studies: int = 16,
+    runs: Sequence[str | Path] | None = None,
+    group_name: str | None = None,
 ) -> dict:
     import torch
 
-    runs = resolve_run_dirs(target)
-    group_name = runs[0].name.rsplit("_fold", 1)[0] if len(runs) > 1 else runs[0].name
+    runs = resolve_run_dirs(target, runs)
+    group_name = group_name or (runs[0].name.rsplit("_fold", 1)[0] if len(runs) > 1 else runs[0].name)
     out_dir = Path(out_dir) if out_dir else runs[0].parent / f"{group_name}_diagnose"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +468,7 @@ def diagnose(
     macro = {
         name: {
             "macro_roc_auc": _macro(g, "roc_auc"),
+            "macro_soft_auc": _macro(g, "soft_auc"),
             "ref58_macro_roc_auc": _macro(g, "ref58_roc_auc"),
             "ref58_n_studies": int(g["ref58_n"].max()) if "ref58_n" in g else 0,
         }
@@ -454,13 +482,14 @@ def diagnose(
         "details_csv": str(details_csv) if details_csv else None,
         "deep": deep,
         "note": (
-            "roc_auc is scored on each run's frozen extraction-derived reference; ref58_roc_auc on the "
+            "roc_auc is scored on the hard (0/1) cells and soft_auc on every valid cell of each run's "
+            "frozen extraction-derived reference; ref58_roc_auc on the "
             "radiologist reference studies inside that validation set (small: a directional signal only)."
         ),
     }
     atomic_write_json(out_dir / "diagnose_summary.json", summary)
 
-    printable = table[["run", "target", "roc_auc", "n_pos", "n_neg", "n_excluded"] + (["ref58_roc_auc"] if reference is not None else [])]
+    printable = table[["run", "target", "roc_auc", "soft_auc", "n_pos", "n_neg", "n_soft", "n_excluded"] + (["ref58_roc_auc"] if reference is not None else [])]
     LOG.info("Per-class results:\n%s", printable.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     LOG.info("Macro: %s", json.dumps(macro, indent=1))
     LOG.info("Diagnostics written to %s", out_dir)

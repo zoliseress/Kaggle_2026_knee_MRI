@@ -14,7 +14,7 @@ from .config import Config
 from .constants import CHECKPOINT_VERSION, STUDY_ID, TARGETS
 from .dataset import StudyBagDataset, check_study_coverage, collate_studies, enforce_coverage_gate
 from .labels import build_label_table, load_reference_table
-from .metrics import evaluate_predictions
+from .metrics import evaluate_predictions, soft_roc_auc
 from .model import build_model
 from .preprocess import preprocess_hash
 from .splits import ROLE_REFERENCE_HOLDOUT, ROLE_TRAIN_POOL, fold_study_ids, load_splits
@@ -238,31 +238,33 @@ def bootstrap_intervals(
     n_boot: int = 200,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Patient-group bootstrap CIs for per-target ROC-AUC. Optional, never a prerequisite."""
-    from sklearn.metrics import roc_auc_score
+    """Patient-group bootstrap CIs for per-target soft ROC-AUC. Optional, never a prerequisite.
 
+    The soft ROC-AUC equals ROC-AUC on a binary reference and keeps continuous reference
+    values instead of truncating them to 0.
+    """
     merged = predictions.merge(splits[[STUDY_ID, "group"]], on=STUDY_ID, how="left")
     rng = np.random.default_rng(seed)
     groups = merged["group"].dropna().unique()
     rows = []
     for target in TARGETS:
         subset = merged[(merged["target"] == target) & merged["reference_valid"].astype(bool)]
-        if subset["reference"].nunique() < 2:
-            rows.append({"target": target, "roc_auc": np.nan, "ci_low": np.nan, "ci_high": np.nan, "n_boot": 0})
+        point = soft_roc_auc(subset["reference"].to_numpy(float), subset["score"].to_numpy(float))
+        if not np.isfinite(point):
+            rows.append({"target": target, "soft_auc": np.nan, "ci_low": np.nan, "ci_high": np.nan, "n_boot": 0})
             continue
-        point = float(roc_auc_score(subset["reference"].astype(int), subset["score"].astype(float)))
         samples = []
         for _ in range(n_boot):
             picked = rng.choice(groups, size=len(groups), replace=True)
             chunk = pd.concat([subset[subset["group"] == g] for g in picked], ignore_index=True)
-            if chunk["reference"].nunique() < 2:
-                continue
-            samples.append(float(roc_auc_score(chunk["reference"].astype(int), chunk["score"].astype(float))))
+            value = soft_roc_auc(chunk["reference"].to_numpy(float), chunk["score"].to_numpy(float))
+            if np.isfinite(value):
+                samples.append(value)
         if samples:
             low, high = np.percentile(samples, [2.5, 97.5])
         else:
             low = high = np.nan
         rows.append(
-            {"target": target, "roc_auc": point, "ci_low": float(low), "ci_high": float(high), "n_boot": len(samples)}
+            {"target": target, "soft_auc": point, "ci_low": float(low), "ci_high": float(high), "n_boot": len(samples)}
         )
     return pd.DataFrame(rows)

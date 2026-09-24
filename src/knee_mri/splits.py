@@ -24,7 +24,7 @@ import pandas as pd
 
 from .config import Config
 from .constants import SPLITS_VERSION, STUDY_ID, TARGETS
-from .labels import KIND_POSITIVE, LabelTable
+from .labels import KIND_POSITIVE, KIND_SOFT, LabelTable
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
 ROLE_TRAIN_POOL = "train_pool"
@@ -155,6 +155,9 @@ def _group_positive_counts(
                 if row is None:
                     continue
                 vector[: len(TARGETS)] += (table.kinds[row] == KIND_POSITIVE).astype(np.float64)
+                # A soft cell adds its positive mass; with no soft cells the folds are unchanged.
+                soft = (table.kinds[row] == KIND_SOFT) & (table.weights[row] > 0)
+                vector[: len(TARGETS)] += np.where(soft, table.targets[row], 0.0)
         stats[group] = vector
     return members, stats
 

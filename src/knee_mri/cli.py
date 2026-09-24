@@ -13,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .config import load_config
@@ -266,6 +267,8 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
         details_csv=args.details,
         deep=args.deep,
         n_reload_studies=args.n_reload_studies,
+        runs=args.runs,
+        group_name=args.group_name,
     )
     return 1 if summary["check_counts"].get("FAIL", 0) else 0
 
@@ -317,7 +320,9 @@ def cmd_freeze_reference(args: argparse.Namespace) -> int:
             "label_policy": table.policy,
             "n_studies": len(study_ids),
             "n_valid_cells": int(reference.valid.sum()),
-            "n_positive_cells": int((reference.values * reference.valid).sum()),
+            "n_positive_cells": int(((reference.values == 1.0) & reference.valid).sum()),
+            "n_soft_cells": int((~np.isin(reference.values, (0.0, 1.0)) & reference.valid).sum()),
+            "eff_positive_mass": float((reference.values * reference.valid).sum()),
         },
     )
     LOG.info("Frozen reference written to %s (%d valid cells). Set paths.frozen_reference_csv to use it.", out, int(reference.valid.sum()))
@@ -400,7 +405,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_report)
 
     p = _common(sub.add_parser("diagnose", help="Per-class results and implementation checks of finished runs"))
-    p.add_argument("target", help="A run directory, or a run-group prefix such as work/runs/cv3_20260920_002647")
+    p.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="A run directory, or a run-group prefix such as work/runs/cv3_20260920_002647",
+    )
+    p.add_argument(
+        "--runs",
+        nargs="+",
+        default=None,
+        help="Explicit run directories, one per fold. Use this when a fold has several seeds: "
+        "the prefix form would take them all and skip the OOF.",
+    )
+    p.add_argument("--group-name", default=None, help="Name of the diagnose output directory (default: the prefix)")
     p.add_argument("--details", default=None, help="labels_details file used to break excluded cells down by status")
     p.add_argument("--deep", action="store_true", help="Also load checkpoints: reload, loss-mask and agreement checks")
     p.add_argument("--n-reload-studies", type=int, default=16)

@@ -180,6 +180,9 @@ def validate_config(cfg: Config) -> None:
     if cfg.labels.source not in ("auto", "details", "wide", "train_csv"):
         raise ValueError("labels.source must be one of auto|details|wide|train_csv")
 
+    if str(cfg.eval.get("selection_metric", "macro_soft_auc")) not in ("macro_soft_auc", "macro_roc_auc"):
+        raise ValueError("eval.selection_metric must be 'macro_soft_auc' or 'macro_roc_auc'")
+
     if int(cfg.split.n_folds) < 2:
         raise ValueError("split.n_folds must be >= 2")
     if not 0 <= int(cfg.split.fold) < int(cfg.split.n_folds):

@@ -78,6 +78,22 @@ def test_frozen_reference_roundtrip(tmp_path):
     selftest.check_frozen_reference_roundtrip(tmp_path)
 
 
+def test_soft_auc_matches_roc_auc():
+    selftest.check_soft_auc_matches_roc_auc()
+
+
+def test_soft_auc_bruteforce():
+    selftest.check_soft_auc_bruteforce()
+
+
+def test_soft_reference():
+    selftest.check_soft_reference()
+
+
+def test_bootstrap_keeps_soft():
+    selftest.check_bootstrap_keeps_soft()
+
+
 def test_crop_edge_fill():
     selftest.check_crop_edge_fill()
 
@@ -152,6 +168,10 @@ def test_spatial_pool_training_step(cfg):
 
 def test_float16_transport(cfg):
     selftest.check_float16_transport(cfg)
+
+
+def test_explicit_run_selection():
+    selftest.check_explicit_run_selection()
 
 
 def test_eval_loader_budget(cfg):

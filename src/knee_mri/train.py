@@ -123,14 +123,14 @@ class EvaluationReference:
     """Targets, masks and study order frozen *before* any training-label experiment."""
 
     study_ids: list[str]
-    values: np.ndarray  # [N, 12] in {0, 1}
+    values: np.ndarray  # [N, 12] in [0, 1]: 0/1 for hard labels, the supplied value for soft ones
     valid: np.ndarray  # [N, 12] bool
     note: str | None = None
 
     @classmethod
     def from_table(cls, table: LabelTable, study_ids: Sequence[str]) -> "EvaluationReference":
         subset = table.subset(list(study_ids))
-        values, valid = subset.binary_reference()
+        values, valid = subset.continuous_reference()
         return cls(list(study_ids), values, valid, soft_target_warning(subset.kinds))
 
     @classmethod
@@ -194,6 +194,7 @@ class Trainer:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.reference = reference
         self.provenance = provenance or {}
+        self.selection_name = str(cfg.eval.get("selection_metric", "macro_soft_auc"))
 
         self.device_spec = select_device(cfg.train.amp)
         LOG.info("Compute: %s", self.device_spec.describe())
@@ -537,6 +538,7 @@ class Trainer:
             "global_step": self.state.global_step,
             "best_score": self.state.best_score,
             "best_epoch": self.state.best_epoch,
+            "selection_metric": self.selection_name,
             "target_order": list(TARGETS),
             "config": self.cfg.to_dict(),
             "model_description": self.model.describe(),
@@ -584,6 +586,15 @@ class Trainer:
         self.state.global_step = int(payload.get("global_step", 0))
         self.state.best_score = float(payload.get("best_score", float("-inf")))
         self.state.best_epoch = int(payload.get("best_epoch", -1))
+        # Checkpoints from before eval.selection_metric existed were selected on macro ROC-AUC.
+        stored_metric = payload.get("selection_metric", "macro_roc_auc")
+        if stored_metric != self.selection_name:
+            LOG.warning(
+                "Checkpoint best score was measured as %s but this run selects on %s; the two agree "
+                "only on a binary reference.",
+                stored_metric,
+                self.selection_name,
+            )
         rng = payload.get("rng_state", {})
         if "torch" in rng:
             torch.set_rng_state(rng["torch"].cpu() if hasattr(rng["torch"], "cpu") else rng["torch"])
@@ -609,7 +620,7 @@ class Trainer:
             self.state.epoch = epoch
             train_summary = self.train_epoch(epoch)
             table, val_summary, predictions = self.validate(epoch)
-            score = selection_metric(val_summary)
+            score = selection_metric(val_summary, self.selection_name)
 
             record = {
                 "epoch": epoch,
@@ -624,7 +635,11 @@ class Trainer:
                 "seconds": train_summary["seconds"],
                 "studies_per_second": train_summary["studies_per_second"],
                 "peak_gpu_gb": train_summary["peak_gpu_gb"],
-                "val_macro_roc_auc": score,
+                # The early-stopping score (eval.selection_metric); the named macros are logged beside it.
+                "val_selection_score": score,
+                "val_macro_roc_auc": val_summary["macro_roc_auc"],
+                "val_macro_soft_auc": val_summary["macro_soft_auc"],
+                "val_macro_spearman": val_summary["macro_spearman"],
                 "val_defined_targets": val_summary["n_defined_targets"],
                 "val_macro_ap": val_summary["macro_average_precision"],
                 "val_macro_f1": val_summary["macro_f1_at_threshold"],
@@ -632,10 +647,12 @@ class Trainer:
             self.state.history.append(record)
             atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
             LOG.info(
-                "epoch %d | train loss %.4f | val macro ROC-AUC %s (%s defined) | AP %s",
+                "epoch %d | train loss %.4f | val %s %s | macro ROC-AUC %s (%s defined) | AP %s",
                 epoch,
                 record["train_loss"],
+                self.selection_name,
                 f"{score:.4f}" if np.isfinite(score) else "NA",
+                f"{val_summary['macro_roc_auc']:.4f}" if np.isfinite(val_summary["macro_roc_auc"]) else "NA",
                 val_summary["defined_fraction"],
                 f"{val_summary['macro_average_precision']:.4f}"
                 if np.isfinite(val_summary["macro_average_precision"])
@@ -645,9 +662,10 @@ class Trainer:
             if not np.isfinite(score):
                 no_defined_auc_epochs += 1
                 LOG.error(
-                    "No validation target has a defined ROC-AUC (undefined: %s). The checkpoint is NOT "
-                    "selected on a NaN, and the radiologist reference audit must not be used as a "
-                    "substitute selection criterion.",
+                    "No validation target has a defined %s (ROC-AUC undefined for: %s). The checkpoint "
+                    "is NOT selected on a NaN, and the radiologist reference audit must not be used as "
+                    "a substitute selection criterion.",
+                    self.selection_name,
                     val_summary["undefined_targets"],
                 )
                 if no_defined_auc_epochs >= 2:
@@ -666,7 +684,7 @@ class Trainer:
                     atomic_write_dataframe(table, self.run_dir / "metrics_per_class.csv")
                     atomic_write_dataframe(predictions, self.run_dir / "validation_predictions.csv")
                     atomic_write_json(self.run_dir / "val_summary.json", val_summary)
-                    LOG.info("New best macro ROC-AUC %.4f at epoch %d -> best.pt", score, epoch)
+                    LOG.info("New best %s %.4f at epoch %d -> best.pt", self.selection_name, score, epoch)
                 else:
                     self.state.epochs_without_improvement += 1
 
@@ -686,7 +704,8 @@ class Trainer:
         summary = {
             "mode": self.mode,
             "fold": int(self.cfg.split.fold),
-            "best_macro_roc_auc": self.state.best_score if np.isfinite(self.state.best_score) else None,
+            "selection_metric": self.selection_name,
+            "best_score": self.state.best_score if np.isfinite(self.state.best_score) else None,
             "best_epoch": self.state.best_epoch,
             "epochs_run": self.state.epoch + 1,
             "optimizer_steps": self.state.global_step,
@@ -694,7 +713,10 @@ class Trainer:
             "n_val_studies": len(self.val_loader.dataset),
             "device": self.device_spec.describe(),
             "provenance": self.provenance,
-            "metric_scope": "local evaluable-target macro ROC-AUC; not a verified official metric",
+            "metric_scope": (
+                f"selection on the local evaluable-target {self.selection_name} (soft ROC-AUC equals ROC-AUC "
+                "on a binary reference); not a verified official metric"
+            ),
             "run_dir": str(self.run_dir),
         }
         if self.mode == "overfit":
@@ -742,7 +764,7 @@ def run_synthetic(cfg: Config, n_studies: int = 16, epochs: int | None = None, n
     weights = np.stack([val_ds[i]["label_weights"].numpy() for i in range(len(val_ds))])
     reference = EvaluationReference(
         study_ids=[val_ds[i]["study_id"] for i in range(len(val_ds))],
-        values=(values >= 0.5).astype(np.float32),
+        values=values.astype(np.float32),
         valid=weights > 0,
     )
     reference.save(run_dir / "validation_reference.csv")
@@ -781,7 +803,7 @@ def _report_split_label_counts(
     for split_name in ("train", "validation"):
         chunk = table[table["split"] == split_name]
         unsupervised = list(chunk.loc[chunk["n_supervised"] == 0, "target"])
-        one_class = list(chunk.loc[(chunk["n_eval_positive"] == 0) | (chunk["n_eval_negative"] == 0), "target"])
+        one_class = list(chunk.loc[(chunk["eff_positive"] == 0) | (chunk["eff_negative"] == 0), "target"])
         if unsupervised:
             LOG.warning("%s split: NO supervision at all for %s", split_name, unsupervised)
         if one_class:
