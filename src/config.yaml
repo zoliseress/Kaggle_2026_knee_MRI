@@ -9,7 +9,8 @@ paths:
   # to the usual layout under this root when left as null.
   data_root: "F:/Kaggle/data"
   dicom_root: null                 # default: <data_root>/train_series
-  train_csv: "F:/Kaggle/data/train_v1.csv"   # default lenne: <data_root>/train.csv
+  # train_csv: "F:/Kaggle/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
+  train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
