@@ -5,13 +5,16 @@ cell. The labelling runs kept both apart in their long `labels_details.csv` expo
 (one row per study x target with `status` and `basis`); this module stitches those
 exports together into the `labels_details_csv` contract of `labels.build_from_details`:
 
-    StudyInstanceUID, target, status, basis, evidence, reason, needs_review, source
+    StudyInstanceUID, target, status, basis, soft_target, evidence, reason, needs_review, source
 
 Rules:
   * every training study must carry exactly one row per target - a gap or a duplicate
     is an error, never silently filled;
   * the radiologist reference studies take the reference label instead of the LLM one
-    (status positive/negative, basis `reference`), exactly as `train_v1.csv` did;
+    (status positive/negative, basis `reference`, no soft value), exactly as
+    `train_v1.csv` did;
+  * a soft P(positive) column (`soft_target`, or the notebooks' `p_positive`) is kept
+    as `soft_target`; it must be in [0, 1] and empty on `not_mentioned` rows;
   * the LLM columns are passed through unchanged, so the audit can trace every cell
     back to its evidence.
 """
@@ -24,7 +27,8 @@ from typing import Sequence
 import pandas as pd
 
 from .config import Config
-from .constants import STATUS_NEGATIVE, STATUS_POSITIVE, STUDY_ID, TARGETS
+from .constants import STATUS_NEGATIVE, STATUS_NOT_MENTIONED, STATUS_POSITIVE, STUDY_ID, TARGETS
+from .labels import SOFT_COLUMN, soft_column
 from .schema import read_id_csv
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
@@ -43,6 +47,13 @@ def _read_llm_details(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path}: missing columns {missing}")
     keep = required + [c for c in PASSTHROUGH if c in df.columns]
     out = df[keep].copy()
+    no_status = out["status"].isna() | (out["status"].astype(str).str.strip() == "")
+    if no_status.any():
+        studies = sorted(set(out.loc[no_status, STUDY_ID].astype(str)))
+        raise ValueError(
+            f"{path}: {int(no_status.sum())} rows in {len(studies)} studies have no status (unprocessed or "
+            f"failed extractions?), e.g. {studies[:3]}; finish or drop those studies before merging"
+        )
     out["status"] = out["status"].astype(str).str.strip().str.lower()
     out["basis"] = out["basis"].astype("string").str.strip().str.lower()
     out["source"] = str(path)
@@ -52,6 +63,19 @@ def _read_llm_details(path: Path) -> pd.DataFrame:
     unknown_target = sorted(set(out["target"]) - set(TARGETS))
     if unknown_target:
         raise ValueError(f"{path}: unknown targets {unknown_target}")
+
+    soft_col = soft_column(df.columns, str(path))
+    if soft_col:
+        soft = pd.to_numeric(df[soft_col], errors="raise").astype(float)
+        out_of_range = soft.notna() & ~soft.between(0.0, 1.0)  # +-Inf included
+        if out_of_range.any():
+            examples = out.loc[out_of_range, [STUDY_ID, "target"]].assign(value=soft[out_of_range]).head(3)
+            raise ValueError(f"{path}: {int(out_of_range.sum())} {soft_col} values outside [0, 1], e.g. {examples.to_dict('records')}")
+        unmentioned = soft.notna() & (out["status"] == STATUS_NOT_MENTIONED)
+        if unmentioned.any():
+            examples = out.loc[unmentioned, [STUDY_ID, "target"]].head(3).to_dict("records")
+            raise ValueError(f"{path}: {int(unmentioned.sum())} not_mentioned rows carry a {soft_col}, e.g. {examples}")
+        out[SOFT_COLUMN] = soft
     return out
 
 
@@ -80,6 +104,14 @@ def merge_label_details(
     if not detail_paths:
         raise ValueError("At least one labels_details.csv is required")
     frames = [_read_llm_details(Path(p)) for p in detail_paths]
+    with_soft = [SOFT_COLUMN in f.columns for f in frames]
+    if any(with_soft) and not all(with_soft):
+        soft_inputs = [str(p) for p, s in zip(detail_paths, with_soft) if s]
+        hard_inputs = [str(p) for p, s in zip(detail_paths, with_soft) if not s]
+        raise ValueError(
+            f"Mixing soft-scored exports {soft_inputs} with status-only exports {hard_inputs} would "
+            "leave part of the training set without soft values; merge one kind at a time."
+        )
     llm = pd.concat(frames, ignore_index=True)
 
     dup = llm.duplicated(subset=[STUDY_ID, "target"], keep=False)
@@ -110,7 +142,11 @@ def merge_label_details(
 
     order = {t: i for i, t in enumerate(TARGETS)}
     merged = merged.assign(_t=merged["target"].map(order)).sort_values([STUDY_ID, "_t"]).drop(columns="_t")
-    columns = [STUDY_ID, "target", "status", "basis"] + [c for c in PASSTHROUGH if c in merged.columns] + ["source"]
+    columns = (
+        [STUDY_ID, "target", "status", "basis"]
+        + [c for c in [SOFT_COLUMN, *PASSTHROUGH] if c in merged.columns]
+        + ["source"]
+    )
     merged = merged[columns].reset_index(drop=True)
 
     out_path = Path(out_path) if out_path else Path(cfg.paths.work_dir) / "labels" / "labels_details_all.csv"
@@ -120,6 +156,7 @@ def merge_label_details(
         "n_studies": len(train_ids),
         "n_rows": len(merged),
         "n_reference_studies": len(reference_ids & set(train_ids)),
+        "n_soft_rows": int(merged[SOFT_COLUMN].notna().sum()) if SOFT_COLUMN in merged.columns else 0,
         "inputs": [str(p) for p in detail_paths],
         "status_by_basis": {
             f"{s}/{b}": int(n) for (s, b), n in merged.groupby(["status", "basis"], dropna=False).size().items()

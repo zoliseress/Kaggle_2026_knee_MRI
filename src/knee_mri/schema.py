@@ -25,11 +25,12 @@ TRAIN_SERIES_CSV_REQUIRED = [STUDY_ID, SERIES_ID]
 EXPECTED_EXPORT_SCHEMAS: dict[str, dict[str, Any]] = {
     "labels_details_csv": {
         "required": [STUDY_ID, "target", "status"],
-        "optional": ["basis", "value", "soft_target", "confidence", "evidence", "review_flag"],
+        "optional": ["basis", "value", "soft_target", "p_positive", "confidence", "evidence", "review_flag"],
         "note": (
             "Preferred source: one row per (study, target) with the extraction status. "
             "`status` in {positive, negative, uncertain, not_mentioned}; for `negative` the "
-            "`basis` column distinguishes explicit_absence / below_threshold / borderline."
+            "`basis` column distinguishes explicit_absence / below_threshold / borderline. "
+            "`soft_target` or `p_positive` (one of them) is P(positive) in [0, 1], empty on not_mentioned."
         ),
     },
     "labels_statuses_csv": {

@@ -22,7 +22,26 @@ from .train import EvaluationReference
 from .utils import LOG, atomic_write_dataframe, atomic_write_json, autocast_ctx, select_device
 
 
-def load_checkpoint_for_inference(cfg: Config, path: str | Path) -> tuple[torch.nn.Module, dict]:
+# Input keys the dataset applies at inference time that the model's weights depend on. A
+# mismatch feeds the model other inputs than it was trained on - with identical tensor
+# shapes for a reordered slot list or another normalisation, so nothing would crash.
+INFERENCE_DATA_KEYS = ("data.image_size", "data.series_slots", "data.centers_per_series", "data.encoder_normalization")
+# Model keys that are not architecture: the pretrained source (the checkpoint replaces it)
+# and the memory-only chunking, which the inference host may tune.
+RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size")
+ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "feature_dim", "head_in")
+
+
+def load_checkpoint_for_inference(
+    cfg: Config, path: str | Path, allow_data_overrides: Sequence[str] = ()
+) -> tuple[torch.nn.Module, dict]:
+    """Rebuild a checkpoint's model for inference.
+
+    The architecture comes from the checkpoint's own config, so any run can be loaded
+    whatever `cfg` says about the model. The inputs come from `cfg` (the dataset is built
+    from it), so a difference in INFERENCE_DATA_KEYS is refused unless that key is named
+    in `allow_data_overrides` - an explicit, logged decision.
+    """
     payload = torch.load(str(path), map_location="cpu", weights_only=False)
     if payload.get("version") != CHECKPOINT_VERSION:
         raise ValueError(f"Checkpoint version {payload.get('version')} != {CHECKPOINT_VERSION}")
@@ -31,18 +50,48 @@ def load_checkpoint_for_inference(cfg: Config, path: str | Path) -> tuple[torch.
             f"Checkpoint target order differs from the project order.\n"
             f"  checkpoint: {payload.get('target_order')}\n  project:    {list(TARGETS)}"
         )
-    stored_cfg = Config(payload.get("config", {}))
-    for key in ("data.image_size", "data.series_slots", "data.centers_per_series", "data.encoder_normalization"):
+    unknown = sorted(set(allow_data_overrides) - set(INFERENCE_DATA_KEYS))
+    if unknown:
+        raise ValueError(f"allow_data_overrides names {unknown}; only {list(INFERENCE_DATA_KEYS)} can be overridden")
+
+    stored_tree = payload.get("config") or {}
+    stored_cfg = Config(stored_tree)
+    mismatched = {}
+    for key in INFERENCE_DATA_KEYS:
         stored, current = stored_cfg.get_dotted(key), cfg.get_dotted(key)
         if stored is None:
             continue
-        differs = list(stored) != list(current) if isinstance(stored, list) else stored != current
+        differs = list(stored) != list(current) if isinstance(stored, (list, tuple)) else stored != current
         if differs:
-            LOG.warning("Checkpoint %s=%s differs from the current config value %s", key, stored, current)
-    # Rebuild the architecture without re-downloading pretrained weights.
+            mismatched[key] = (stored, current)
+    refused = {k: v for k, v in mismatched.items() if k not in allow_data_overrides}
+    if refused:
+        details = "; ".join(f"{k}: trained {s!r}, now {c!r}" for k, (s, c) in refused.items())
+        raise ValueError(
+            f"{path}: the inference config would feed the model other inputs than in training ({details}). "
+            "Use the training run's config.yaml, or name the keys in allow_data_overrides to accept this."
+        )
+    for key, (stored, current) in mismatched.items():
+        LOG.warning("%s: %s override accepted - trained with %r, inferring with %r", path, key, stored, current)
+
+    # Architecture from the checkpoint, runtime knobs from the caller, no pretrained download.
     build_cfg = cfg.copy()
+    stored_model = stored_tree.get("model")
+    if stored_model:
+        for key, value in stored_model.items():
+            if key not in RUNTIME_MODEL_KEYS:
+                build_cfg.set_dotted(f"model.{key}", value)
+    else:
+        LOG.warning("%s carries no model config; building the architecture from the current config", path)
     build_cfg.model.weights = "none"
-    model = build_model(build_cfg, n_slots=len(stored_cfg.get_dotted("data.series_slots", cfg.data.series_slots)))
+    model = build_model(build_cfg, n_slots=len(stored_cfg.get_dotted("data.series_slots") or cfg.data.series_slots))
+    stored_description, built = payload.get("model_description") or {}, model.describe()
+    differing = [k for k in ARCHITECTURE_KEYS if k in stored_description and stored_description[k] != built[k]]
+    if differing:
+        raise ValueError(
+            f"{path}: rebuilt architecture differs in {differing}: "
+            + ", ".join(f"{k} {stored_description[k]!r} vs {built[k]!r}" for k in differing)
+        )
     model.load_state_dict(payload["model"])
     model.eval()
     return model, payload
@@ -94,13 +143,14 @@ def evaluate_checkpoint(
     checkpoint: str | Path,
     out_dir: str | Path | None = None,
     partition: str = "validation",
+    allow_data_overrides: Sequence[str] = (),
 ) -> dict:
     """Score a checkpoint on its fold's validation studies, or on the reference hold-out."""
     checkpoint = Path(checkpoint)
     out_dir = Path(out_dir) if out_dir else checkpoint.parent / f"eval_{partition}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model, payload = load_checkpoint_for_inference(cfg, checkpoint)
+    model, payload = load_checkpoint_for_inference(cfg, checkpoint, allow_data_overrides)
     splits = load_splits(cfg)
     all_ids = sorted(set(splits[STUDY_ID].astype(str)))
     label_table = build_label_table(cfg, all_ids)

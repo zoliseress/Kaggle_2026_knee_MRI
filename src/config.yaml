@@ -100,7 +100,7 @@ labels:
   # Needs a source that keeps not_mentioned apart (labels.source=details).
   unmentioned_weight_per_target: {}
   uncertain_weight: 0.0
-  allow_soft_targets: true         # continuous targets in (0, 1) from the wide export
+  allow_soft_targets: true         # continuous targets in (0, 1): wide export, or soft_target/p_positive in details
   # Minimum labelled coverage / class support required for a full training run.
   min_labeled_studies: 500
   min_positives_per_target: 10
@@ -135,7 +135,8 @@ train:
   amp: "auto"                      # auto|bf16|fp16|fp32
   eval_batch_studies: 2
   log_every: 20
-  resume: null                     # path to last.pt
+  resume: null                     # path to last.pt: continue the SAME run exactly (checked)
+  init_weights: null               # path to a checkpoint: NEW run from its weights (fresh optimizer/best/history)
 
 eval:
   threshold: 0.5

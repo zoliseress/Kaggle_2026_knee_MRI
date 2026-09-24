@@ -807,6 +807,212 @@ def check_unmentioned_weight_per_target() -> str:
     return "per-target not_mentioned weights applied; uncertain stays out; reference unchanged"
 
 
+def check_details_soft_roundtrip(tmp_dir) -> str:
+    """The notebooks' `p_positive` survives the merge and loads the same as the direct export."""
+    from pathlib import Path
+
+    from .labels import KIND_BORDERLINE, KIND_NEGATIVE, KIND_NOT_MENTIONED, KIND_POSITIVE, KIND_SOFT, build_from_details
+    from .merge_label_details import merge_label_details
+    from .schema import read_id_csv
+
+    tmp = Path(tmp_dir) / "details_soft"
+    tmp.mkdir(parents=True, exist_ok=True)
+    ids = ["s1", "s2", "r1"]
+    cells = {t: ("not_mentioned", "not_mentioned", np.nan) for t in TARGETS}
+    cells.update(
+        {
+            "ACL": ("positive", "meets_criteria", 0.7),
+            "MCL": ("uncertain", "insufficient_detail", 0.4),
+            "Medial Meniscus": ("negative", "borderline", 0.1),
+            "Lateral Meniscus": ("negative", "explicit_absence", 0.05),
+        }
+    )
+    rows = [  # the notebook export: `label` and `p_positive`
+        {STUDY_ID: sid, "label": t, "status": s, "basis": b, "p_positive": p}
+        for sid in ("s1", "s2")
+        for t, (s, b, p) in cells.items()
+    ]
+    rows += [{STUDY_ID: "r1", "label": t, "status": "positive", "basis": "meets_criteria", "p_positive": 0.9} for t in TARGETS]
+    llm = pd.DataFrame(rows)
+    llm_path = tmp / "labels_details.csv"
+    llm.to_csv(llm_path, index=False)
+    pd.DataFrame({STUDY_ID: ids}).to_csv(tmp / "train.csv", index=False)
+    pd.DataFrame({STUDY_ID: ["r1"], **{t: [0] for t in TARGETS}}).to_csv(tmp / "reference.csv", index=False)
+
+    cfg = load_config(resolve=False)
+    cfg.paths.train_csv = str(tmp / "train.csv")
+    cfg.paths.reference_csv = str(tmp / "reference.csv")
+    cfg.labels.allow_soft_targets = True
+    cfg.labels.borderline_policy = "exclude"
+    cfg.labels.uncertain_weight = 0.0
+    merged_path = merge_label_details(cfg, [llm_path], tmp / "labels_details_all.csv")
+    assert "soft_target" in read_id_csv(merged_path).columns, "merge dropped the soft column"
+
+    direct = build_from_details(read_id_csv(llm_path), ids, cfg)
+    merged = build_from_details(read_id_csv(merged_path), ids, cfg)
+    for name in ("targets", "weights", "kinds"):
+        assert np.array_equal(getattr(direct, name)[:2], getattr(merged, name)[:2]), f"merge changed {name}"
+    acl, mcl, med, lat, frac = (TARGETS.index(t) for t in ("ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Fracture"))
+    # Uncertain (uncertain_weight 0) and borderline (policy exclude) cells train on their soft value.
+    for c, value in ((acl, 0.7), (mcl, 0.4), (med, 0.1), (lat, 0.05)):
+        assert merged.kinds[0, c] == KIND_SOFT and merged.targets[0, c] == np.float32(value) and merged.weights[0, c] == 1.0
+    assert merged.kinds[0, frac] == KIND_NOT_MENTIONED and merged.weights[0, frac] == 0.0
+    assert (merged.kinds[2] == KIND_NEGATIVE).all() and not merged.targets[2].any() and (merged.weights[2] == 1.0).all(), (
+        "the radiologist reference must replace the LLM soft value"
+    )
+
+    cfg.labels.allow_soft_targets = False
+    hard = build_from_details(read_id_csv(merged_path), ids, cfg)
+    assert hard.kinds[0, acl] == KIND_POSITIVE and hard.targets[0, acl] == 1.0, "allow_soft_targets=false must use the status"
+    assert hard.kinds[0, med] == KIND_BORDERLINE and hard.weights[0, med] == 0.0, "status path must keep the exclude policy"
+
+    for broken, where in (
+        (llm.assign(soft_target=llm["p_positive"]), "both soft columns"),
+        (llm.assign(p_positive=llm["p_positive"].fillna(0.5)), "soft value on not_mentioned"),
+        (llm.assign(p_positive=llm["p_positive"].replace(0.7, np.inf)), "infinite soft value"),
+    ):
+        path = tmp / "broken.csv"
+        broken.to_csv(path, index=False)
+        for call in (
+            lambda: merge_label_details(cfg, [path], tmp / "broken_all.csv"),
+            lambda: build_from_details(read_id_csv(path), ids, cfg),
+        ):
+            try:
+                call()
+            except ValueError:
+                continue
+            raise AssertionError(f"{where} was accepted")
+    return "p_positive survives the merge as soft_target; direct == merged; borderline/uncertain soft kept; reference wins"
+
+
+def check_details_missing_values(tmp_dir) -> str:
+    """Empty status/basis cells (NaN from a CSV, pd.NA in memory) are unknown, never a crash."""
+    from pathlib import Path
+
+    from .labels import KIND_NEGATIVE, KIND_POSITIVE, KIND_SOFT, KIND_UNKNOWN, build_from_details
+    from .merge_label_details import merge_label_details
+    from .schema import read_id_csv
+
+    tmp = Path(tmp_dir) / "details_missing"
+    tmp.mkdir(parents=True, exist_ok=True)
+    acl, mcl, med, lat = range(4)
+    cells = {t: ("not_mentioned", "not_mentioned", None) for t in TARGETS}
+    cells.update(
+        {
+            TARGETS[acl]: ("negative", None, None),  # basis cell empty -> masked
+            TARGETS[mcl]: ("negative", None, 0.1),  # ... unless a soft value is supplied
+            TARGETS[med]: ("positive", None, None),  # a positive does not need a basis
+        }
+    )
+    rows = [{STUDY_ID: "s1", "label": t, "status": s, "basis": b, "p_positive": p} for t, (s, b, p) in cells.items()]
+    rows += [{STUDY_ID: "s2", "label": t, "status": None, "basis": None, "p_positive": None} for t in TARGETS]  # unprocessed
+    frame = pd.DataFrame(rows)
+    path = tmp / "labels_details.csv"
+    frame.to_csv(path, index=False)
+
+    cfg = load_config(resolve=False)
+    cfg.labels.allow_soft_targets = True
+    from_csv = build_from_details(read_id_csv(path), ["s1", "s2"], cfg)
+    in_memory = build_from_details(frame.astype({"status": "string", "basis": "string"}), ["s1", "s2"], cfg)
+    for table in (from_csv, in_memory):
+        assert table.kinds[0, acl] == KIND_UNKNOWN and table.weights[0, acl] == 0.0, "empty basis became a firm negative"
+        assert table.kinds[0, mcl] == KIND_SOFT and table.weights[0, mcl] == 1.0
+        assert table.kinds[0, med] == KIND_POSITIVE and table.weights[0, med] == 1.0
+        assert (table.kinds[1] == KIND_UNKNOWN).all() and not table.weights[1].any(), "an unprocessed study was supervised"
+
+    no_basis = build_from_details(frame.drop(columns="basis"), ["s1"], cfg)
+    assert no_basis.kinds[0, acl] == KIND_NEGATIVE and no_basis.weights[0, acl] == 1.0, "no basis column: firm negative"
+
+    pd.DataFrame({STUDY_ID: ["s1", "s2"]}).to_csv(tmp / "train.csv", index=False)
+    cfg.paths.train_csv = str(tmp / "train.csv")
+    cfg.paths.reference_csv = None
+    try:
+        merge_label_details(cfg, [path], tmp / "merged.csv")
+    except ValueError as error:
+        assert "no status" in str(error), f"unclear merge error: {error}"
+    else:
+        raise AssertionError("the merge accepted rows without a status")
+    return "empty basis masks a negative; empty status is unknown; no basis column keeps firm negatives"
+
+
+def check_statuses_all_targets(tmp_dir) -> str:
+    """Every target column of a wide status export is read, spaces and apostrophes included."""
+    from pathlib import Path
+
+    from .labels import KIND_NEGATIVE, KIND_NOT_MENTIONED, KIND_POSITIVE, KIND_UNCERTAIN, build_label_table
+
+    cycle = [("positive", KIND_POSITIVE, 1.0), ("negative", KIND_NEGATIVE, 1.0),
+             ("uncertain", KIND_UNCERTAIN, 0.0), ("not_mentioned", KIND_NOT_MENTIONED, 0.0)]
+    rows = [
+        {STUDY_ID: "s1", **{t: "positive" for t in TARGETS}},
+        {STUDY_ID: "s2", **{t: cycle[c % 4][0] for c, t in enumerate(TARGETS)}},
+    ]
+    frame = pd.DataFrame(rows)[[STUDY_ID, *reversed(TARGETS)]]  # column order must not matter
+    path = Path(tmp_dir) / "labels_statuses.csv"
+    frame.to_csv(path, index=False)
+
+    cfg = load_config(resolve=False)
+    cfg.labels.source = "auto"
+    cfg.labels.borderline_policy = "as_negative"
+    cfg.labels.uncertain_weight = 0.0
+    cfg.labels.unmentioned_weight = 0.0
+    cfg.labels.unmentioned_weight_per_target = {}
+    cfg.paths.labels_details_csv = None
+    cfg.paths.labels_statuses_csv = str(path)
+    table = build_label_table(cfg, ["s1", "s2"])
+    assert table.source == "statuses"
+    lost = [t for c, t in enumerate(TARGETS) if table.weights[0, c] != 1.0 or table.kinds[0, c] != KIND_POSITIVE]
+    assert not lost, f"all-positive study lost targets {lost}"
+    for c, target in enumerate(TARGETS):
+        _, kind, weight = cycle[c % 4]
+        assert table.kinds[1, c] == kind and table.weights[1, c] == weight, f"{target}: {table.kinds[1, c]} != {kind}"
+    return "all 12 status columns read by name, including 'Medial Meniscus' and \"Baker's\""
+
+
+def check_wide_soft_source(tmp_dir) -> str:
+    """Under borderline_policy='exclude' a soft wide export keeps its borderline soft values."""
+    from pathlib import Path
+
+    from .labels import KIND_SOFT, build_label_table
+
+    tmp = Path(tmp_dir) / "wide_soft"
+    tmp.mkdir(parents=True, exist_ok=True)
+    acl, mcl, med = (TARGETS.index(t) for t in ("ACL", "MCL", "Medial Meniscus"))
+
+    def write(name: str, row: dict[str, float]) -> str:
+        path = tmp / name
+        pd.DataFrame([{STUDY_ID: "s1", **{t: row.get(t, np.nan) for t in TARGETS}}]).to_csv(path, index=False)
+        return str(path)
+
+    # The soft notebook: positive 0.7, uncertain 0.4, borderline negative 0.1; the exclude file blanks the borderline cell.
+    soft = {"ACL": 0.7, "MCL": 0.4, "Medial Meniscus": 0.1}
+    binary = {"ACL": 1.0, "Medial Meniscus": 0.0}  # binary exports: uncertain blank, borderline written as 0
+    exports = {
+        "soft": (write("soft.csv", soft), write("soft_excl.csv", {**soft, "Medial Meniscus": np.nan})),
+        "binary": (write("bin.csv", binary), write("bin_excl.csv", {**binary, "Medial Meniscus": np.nan})),
+    }
+    for source in ("wide", "auto"):
+        for kind, (plain, excluded) in exports.items():
+            cfg = load_config(resolve=False)
+            cfg.labels.source = source
+            cfg.labels.borderline_policy = "exclude"
+            cfg.labels.allow_soft_targets = True
+            cfg.paths.labels_details_csv = None
+            cfg.paths.labels_statuses_csv = None
+            cfg.paths.labels_predictions_csv = plain
+            cfg.paths.labels_predictions_exclude_borderline_csv = excluded
+            table = build_label_table(cfg, ["s1"])
+            if kind == "soft":
+                assert table.source == "wide", f"{source}: a soft export must win over its exclude_borderline copy"
+                for c, value in ((acl, 0.7), (mcl, 0.4), (med, 0.1)):
+                    assert table.kinds[0, c] == KIND_SOFT and table.targets[0, c] == np.float32(value)
+                    assert table.weights[0, c] == 1.0, f"{source}: soft cell {TARGETS[c]} lost its weight"
+            else:
+                assert table.source == "wide_exclude_borderline", f"{source}: a binary export must honour exclude"
+                assert table.weights[0, med] == 0.0, f"{source}: a binary borderline 0 entered training"
+    return "soft wide export keeps borderline/uncertain soft values; binary export still excludes borderline"
+
+
 def check_frozen_reference_roundtrip(tmp_dir) -> str:
     from pathlib import Path
 
@@ -871,6 +1077,50 @@ def check_soft_auc_bruteforce() -> str:
     assert math.isclose(soft_roc_auc(perfect, perfect), 1.0), "a score equal to the reference must rank perfectly"
     assert math.isclose(soft_roc_auc(perfect, -perfect), 0.0), "a reversed score must rank at 0"
     return "soft ROC-AUC matches the brute-force pair sum on a continuous reference"
+
+
+def check_nonfinite_scores_rejected() -> str:
+    """A NaN/Inf prediction must fail the evaluation, never rank as the top score."""
+    references = {
+        "binary": np.tile(np.array([0.0, 1.0, 0.0, 1.0])[:, None], (1, N_TARGETS)),
+        "mixed": np.tile(np.array([0.0, 1.0, 0.3, 0.8])[:, None], (1, N_TARGETS)),
+        "soft": np.tile(np.array([0.2, 0.8, 0.4, 0.6])[:, None], (1, N_TARGETS)),
+    }
+    valid = np.ones((4, N_TARGETS), dtype=bool)
+    for name, reference in references.items():
+        for bad in (np.nan, np.inf, -np.inf):
+            scores = np.tile(np.array([0.1, 0.9, 0.3, 0.7])[:, None], (1, N_TARGETS))
+            scores[3, N_TARGETS - 1] = bad  # a single broken cell
+            for call in (
+                lambda: evaluate_predictions(scores, reference, valid),
+                lambda: soft_roc_auc(reference[:, -1], scores[:, -1]),
+            ):
+                try:
+                    call()
+                except ValueError:
+                    continue
+                raise AssertionError(f"a {bad} score on a {name} reference was accepted")
+
+    # The original failure: NaN on the high-reference study scored a perfect 1.0.
+    try:
+        evaluate_predictions(
+            np.tile([[0.1], [np.nan]], (1, N_TARGETS)), np.tile([[0.2], [0.8]], (1, N_TARGETS)), valid[:2]
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("NaN scores produced a macro soft ROC-AUC instead of an error")
+
+    # A broken output is an error even where the reference is not valid.
+    scores = np.tile(np.array([0.1, 0.9, 0.3, 0.7])[:, None], (1, N_TARGETS))
+    scores[0, 0] = np.nan
+    masked = valid.copy()
+    masked[0, 0] = False
+    try:
+        evaluate_predictions(scores, references["binary"], masked)
+    except ValueError:
+        return "non-finite scores raise on binary, mixed and soft references, masked cells included"
+    raise AssertionError("a NaN score in a masked cell was accepted")
 
 
 def check_soft_reference() -> str:
@@ -1083,17 +1333,28 @@ def check_float16_transport(cfg: Config) -> str:
     Only the deferred (GPU-augmented) path may do this: its bag is gathered slices of a
     float16 cache, so widening back to float32 is exact. The CPU path normalises in the
     worker and must stay float32.
-    """
-    small = cfg.copy()
-    small.augment.device = "cuda"  # deferred path, regardless of what is installed
-    small.data.cache_dtype = "float16"
-    deferred = _Float16CacheDataset(small, [f"study{i}" for i in range(2)], None, train=True)
-    assert deferred.transport_dtype == torch.float16, "deferred bags should travel as float16"
 
+    Hardware-independent: the deferred decision is pinned to "cuda" here, because packing a
+    deferred bag needs no GPU (augmentation happens later, in the trainer). Whether a real
+    host resolves to cuda or falls back to cpu is `augment_device_resolution`'s business.
+    """
+    from unittest import mock
+
+    from . import dataset as dataset_module
+
+    small = cfg.copy()
+    small.augment.device = "cuda"
+    small.data.cache_dtype = "float16"
     wide = small.copy()
     wide.data.cache_dtype = "float32"
-    reference = _Float16CacheDataset(wide, [f"study{i}" for i in range(2)], None, train=True)
+    ids = [f"study{i}" for i in range(2)]
+    with mock.patch.object(dataset_module, "resolve_augment_device", return_value="cuda"):
+        deferred = _Float16CacheDataset(small, ids, None, train=True)
+        reference = _Float16CacheDataset(wide, ids, None, train=True)
+        val = _Float16CacheDataset(small, ["study0"], None, train=False)
+    assert deferred.defer_augment and deferred.transport_dtype == torch.float16, "deferred bags should travel as float16"
     assert reference.transport_dtype == torch.float32
+    assert val.transport_dtype == torch.float32, "the validation path normalises in the worker"
 
     for index in range(2):
         packed = deferred[index]["images"]
@@ -1105,8 +1366,6 @@ def check_float16_transport(cfg: Config) -> str:
     cpu_path = small.copy()
     cpu_path.augment.device = "cpu"
     assert _Float16CacheDataset(cpu_path, ["study0"], None, train=True).transport_dtype == torch.float32
-    val = _Float16CacheDataset(small, ["study0"], None, train=False)
-    assert val.transport_dtype == torch.float32, "the validation path normalises in the worker"
     mb = packed.element_size() * packed.numel() / 1024**2
     return f"deferred bags float16 and bit-identical ({mb:.1f} MB/study instead of {2 * mb:.1f}); CPU and val paths float32"
 
@@ -1320,6 +1579,186 @@ def check_checkpoint_roundtrip(cfg: Config, tmp_dir) -> str:
     return "checkpoint reload reproduces identical logits"
 
 
+def check_skipped_amp_step() -> str:
+    """A step the GradScaler skips (inf gradients) must not advance the LR schedule or global_step."""
+    from types import SimpleNamespace
+
+    from .train import Trainer, TrainState, make_scheduler
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    cfg = load_config(resolve=False)
+    cfg.train.grad_clip = 1.0
+    trainer = SimpleNamespace(
+        cfg=cfg,
+        model=model,
+        optimizer=optimizer,
+        scheduler=make_scheduler(optimizer, warmup_steps=2, total_steps=10),
+        scaler=torch.amp.GradScaler("cpu", init_scale=2.0**8),  # a real scaler, no CUDA needed
+        state=TrainState(),
+    )
+    x = torch.ones(4, 2)
+
+    def step(loss_scale: float) -> None:
+        optimizer.zero_grad(set_to_none=True)
+        trainer.scaler.scale(model(x).sum() * loss_scale).backward()
+        Trainer._optimizer_step(trainer)
+
+    step(1.0)
+    assert trainer.state.global_step == 1 and trainer.scheduler.last_epoch == 1 and trainer.state.skipped_steps == 0
+    weights, lr = model.weight.detach().clone(), optimizer.param_groups[0]["lr"]
+    step(float("inf"))  # overflow: the scaler must skip the update
+    assert torch.equal(model.weight, weights), "the scaler did not skip the overflowing step"
+    assert trainer.state.global_step == 1 and trainer.scheduler.last_epoch == 1, "a skipped step advanced the schedule"
+    assert trainer.state.skipped_steps == 1 and optimizer.param_groups[0]["lr"] == lr
+    step(1.0)
+    assert trainer.state.global_step == 2 and trainer.scheduler.last_epoch == 2
+    return "an overflow-skipped step leaves the LR schedule and global_step alone and is counted"
+
+
+def check_inference_architecture(cfg: Config, tmp_dir) -> str:
+    """Inference rebuilds the checkpoint's architecture and refuses silently different inputs."""
+    from pathlib import Path
+
+    from .constants import CHECKPOINT_VERSION
+    from .evaluate import load_checkpoint_for_inference
+    from .model import build_model
+
+    trained = cfg.copy()
+    trained.model.spatial_pool = "attention"
+    trained.model.weights = "none"
+    torch.manual_seed(5)
+    model = build_model(trained).eval()
+    path = Path(tmp_dir) / "attention.pt"
+    torch.save(
+        {
+            "version": CHECKPOINT_VERSION,
+            "target_order": list(TARGETS),
+            "config": trained.to_dict(),
+            "model_description": model.describe(),
+            "model": model.state_dict(),
+        },
+        path,
+    )
+    batch = _random_batch(cfg, b=1, seed=6)
+    with torch.no_grad():
+        expected = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+
+    caller = cfg.copy()
+    caller.model.spatial_pool = "avg"  # the base config: must not decide the architecture
+    loaded, _ = load_checkpoint_for_inference(caller, path)
+    with torch.no_grad():
+        actual = loaded(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+    assert loaded.describe()["spatial_pool"] == "attention" and torch.allclose(expected, actual, atol=1e-6)
+
+    other_norm = cfg.copy()
+    other_norm.data.encoder_normalization = "imagenet" if cfg.data.encoder_normalization != "imagenet" else "mri_scalar"
+    reordered = cfg.copy()
+    reordered.data.series_slots = list(reversed(cfg.data.series_slots))  # same shapes, other meaning
+    for caller, key in ((other_norm, "data.encoder_normalization"), (reordered, "data.series_slots")):
+        try:
+            load_checkpoint_for_inference(caller, path)
+        except ValueError as error:
+            assert key in str(error), f"refusal does not name {key}: {error}"
+        else:
+            raise AssertionError(f"a different {key} was accepted silently")
+        load_checkpoint_for_inference(caller, path, allow_data_overrides=[key])  # explicit override works
+    try:
+        load_checkpoint_for_inference(cfg, path, allow_data_overrides=["model.spatial_pool"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an override outside the data keys was accepted")
+    return "architecture rebuilt from the checkpoint (attention under an avg config); input mismatches need an explicit override"
+
+
+def check_exact_resume(cfg: Config) -> str:
+    """Stopping after epoch 0 and resuming from last.pt must repeat the uninterrupted run exactly."""
+    import tempfile
+    from pathlib import Path
+
+    small = cfg.copy()
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.microbatch_studies = 1
+    small.train.accumulation_steps = 2
+    small.train.early_stopping_patience = 10
+    small.train.resume = None
+    small.train.init_weights = None
+    with tempfile.TemporaryDirectory(prefix="knee_mri_resume_") as tmp:
+        small.paths.output_dir = str(Path(tmp))
+        try:
+            return _exact_resume_checks(small, Path(tmp))
+        finally:
+            remove_file_logging(tmp)  # Windows cannot delete an open run.log
+
+
+def _exact_resume_checks(small: Config, tmp) -> str:
+    from .train import build_synthetic_trainer
+
+    def build(run_cfg: Config, name: str):
+        return build_synthetic_trainer(run_cfg, n_studies=6, epochs=3, name=name)
+
+    full = build(small, "full")
+    full.fit()
+
+    interrupted = build(small, "interrupted")
+    interrupted.cfg.train.max_epochs = 1  # stop after epoch 0; schedule and signature were built for 3
+    interrupted.fit()
+
+    # The first epoch always improves, so probe a non-zero early-stopping counter directly.
+    interrupted.state.epochs_without_improvement = 4
+    interrupted.save_checkpoint("probe.pt")
+    probe_cfg = small.copy()
+    probe_cfg.train.resume = str(tmp / "interrupted" / "probe.pt")
+    assert build(probe_cfg, "probe").state.epochs_without_improvement == 4, "early-stopping counter reset on resume"
+
+    resume_cfg = small.copy()
+    resume_cfg.train.resume = str(tmp / "interrupted" / "last.pt")
+    resumed = build(resume_cfg, "resumed")
+    assert resumed.state.epoch == 1 and len(resumed.state.history) == 1, "history/epoch not restored"
+    resumed.fit()
+
+    volatile = ["seconds", "studies_per_second", "peak_gpu_gb"]
+    expected = pd.DataFrame(full.state.history).drop(columns=volatile)
+    actual = pd.DataFrame(resumed.state.history).drop(columns=volatile)
+    pd.testing.assert_frame_equal(expected, actual, check_exact=False, rtol=1e-6, atol=1e-7)
+    assert len(pd.read_csv(tmp / "resumed" / "history.csv")) == 3, "history.csv lost the epochs before resume"
+    for key in ("global_step", "best_epoch", "epochs_without_improvement"):
+        assert getattr(full.state, key) == getattr(resumed.state, key), f"{key} differs after resume"
+    assert math.isclose(full.state.best_score, resumed.state.best_score, rel_tol=1e-6)
+    assert torch.equal(full.sampler_generator.get_state(), resumed.sampler_generator.get_state()), "sampler order drifted"
+    full_params, resumed_params = full.model.state_dict(), resumed.model.state_dict()
+    drift = max(float((full_params[k].float() - resumed_params[k].float()).abs().max()) for k in full_params)
+    assert drift <= 1e-6, f"model weights differ after resume (max {drift:.2e})"
+
+    # Another experiment must not resume from this checkpoint ...
+    other = resume_cfg.copy()
+    other.eval.selection_metric = "macro_roc_auc"
+    try:
+        build(other, "other")
+    except ValueError as error:
+        assert "eval.selection_metric" in str(error), f"mismatch not named: {error}"
+    else:
+        raise AssertionError("a resume with another selection metric was accepted")
+
+    # ... but may start from its weights, with fresh state.
+    other.train.resume = None
+    other.train.init_weights = str(tmp / "full" / "last.pt")
+    tuned = build(other, "tuned")
+    assert tuned.state.epoch == 0 and not tuned.state.history and tuned.state.best_score == float("-inf")
+    assert all(torch.equal(v, full_params[k]) for k, v in tuned.model.state_dict().items()), "init_weights not loaded"
+    other.train.resume = other.train.init_weights
+    try:
+        build(other, "both")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("resume and init_weights together were accepted")
+    return f"resume after epoch 0 repeats the uninterrupted run (max weight diff {drift:.1e}); mismatches refused"
+
+
 def check_train_step_reduces_loss(cfg: Config) -> str:
     """A real forward/backward/step on synthetic bags must be able to reduce the loss."""
     model = _tiny_model(cfg, seed=13).train()
@@ -1373,9 +1812,15 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("label_join_by_key", check_label_join),
             ("empty_numeric_is_unknown", check_empty_numeric_is_unknown),
             ("unmentioned_weight_per_target", check_unmentioned_weight_per_target),
+            ("details_soft_roundtrip", lambda: check_details_soft_roundtrip(tmp_dir)),
+            ("wide_soft_source", lambda: check_wide_soft_source(tmp_dir)),
+            ("statuses_all_targets", lambda: check_statuses_all_targets(tmp_dir)),
+            ("details_missing_values", lambda: check_details_missing_values(tmp_dir)),
             ("frozen_reference_roundtrip", lambda: check_frozen_reference_roundtrip(tmp_dir)),
             ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
+            ("nonfinite_scores_rejected", check_nonfinite_scores_rejected),
+            ("skipped_amp_step", check_skipped_amp_step),
             ("soft_reference", check_soft_reference),
             ("bootstrap_keeps_soft", check_bootstrap_keeps_soft),
             ("crop_edge_fill", check_crop_edge_fill),
@@ -1394,6 +1839,8 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("gradient_accumulation", lambda: check_accumulation(small)),
                 ("sigmoid_not_softmax", lambda: check_sigmoid_outputs(small)),
                 ("checkpoint_roundtrip", lambda: check_checkpoint_roundtrip(small, tmp_dir)),
+                ("exact_resume", lambda: check_exact_resume(small)),
+                ("inference_architecture", lambda: check_inference_architecture(small, tmp_dir)),
                 ("train_step_reduces_loss", lambda: check_train_step_reduces_loss(small)),
                 ("epoch_reaches_workers", lambda: check_epoch_reaches_workers(small)),
                 ("window_training_step", lambda: check_window_training_step(small)),

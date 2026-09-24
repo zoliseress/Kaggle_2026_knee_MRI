@@ -12,7 +12,9 @@ Rules enforced here:
     macro, which is not the same object as any official competition metric;
   * ROC-AUC, AP and the threshold counts use the hard (0/1) reference cells only. The
     soft ROC-AUC (`soft_roc_auc`) uses every valid cell, continuous ones included, and
-    equals ROC-AUC exactly when the reference is binary.
+    equals ROC-AUC exactly when the reference is binary;
+  * a non-finite score (NaN, +-Inf) is an error, never imputed or dropped: NaN sorts as
+    the largest score and would otherwise rank "perfectly".
 """
 
 from __future__ import annotations
@@ -85,6 +87,9 @@ def soft_roc_auc(y: np.ndarray, scores: np.ndarray, min_support: float = 1.0) ->
         raise ValueError("y and scores must be 1-D arrays of the same length")
     if y.size and (not np.isfinite(y).all() or y.min() < 0.0 or y.max() > 1.0):
         raise ValueError("soft_roc_auc reference values must be finite and in [0, 1]")
+    if not np.isfinite(s).all():
+        bad = np.flatnonzero(~np.isfinite(s))
+        raise ValueError(f"soft_roc_auc scores must be finite; {bad.size} non-finite at positions {bad[:5].tolist()}")
     pos_mass, neg_mass = float(y.sum()), float((1.0 - y).sum())
     if pos_mass < min_support or neg_mass < min_support:
         return float("nan")
@@ -204,7 +209,12 @@ def evaluate_predictions(
         raise ValueError("scores, reference and valid must share the same [N, 12] shape")
     if scores.shape[1] != N_TARGETS:
         raise ValueError(f"expected {N_TARGETS} target columns, got {scores.shape[1]}")
-    if scores.size and (np.nanmin(scores) < 0.0 or np.nanmax(scores) > 1.0):
+    finite = np.isfinite(scores)
+    if not finite.all():
+        rows, cols = np.nonzero(~finite)
+        examples = ", ".join(f"row {r}/{TARGETS[c]}={scores[r, c]}" for r, c in zip(rows[:5], cols[:5]))
+        raise ValueError(f"scores contain {rows.size} non-finite values (e.g. {examples}); the model output is broken")
+    if scores.size and (scores.min() < 0.0 or scores.max() > 1.0):
         raise ValueError("scores must be sigmoid probabilities in [0, 1], not logits")
 
     rows = [

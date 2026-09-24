@@ -11,8 +11,10 @@ Tiny-subset overfit numbers are never validation performance, and the run summar
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -173,7 +175,46 @@ class TrainState:
     best_score: float = float("-inf")
     best_epoch: int = -1
     epochs_without_improvement: int = 0
+    skipped_steps: int = 0  # optimizer steps the GradScaler skipped on inf/NaN gradients
     history: list[dict] = field(default_factory=list)
+
+
+def _fingerprint(*parts: Any) -> str:
+    """sha256 over strings and arrays; identifies label and reference content, not file paths."""
+    digest = hashlib.sha256()
+    for part in parts:
+        if isinstance(part, np.ndarray):
+            digest.update(str((part.dtype, part.shape)).encode())
+            digest.update(np.ascontiguousarray(part).tobytes())
+        else:
+            digest.update(json.dumps(part, sort_keys=True, default=str).encode())
+    return digest.hexdigest()
+
+
+def _train_label_fingerprint(dataset: Dataset) -> str:
+    table = getattr(dataset, "label_table", None)
+    if table is not None:
+        return _fingerprint(list(dataset.study_ids), table.targets.astype(np.float32), table.weights.astype(np.float32))
+    return _fingerprint(len(dataset), getattr(dataset, "seed", None), dataset.label_weight_matrix())
+
+
+# Everything an exact resume must share with the checkpoint. File paths are left out on
+# purpose: the same labels on another machine are still the same labels.
+RESUME_CONFIG_KEYS = (
+    "seed", "split.fold", "data", "model", "augment", "eval.selection_metric",
+    "train.loss_normalization", "train.microbatch_studies", "train.accumulation_steps", "train.warmup_epochs",
+    "train.max_epochs", "train.encoder_lr", "train.head_lr", "train.weight_decay", "train.grad_clip",
+    "train.early_stopping_patience", "train.amp",
+)
+# Model keys that do not change what is computed: the pretrained source is overwritten by
+# the checkpoint, and chunking only bounds memory.
+RESUME_IGNORED_MODEL_KEYS = ("weights", "encoder_chunk_size")
+
+
+def _dotted(tree: dict, key: str) -> Any:
+    for part in key.split("."):
+        tree = tree.get(part) if isinstance(tree, dict) else None
+    return tree
 
 
 class Trainer:
@@ -216,6 +257,7 @@ class Trainer:
             bool(cfg.augment.enabled),
         )
 
+        self.sampler_generator: torch.Generator | None = None  # set by the shuffled loader
         self.train_loader = self._make_loader(train_dataset, shuffle=True, batch_size=int(cfg.train.microbatch_studies))
         self.val_loader = self._make_loader(
             val_dataset, shuffle=False, batch_size=int(cfg.train.eval_batch_studies), role="eval"
@@ -247,6 +289,7 @@ class Trainer:
             self.device_spec.device.type, enabled=bool(self.device_spec.use_grad_scaler)
         )
         self.state = TrainState()
+        self.resume_signature = self._resume_signature(train_dataset)
         LOG.info(
             "Effective batch: %d studies/micro-batch x %d accumulation = %d studies per optimizer step; "
             "%d micro-batches -> %d optimizer steps per epoch",
@@ -286,7 +329,24 @@ class Trainer:
             generator.manual_seed(int(self.cfg.seed))
             kwargs["shuffle"] = False
             kwargs["sampler"] = EpochSampler(RandomSampler(dataset, generator=generator))
+            self.sampler_generator = generator  # its state is the next epoch's order; checkpointed
         return DataLoader(dataset, **kwargs)
+
+    def _resume_signature(self, train_dataset: Dataset) -> dict:
+        """What an exact resume must share with its checkpoint (see RESUME_CONFIG_KEYS)."""
+        tree = self.cfg.to_dict()
+        signature: dict[str, Any] = {key: _dotted(tree, key) for key in RESUME_CONFIG_KEYS}
+        signature["model"] = {
+            k: v for k, v in (signature["model"] or {}).items() if k not in RESUME_IGNORED_MODEL_KEYS
+        }
+        signature["mode"] = self.mode
+        signature["device"] = self.device_spec.device.type
+        signature["augment_device"] = self.augment_device
+        signature["train_labels"] = _train_label_fingerprint(train_dataset)
+        signature["validation_reference"] = _fingerprint(
+            list(self.reference.study_ids), self.reference.values.astype(np.float32), self.reference.valid.astype(bool)
+        )
+        return json.loads(json.dumps(signature, sort_keys=True, default=str))  # tuples -> lists, as stored
 
     # -- one epoch -------------------------------------------------------------------
 
@@ -322,8 +382,14 @@ class Trainer:
         if float(self.cfg.train.grad_clip) > 0:
             self.scaler.unscale_(self.optimizer)  # clip on unscaled gradients
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.cfg.train.grad_clip))
+        scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if scale_before is not None and self.scaler.get_scale() < scale_before:
+            # Inf/NaN gradients: the scaler skipped optimizer.step() and lowered the scale. The
+            # schedule follows the updates actually made, so it does not advance either.
+            self.state.skipped_steps += 1
+            return
         self.scheduler.step()
         self.state.global_step += 1
 
@@ -369,6 +435,7 @@ class Trainer:
                 "seconds": round(time.time() - started, 2),
                 "studies_per_second": round(n_studies / max(time.time() - started, 1e-6), 3),
                 "optimizer_steps": self.state.global_step,
+                "skipped_optimizer_steps": self.state.skipped_steps,
                 "encoder_lr": self.optimizer.param_groups[0]["lr"],
                 "head_lr": self.optimizer.param_groups[1]["lr"],
                 "peak_gpu_gb": round(peak_gpu_memory_gb(), 3),
@@ -551,10 +618,19 @@ class Trainer:
                 "prep_hash": self.provenance.get("prep_hash", ""),
             },
             "provenance": self.provenance,
+            "resume_signature": self.resume_signature,
+            "train_state": {
+                "epochs_without_improvement": self.state.epochs_without_improvement,
+                "skipped_steps": self.state.skipped_steps,
+                "history": list(self.state.history),
+            },
             "rng_state": {
+                "python": random.getstate(),
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                 "numpy": np.random.get_state(),
+                "sampler": self.sampler_generator.get_state() if self.sampler_generator is not None else None,
+                "augment": self.augment_generator.get_state(),
             },
             **(extra or {}),
         }
@@ -564,7 +640,7 @@ class Trainer:
         torch.save(self.checkpoint_payload(extra), path)
         return path
 
-    def load_checkpoint(self, path: str | Path) -> None:
+    def _read_checkpoint(self, path: str | Path) -> dict:
         payload = torch.load(str(path), map_location=self.device_spec.device, weights_only=False)
         if payload.get("target_order") != list(TARGETS):
             raise ValueError(f"Checkpoint target order {payload.get('target_order')} differs from {TARGETS}")
@@ -577,36 +653,79 @@ class Trainer:
                 stored_hash,
                 self.provenance.get("prep_hash"),
             )
+        return payload
+
+    def load_weights(self, path: str | Path) -> None:
+        """Fine-tune start (`train.init_weights`): model weights only.
+
+        Optimizer, scheduler, best score, history and early stopping start fresh, so the
+        new run may use other labels, another reference or another selection metric.
+        """
+        payload = self._read_checkpoint(path)
+        self.model.load_state_dict(payload["model"])
+        LOG.info(
+            "Initialised the model from %s (epoch %s of that run); optimizer, schedule, best score and "
+            "history start fresh.",
+            path,
+            payload.get("epoch"),
+        )
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Exact resume (`train.resume`) at an epoch boundary.
+
+        The run continues as if it had never stopped: model, optimizer, scheduler, scaler,
+        early-stopping state, history and every RNG (python, numpy, torch CPU/CUDA, the
+        sampler and the augmentation generator) come back. The checkpoint must come from the
+        same experiment - same labels, reference, fold, selection metric and training setup;
+        anything else is refused. Use `train.init_weights` to start a new run from its weights.
+        """
+        payload = self._read_checkpoint(path)
+        stored = payload.get("resume_signature")
+        if stored is None:
+            raise ValueError(
+                f"{path} predates exact resume (no resume_signature). Use train.init_weights to start a "
+                "new run from its weights."
+            )
+        differing = sorted(k for k in set(stored) | set(self.resume_signature) if stored.get(k) != self.resume_signature.get(k))
+        if differing:
+            details = "; ".join(f"{k}: checkpoint={stored.get(k)!r} now={self.resume_signature.get(k)!r}" for k in differing[:6])
+            raise ValueError(
+                f"Cannot resume from {path}: the run differs in {differing}. {details}. A resume must "
+                "continue the same experiment; use train.init_weights for a new run from these weights."
+            )
+
         self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         # The stored epoch is the last *completed* one; training continues with the next.
-        self.state.epoch = int(payload.get("epoch", -1)) + 1
-        self.state.global_step = int(payload.get("global_step", 0))
-        self.state.best_score = float(payload.get("best_score", float("-inf")))
-        self.state.best_epoch = int(payload.get("best_epoch", -1))
-        # Checkpoints from before eval.selection_metric existed were selected on macro ROC-AUC.
-        stored_metric = payload.get("selection_metric", "macro_roc_auc")
-        if stored_metric != self.selection_name:
-            LOG.warning(
-                "Checkpoint best score was measured as %s but this run selects on %s; the two agree "
-                "only on a binary reference.",
-                stored_metric,
-                self.selection_name,
-            )
-        rng = payload.get("rng_state", {})
-        if "torch" in rng:
-            torch.set_rng_state(rng["torch"].cpu() if hasattr(rng["torch"], "cpu") else rng["torch"])
-        if rng.get("numpy") is not None:
-            np.random.set_state(rng["numpy"])
+        self.state.epoch = int(payload["epoch"]) + 1
+        self.state.global_step = int(payload["global_step"])
+        self.state.best_score = float(payload["best_score"])
+        self.state.best_epoch = int(payload["best_epoch"])
+        train_state = payload["train_state"]
+        self.state.epochs_without_improvement = int(train_state["epochs_without_improvement"])
+        self.state.skipped_steps = int(train_state["skipped_steps"])
+        self.state.history = list(train_state["history"])
+
+        rng = payload["rng_state"]
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"].cpu())
+        if rng["cuda"]:
+            torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
+        if rng["sampler"] is not None:
+            self.sampler_generator.set_state(rng["sampler"].cpu())
+        self.augment_generator.set_state(rng["augment"].cpu())
         LOG.info(
-            "Resumed from %s at epoch %d (best %.4f @ epoch %d). Resume is exact at epoch boundaries only; "
-            "mid-epoch resume is not implemented.",
+            "Resumed from %s at epoch %d (best %.4f @ epoch %d, %d epochs without improvement, %d history "
+            "rows). Resume is exact at epoch boundaries only; mid-epoch resume is not implemented.",
             path,
             self.state.epoch,
             self.state.best_score,
             self.state.best_epoch,
+            self.state.epochs_without_improvement,
+            len(self.state.history),
         )
 
     # -- driver ----------------------------------------------------------------------
@@ -630,6 +749,7 @@ class Trainer:
                 "train_objective": train_summary["objective"],
                 "train_empty_microbatches": train_summary["n_empty_microbatches"],
                 "optimizer_steps": train_summary["optimizer_steps"],
+                "skipped_optimizer_steps": train_summary["skipped_optimizer_steps"],
                 "encoder_lr": train_summary["encoder_lr"],
                 "head_lr": train_summary["head_lr"],
                 "seconds": train_summary["seconds"],
@@ -744,8 +864,25 @@ def _run_dir(cfg: Config, mode: str, name: str | None = None) -> Path:
     return Path(cfg.paths.output_dir) / label
 
 
+def _apply_start(trainer: Trainer, cfg: Config) -> None:
+    """`train.resume` continues a run exactly; `train.init_weights` starts a new one from its weights."""
+    resume, init_weights = cfg.train.get("resume"), cfg.train.get("init_weights")
+    if resume and init_weights:
+        raise ValueError("Set train.resume (continue the same run) or train.init_weights (new run), not both.")
+    if resume:
+        trainer.load_checkpoint(resume)
+    elif init_weights:
+        trainer.load_weights(init_weights)
+
+
 def run_synthetic(cfg: Config, n_studies: int = 16, epochs: int | None = None, name: str | None = None) -> dict:
     """Smoke test: full training path on generated images, no dataset required."""
+    return build_synthetic_trainer(cfg, n_studies, epochs, name).fit()
+
+
+def build_synthetic_trainer(
+    cfg: Config, n_studies: int = 16, epochs: int | None = None, name: str | None = None
+) -> Trainer:
     cfg = cfg.copy()
     if epochs is not None:
         cfg.train.max_epochs = int(epochs)
@@ -780,7 +917,8 @@ def run_synthetic(cfg: Config, n_studies: int = 16, epochs: int | None = None, n
         mode="synthetic",
         provenance={"label_source": "synthetic", "prep_hash": "synthetic"},
     )
-    return trainer.fit()
+    _apply_start(trainer, cfg)
+    return trainer
 
 
 def _report_split_label_counts(
@@ -895,8 +1033,7 @@ def _prepare_real_run(
 
     model = build_model(cfg)
     trainer = Trainer(cfg, model, train_ds, val_ds, reference, run_dir, mode=mode, provenance=provenance)
-    if cfg.train.get("resume"):
-        trainer.load_checkpoint(cfg.train.resume)
+    _apply_start(trainer, cfg)
     return trainer, provenance
 
 

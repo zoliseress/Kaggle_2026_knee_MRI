@@ -230,7 +230,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     from .evaluate import evaluate_checkpoint
 
     cfg = _load(args)
-    summary = evaluate_checkpoint(cfg, args.checkpoint, out_dir=args.out_dir, partition=args.partition)
+    summary = evaluate_checkpoint(
+        cfg,
+        args.checkpoint,
+        out_dir=args.out_dir,
+        partition=args.partition,
+        allow_data_overrides=args.allow_data_override or (),
+    )
     print(json.dumps(summary, indent=2, default=str))
     return 0
 
@@ -392,6 +398,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--partition", choices=["validation", "reference_holdout"], default="validation")
     p.add_argument("--out-dir", default=None)
+    p.add_argument(
+        "--allow-data-override",
+        action="append",
+        metavar="KEY",
+        help="Accept a data.* input setting that differs from the checkpoint's training config (repeatable)",
+    )
     p.set_defaults(func=cmd_evaluate)
 
     p = _common(sub.add_parser("merge-oof", help="Merge complete, verified per-fold predictions"))

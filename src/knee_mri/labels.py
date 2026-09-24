@@ -48,6 +48,19 @@ KIND_SOFT = "soft"
 NEGATIVE_BASES_FIRM = {"explicit_absence", "below_threshold", "reference"}
 BORDERLINE_BASES = {"borderline"}
 
+# The long-form soft value is P(positive), never the confidence of the status decision.
+# `soft_target` is the canonical name; the soft labelling notebooks export `p_positive`.
+SOFT_COLUMN = "soft_target"
+SOFT_COLUMN_ALIASES = (SOFT_COLUMN, "p_positive")
+
+
+def soft_column(columns, where: str) -> str | None:
+    """The column carrying the long-form soft value, or None. Two candidates are ambiguous."""
+    present = [c for c in SOFT_COLUMN_ALIASES if c in columns]
+    if len(present) > 1:
+        raise ValueError(f"{where}: both {present} are present; keep exactly one P(positive) column")
+    return present[0] if present else None
+
 
 @dataclass
 class LabelTable:
@@ -164,29 +177,45 @@ def _blank_matrices(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return targets, weights, kinds
 
 
+def _missing(value: Any) -> bool:
+    """None, NaN or pd.NA - what pandas puts in an empty CSV cell."""
+    return value is None or (pd.api.types.is_scalar(value) and bool(pd.isna(value)))
+
+
+def _text(value: Any) -> str:
+    """Normalised status/basis text; a missing cell is ''."""
+    return "" if _missing(value) else str(value).strip().lower()
+
+
 def _resolve_status(
-    status: str | None,
-    basis: str | None,
+    status: Any,
+    basis: Any,
     borderline_policy: str,
     unmentioned_weight: float,
     uncertain_weight: float,
+    has_basis: bool,
 ) -> tuple[float, float, str]:
-    """Map one extraction status to (target, weight, kind)."""
-    status = (status or "").strip().lower()
-    basis = (basis or "").strip().lower()
+    """Map one extraction status to (target, weight, kind).
+
+    A negative needs its basis to tell firm from borderline. Without a basis column
+    (`has_basis=False`) every negative is firm, as the caller warns. With the column
+    present, a negative whose basis cell is empty is UNKNOWN - never a silent firm negative.
+    """
+    status = _text(status)
+    basis = _text(basis)
 
     if status == STATUS_POSITIVE:
         return 1.0, 1.0, KIND_POSITIVE
     if status == STATUS_NEGATIVE:
+        if not has_basis:
+            return 0.0, 1.0, KIND_NEGATIVE
         if basis in BORDERLINE_BASES:
             if borderline_policy == "as_negative":
                 return 0.0, 1.0, KIND_BORDERLINE
             return 0.0, 0.0, KIND_BORDERLINE
-        if basis in NEGATIVE_BASES_FIRM or basis == "":
-            # An empty basis is treated as a firm negative only for exports that do
-            # not carry the basis column at all; see build_from_statuses().
+        if basis in NEGATIVE_BASES_FIRM:
             return 0.0, 1.0, KIND_NEGATIVE
-        # Unknown basis vocabulary: do not guess.
+        # Missing or unknown basis vocabulary: do not guess.
         return 0.0, 0.0, KIND_UNKNOWN
     if status == STATUS_UNCERTAIN or status in ("conflict", "insufficient_detail", "not_assessed"):
         return 0.0, float(uncertain_weight), KIND_UNCERTAIN
@@ -207,11 +236,21 @@ def unmentioned_weights(cfg: Config) -> dict[str, float]:
 
 
 def build_from_details(df: pd.DataFrame, study_ids: list[str], cfg: Config) -> LabelTable:
-    """Preferred path: long export with one row per (study, target) and a status/basis."""
+    """Preferred path: long export with one row per (study, target) and a status/basis.
+
+    A soft value (`soft_target`, or the notebooks' `p_positive`) replaces the status label
+    at full weight when `labels.allow_soft_targets` is on - borderline and uncertain cells
+    included, whatever borderline_policy and uncertain_weight say for their status label.
+    A soft value on a `not_mentioned` cell is a contract violation.
+    """
+    if "target" not in df.columns and "label" in df.columns:
+        df = df.rename(columns={"label": "target"})  # the labelling notebooks' column name
     idx = {sid: i for i, sid in enumerate(study_ids)}
     targets, weights, kinds = _blank_matrices(len(study_ids))
     target_idx = {t: c for c, t in enumerate(TARGETS)}
     allow_soft = bool(cfg.labels.allow_soft_targets)
+    soft_col = soft_column(df.columns, "labels_details")
+    n_soft_ignored = 0
     unmentioned = unmentioned_weights(cfg)
     has_basis = "basis" in df.columns
     if not has_basis:
@@ -221,34 +260,63 @@ def build_from_details(df: pd.DataFrame, study_ids: list[str], cfg: Config) -> L
             "exclude_borderline export to apply labels.borderline_policy."
         )
 
+    n_negative_without_basis = 0
     for row in df.itertuples(index=False):
-        sid = str(getattr(row, STUDY_ID, "") or "")
-        target = str(getattr(row, "target", "") or "")
+        raw_sid, raw_target = getattr(row, STUDY_ID, None), getattr(row, "target", None)
+        sid = "" if _missing(raw_sid) else str(raw_sid)
+        target = "" if _missing(raw_target) else str(raw_target)
         if sid not in idx or target not in target_idx:
             continue
         i, c = idx[sid], target_idx[target]
+        status, basis = getattr(row, "status", None), getattr(row, "basis", None) if has_basis else None
         value, weight, kind = _resolve_status(
-            getattr(row, "status", None),
-            getattr(row, "basis", None) if has_basis else None,
+            status,
+            basis,
             cfg.labels.borderline_policy,
             unmentioned[target],
             float(cfg.labels.uncertain_weight),
+            has_basis=has_basis,
         )
-        soft = getattr(row, "soft_target", None)
-        if allow_soft and soft is not None and pd.notna(soft):
+        if has_basis and _text(status) == STATUS_NEGATIVE and _missing(basis):
+            n_negative_without_basis += 1
+        soft = getattr(row, soft_col) if soft_col else None
+        if soft is not None and pd.notna(soft):
             soft_value = float(soft)
-            if not 0.0 <= soft_value <= 1.0:
-                raise ValueError(f"soft_target must be in [0, 1], got {soft_value} for study {sid} target {target}")
-            value, weight, kind = soft_value, max(weight, 1.0), KIND_SOFT
+            if not 0.0 <= soft_value <= 1.0:  # also rejects +-Inf
+                raise ValueError(f"{soft_col} must be in [0, 1], got {soft_value} for study {sid} target {target}")
+            if kind == KIND_NOT_MENTIONED:
+                raise ValueError(
+                    f"{soft_col}={soft_value} on a not_mentioned cell (study {sid}, target {target}); "
+                    "an unmentioned finding carries no P(positive)"
+                )
+            if not allow_soft:
+                n_soft_ignored += 1
+            else:
+                value, weight, kind = soft_value, max(weight, 1.0), KIND_SOFT
         targets[i, c], weights[i, c], kinds[i, c] = value, weight, kind
 
+    if n_soft_ignored:
+        LOG.warning(
+            "labels_details carries %d %s values but labels.allow_soft_targets is off: training on the "
+            "status labels only.",
+            n_soft_ignored,
+            soft_col,
+        )
+    if n_negative_without_basis:
+        LOG.warning(
+            "%d negative cells have an empty basis: firm and borderline cannot be told apart, so their "
+            "status label is masked (weight 0) unless a soft value is supplied.",
+            n_negative_without_basis,
+        )
+    policy = _policy(cfg, has_basis=has_basis)
+    policy["soft_column"] = soft_col
     return LabelTable(
         study_ids=list(study_ids),
         targets=targets,
         weights=weights,
         kinds=kinds,
         source="details",
-        policy=_policy(cfg, has_basis=has_basis),
+        policy=policy,
     )
 
 
@@ -262,21 +330,22 @@ def build_from_statuses(df: pd.DataFrame, study_ids: list[str], cfg: Config) -> 
             "honoured from this file. Use labels_details_csv or the exclude_borderline numeric export."
         )
     unmentioned = unmentioned_weights(cfg)
-    for row in df.itertuples(index=False):
-        sid = str(getattr(row, STUDY_ID, "") or "")
+    present = [(c, target) for c, target in enumerate(TARGETS) if target in df.columns]
+    # By column name: itertuples() renames "Medial Meniscus", "Baker's", ... to positional fields.
+    for record in df.to_dict(orient="records"):
+        raw_sid = record.get(STUDY_ID)
+        sid = "" if _missing(raw_sid) else str(raw_sid)
         if sid not in idx:
             continue
         i = idx[sid]
-        for c, target in enumerate(TARGETS):
-            if target not in df.columns:
-                continue
-            raw = getattr(row, _attr_name(target), None)
+        for c, target in present:
             value, weight, kind = _resolve_status(
-                None if raw is None or pd.isna(raw) else str(raw),
+                record[target],
                 None,
                 cfg.labels.borderline_policy,
                 unmentioned[target],
                 float(cfg.labels.uncertain_weight),
+                has_basis=False,
             )
             targets[i, c], weights[i, c], kinds[i, c] = value, weight, kind
     return LabelTable(
@@ -333,9 +402,9 @@ def build_from_wide_numeric(df: pd.DataFrame, study_ids: list[str], cfg: Config,
     policy = _policy(cfg, has_basis=False)
     policy["non_binary_values_present"] = non_binary_seen
     policy["borderline_note"] = (
-        "A wide numeric export cannot express borderline negatives. Point "
+        "A wide numeric export cannot express borderline negatives. For a binary export, point "
         "paths.labels_predictions_exclude_borderline_csv at the matching export when "
-        "labels.borderline_policy='exclude'."
+        "labels.borderline_policy='exclude'; a soft export keeps its borderline soft values."
     )
     return LabelTable(
         study_ids=list(study_ids),
@@ -345,14 +414,6 @@ def build_from_wide_numeric(df: pd.DataFrame, study_ids: list[str], cfg: Config,
         source=source,
         policy=policy,
     )
-
-
-def _attr_name(column: str) -> str:
-    """itertuples() sanitises column names; mirror that mapping."""
-    safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in column)
-    if safe and safe[0].isdigit():
-        safe = "_" + safe
-    return safe
 
 
 def _policy(cfg: Config, has_basis: bool) -> dict:
@@ -368,15 +429,31 @@ def _policy(cfg: Config, has_basis: bool) -> dict:
     }
 
 
+def _wide_has_soft_values(raw: str | None) -> bool:
+    """True for a P(positive) export: some target cell lies strictly between 0 and 1."""
+    if not raw or not Path(raw).exists():
+        return False
+    frame = pd.read_csv(raw, usecols=lambda column: column in TARGETS)
+    values = frame.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    return bool(((values > 0.0) & (values < 1.0)).any())
+
+
 def _pick_source(cfg: Config) -> tuple[str, Path]:
-    """Decide which export to use, honouring labels.source and the borderline policy."""
+    """Decide which export to use, honouring labels.source and the borderline policy.
+
+    Under borderline_policy='exclude' the exclude_borderline wide export comes first,
+    because a binary export writes a borderline negative as a plain 0. A soft export
+    (P(positive) values) is the exception when soft targets are allowed: its borderline
+    cells carry a valid soft value, which trains like any other soft cell.
+    """
     paths = cfg.paths
     requested = cfg.labels.source
     candidates: list[tuple[str, str | None]] = [
         ("details", paths.get("labels_details_csv")),
         ("statuses", paths.get("labels_statuses_csv")),
     ]
-    if cfg.labels.borderline_policy == "exclude":
+    soft_wide = bool(cfg.labels.allow_soft_targets) and _wide_has_soft_values(paths.get("labels_predictions_csv"))
+    if cfg.labels.borderline_policy == "exclude" and not soft_wide:
         candidates.append(("wide_exclude_borderline", paths.get("labels_predictions_exclude_borderline_csv")))
         candidates.append(("wide", paths.get("labels_predictions_csv")))
     else:
@@ -416,6 +493,12 @@ def build_label_table(cfg: Config, study_ids: list[str]) -> LabelTable:
     """Build the study-aligned label table for the configured source."""
     source, path = _pick_source(cfg)
     LOG.info("Label source: %s (%s)", source, path)
+    if source == "wide_exclude_borderline" and cfg.labels.allow_soft_targets and _wide_has_soft_values(str(path)):
+        LOG.warning(
+            "%s is a soft export with the borderline cells removed; point paths.labels_predictions_csv "
+            "at the full export so borderline cells train on their soft value.",
+            path,
+        )
     df = read_id_csv(path)
 
     if source == "details":
