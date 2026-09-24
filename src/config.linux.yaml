@@ -7,9 +7,9 @@ seed: 42
 paths:
   # Root of the competition export. All *_csv / dicom_root entries below default
   # to the usual layout under this root when left as null.
-  data_root: "F:/Kaggle/data"
+  data_root: "/ai-storage/Temp/SZ/kaggle_knee/data"
   dicom_root: null                 # default: <data_root>/train_series
-  train_csv: "F:/Kaggle/data/train_v1.csv"   # default lenne: <data_root>/train.csv
+  train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v1.csv"   # default lenne: <data_root>/train.csv
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -25,7 +25,7 @@ paths:
   frozen_reference_csv: "work/labels/frozen_reference.csv"
 
   work_dir: "work"
-  cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
+  cache_dir: "/workssd/zseress/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
   output_dir: null                 # default: <work_dir>/runs
 
 manifest:
@@ -132,7 +132,7 @@ train:
   eval_num_workers: 4
   eval_prefetch_factor: 2
   amp: "auto"                      # auto|bf16|fp16|fp32
-  eval_batch_studies: 2
+  eval_batch_studies: 4
   log_every: 20
   resume: null                     # path to last.pt
 
