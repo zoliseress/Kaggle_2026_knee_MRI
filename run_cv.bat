@@ -7,7 +7,10 @@ REM
 REM  Hasznalat:
 REM     run_cv.bat
 REM     run_cv.bat --set data.image_size=288 --set train.max_epochs=10
+REM     run_cv.bat V2soft_img320 --set data.image_size=320
 REM  Minden ide irt extra argumentum MINDHAROM foldra ervenyes.
+REM  Ha az elso argumentum nem "-"-vel kezdodik, az a run-group elotagja:
+REM     V2soft_img320_cv3_<idobelyeg>_fold<N>, ..._oof
 REM
 REM  Elofeltetel: a work\splits\splits.csv mar letezik es ugyanazzal az
 REM  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
@@ -19,6 +22,12 @@ set "CONDA_ENV=kaggle_2026"
 set "CONDA_ROOT=%LOCALAPPDATA%\miniconda3"
 
 set "EXTRA=%*"
+set "PREFIX="
+set "FIRST=%~1"
+if defined FIRST if not "!FIRST:~0,1!"=="-" (
+    set "PREFIX=!FIRST!_"
+    set "EXTRA=!EXTRA:*%1=!"
+)
 cd /d "%ROOT%"
 set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
 
@@ -35,7 +44,7 @@ if exist "%CONDA_ROOT%\Scripts\activate.bat" (
 )
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%i"
-set "GROUP=cv%NFOLDS%_%STAMP%"
+set "GROUP=%PREFIX%cv%NFOLDS%_%STAMP%"
 set /a LAST=%NFOLDS%-1
 
 echo ======================================================================
