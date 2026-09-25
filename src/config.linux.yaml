@@ -1,4 +1,4 @@
-# RSNA knee MRI - EfficientNet-B0 2.5D MIL baseline.
+# RSNA knee MRI - EfficientNet (B0 / V2-S) 2.5D MIL baseline.
 # These values are starting hypotheses, not tuned optima.
 # Every key can be overridden from the CLI, e.g.: --set data.image_size=288
 
@@ -83,7 +83,14 @@ augment:
   noise_std: 0.01
 
 model:
-  weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth
+  # efficientnet_b0 | efficientnet_v2_s. Both give 1280 features at stride 32, so the head
+  # and pooling are unchanged. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
+  #   b0: 6.3 GB, 10.4 train study/s | v2_s: 11.1 GB, 5.6 study/s | v2_s + grad_checkpointing: 4.1 GB, 4.0 study/s
+  backbone: "efficientnet_b0"
+  weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth (of the chosen backbone)
+  # Recompute each encoder stage in backward instead of storing its activations: less
+  # training memory for ~30% less throughput, identical results. Only if microbatch/size would OOM.
+  grad_checkpointing: false
   head_dropout: 0.2
   head_hidden: 256
   freeze_bn_running_stats: true

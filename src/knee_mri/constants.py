@@ -44,6 +44,13 @@ MRI_SCALAR_MEAN = (0.5, 0.5, 0.5)
 MRI_SCALAR_STD = (0.25, 0.25, 0.25)
 
 EFFICIENTNET_B0_FEATURES = 1280
+# Encoder backbones (model.backbone) -> channels of their last feature map. Both have an
+# output stride of 32, so 320 px gives a 10x10 map either way.
+ENCODER_FEATURES = {
+    "efficientnet_b0": 1280,
+    "efficientnet_v2_s": 1280,
+}
+DEFAULT_BACKBONE = "efficientnet_b0"  # also what checkpoints without model.backbone were trained with
 
 # Label status vocabulary of the report-extraction export.
 STATUS_POSITIVE = "positive"

@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .config import Config, load_config
-from .constants import EFFICIENTNET_B0_FEATURES, N_TARGETS, STUDY_ID, TARGETS
+from .config import Config, load_config, validate_config
+from .constants import EFFICIENTNET_B0_FEATURES, ENCODER_FEATURES, N_TARGETS, STUDY_ID, TARGETS
 from .dataset import (
     AUGMENT_PARAM_COLUMNS,
     EpochSampler,
@@ -1673,6 +1673,99 @@ def check_inference_architecture(cfg: Config, tmp_dir) -> str:
     return "architecture rebuilt from the checkpoint (attention under an avg config); input mismatches need an explicit override"
 
 
+def check_backbone_choice(cfg: Config) -> str:
+    """V2-S builds, keeps the 1280-wide slice features and says so in its description."""
+    from .model import build_model
+
+    widths = {}
+    for backbone in ("efficientnet_b0", "efficientnet_v2_s"):
+        chosen = cfg.copy()
+        chosen.model.backbone = backbone
+        chosen.model.weights = "none"
+        torch.manual_seed(0)
+        model = build_model(chosen).eval()
+        description = model.describe()
+        assert description["architecture"] == f"{backbone}_2p5d_mil", description["architecture"]
+        assert description["backbone"] == backbone and model.feature_dim == ENCODER_FEATURES[backbone]
+        batch = _random_batch(chosen, b=1, seed=2)
+        with torch.no_grad():
+            logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+        assert logits.shape == (1, N_TARGETS) and torch.isfinite(logits).all(), backbone
+        widths[backbone] = (model.feature_dim, description["n_parameters"])
+    unknown = cfg.copy()
+    unknown.model.backbone = "resnet50"
+    try:
+        validate_config(unknown)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown model.backbone must be rejected")
+    return f"(feature_dim, parameters) per backbone: {widths}; unknown backbone rejected"
+
+
+def check_grad_checkpointing_is_exact(cfg: Config) -> str:
+    """Gradient checkpointing changes memory, not the loss or the gradients."""
+    from .model import EfficientNetMIL
+
+    batch = _random_batch(cfg, b=1, seed=4)
+    results = []
+    for enabled in (False, True):
+        torch.manual_seed(0)
+        model = EfficientNetMIL(
+            n_targets=N_TARGETS,
+            n_slots=len(cfg.data.series_slots),
+            weights="none",
+            head_hidden=int(cfg.model.head_hidden),
+            head_dropout=0.0,
+            grad_checkpointing=enabled,
+        ).train()
+        torch.manual_seed(1)  # stochastic depth draws the same masks in both runs
+        logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+        logits.square().mean().backward()
+        results.append((logits.detach(), [p.grad.clone() for p in model.features.parameters() if p.grad is not None]))
+    (plain, plain_grads), (ckpt, ckpt_grads) = results
+    assert torch.allclose(plain, ckpt, atol=1e-6), "checkpointing changed the forward pass"
+    assert len(plain_grads) == len(ckpt_grads) > 0
+    worst = max(float((a - b).abs().max()) for a, b in zip(plain_grads, ckpt_grads))
+    assert worst < 1e-5, f"checkpointing changed the encoder gradients by {worst:.2e}"
+    return f"identical logits and encoder gradients with and without checkpointing (max diff {worst:.1e})"
+
+
+def check_legacy_checkpoint_is_b0(cfg: Config, tmp_dir) -> str:
+    """A checkpoint from before model.backbone existed loads as B0 even under a V2-S config."""
+    from pathlib import Path
+
+    from .constants import CHECKPOINT_VERSION
+    from .evaluate import load_checkpoint_for_inference
+    from .model import build_model
+
+    trained = cfg.copy()
+    trained.model.backbone = "efficientnet_b0"
+    trained.model.weights = "none"
+    torch.manual_seed(7)
+    model = build_model(trained).eval()
+    stored = trained.to_dict()
+    del stored["model"]["backbone"]  # what an older run wrote
+    description = model.describe()
+    del description["backbone"]
+    path = Path(tmp_dir) / "legacy_b0.pt"
+    torch.save(
+        {
+            "version": CHECKPOINT_VERSION,
+            "target_order": list(TARGETS),
+            "config": stored,
+            "model_description": description,
+            "model": model.state_dict(),
+        },
+        path,
+    )
+    caller = cfg.copy()
+    caller.model.backbone = "efficientnet_v2_s"
+    loaded, _ = load_checkpoint_for_inference(caller, path)
+    assert loaded.describe()["backbone"] == "efficientnet_b0"
+    return "a checkpoint without model.backbone rebuilds as efficientnet_b0 under a V2-S config"
+
+
 def check_exact_resume(cfg: Config) -> str:
     """Stopping after epoch 0 and resuming from last.pt must repeat the uninterrupted run exactly."""
     import tempfile
@@ -1841,6 +1934,9 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("checkpoint_roundtrip", lambda: check_checkpoint_roundtrip(small, tmp_dir)),
                 ("exact_resume", lambda: check_exact_resume(small)),
                 ("inference_architecture", lambda: check_inference_architecture(small, tmp_dir)),
+                ("backbone_choice", lambda: check_backbone_choice(small)),
+                ("grad_checkpointing_is_exact", lambda: check_grad_checkpointing_is_exact(small)),
+                ("legacy_checkpoint_is_b0", lambda: check_legacy_checkpoint_is_b0(small, tmp_dir)),
                 ("train_step_reduces_loss", lambda: check_train_step_reduces_loss(small)),
                 ("epoch_reaches_workers", lambda: check_epoch_reaches_workers(small)),
                 ("window_training_step", lambda: check_window_training_step(small)),

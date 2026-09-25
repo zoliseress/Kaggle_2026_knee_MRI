@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 import yaml
 
-from .constants import PLANES, TARGETS
+from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, PLANES, TARGETS
 
 SPATIAL_POOLS = ("avg", "avgmax", "attention")
 
@@ -126,7 +126,7 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"data.image_size must be a multiple of 8 and >= 32, got {data.image_size}")
     if int(data.adjacent_slices) != 3:
         raise ValueError(
-            "data.adjacent_slices must be 3: the torchvision EfficientNet-B0 stem expects "
+            "data.adjacent_slices must be 3: the torchvision EfficientNet stem expects "
             f"3 input channels, got {data.adjacent_slices}"
         )
     if int(data.centers_per_series) < 1:
@@ -163,6 +163,8 @@ def validate_config(cfg: Config) -> None:
 
     if str(cfg.model.get("spatial_pool", "avg")) not in SPATIAL_POOLS:
         raise ValueError(f"model.spatial_pool must be one of {sorted(SPATIAL_POOLS)}")
+    if str(cfg.model.get("backbone", DEFAULT_BACKBONE)) not in ENCODER_FEATURES:
+        raise ValueError(f"model.backbone must be one of {sorted(ENCODER_FEATURES)}")
 
     if cfg.labels.borderline_policy not in ("exclude", "as_negative"):
         raise ValueError("labels.borderline_policy must be 'exclude' or 'as_negative'")

@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from .config import Config
-from .constants import CHECKPOINT_VERSION, STUDY_ID, TARGETS
+from .constants import CHECKPOINT_VERSION, DEFAULT_BACKBONE, STUDY_ID, TARGETS
 from .dataset import StudyBagDataset, check_study_coverage, collate_studies, enforce_coverage_gate
 from .labels import build_label_table, load_reference_table
 from .metrics import evaluate_predictions, soft_roc_auc
@@ -27,8 +27,9 @@ from .utils import LOG, atomic_write_dataframe, atomic_write_json, autocast_ctx,
 # shapes for a reordered slot list or another normalisation, so nothing would crash.
 INFERENCE_DATA_KEYS = ("data.image_size", "data.series_slots", "data.centers_per_series", "data.encoder_normalization")
 # Model keys that are not architecture: the pretrained source (the checkpoint replaces it)
-# and the memory-only chunking, which the inference host may tune.
-RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size")
+# and the memory-only chunking / gradient checkpointing, which the inference host may tune.
+# A checkpoint without model.backbone predates the key and is B0 (the config default).
+RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
 ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "feature_dim", "head_in")
 
 
@@ -78,6 +79,7 @@ def load_checkpoint_for_inference(
     build_cfg = cfg.copy()
     stored_model = stored_tree.get("model")
     if stored_model:
+        build_cfg.set_dotted("model.backbone", stored_model.get("backbone", DEFAULT_BACKBONE))
         for key, value in stored_model.items():
             if key not in RUNTIME_MODEL_KEYS:
                 build_cfg.set_dotted(f"model.{key}", value)

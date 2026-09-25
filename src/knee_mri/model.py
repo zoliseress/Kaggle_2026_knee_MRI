@@ -1,9 +1,9 @@
-"""EfficientNet-B0 encoder + masked multiple-instance pooling over slice bags.
+"""EfficientNet encoder (B0 or V2-S) + masked multiple-instance pooling over slice bags.
 
 Tensor flow
 -----------
     [B, P, S, 3, H, W] -> gather valid triplets -> [N_valid, 3, H, W]
-    -> EfficientNet-B0 features -> spatial pooling (model.spatial_pool) -> [N_valid, F]
+    -> EfficientNet features (model.backbone) -> spatial pooling (model.spatial_pool) -> [N_valid, F]
        avg: global average (1280) | avgmax: average and maximum (2560)
        attention: softmax-weighted average over the map (1280), zero-initialised to avg
     -> scatter back to [B, P, S, F] (differentiable)
@@ -24,8 +24,9 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
 
-from .constants import EFFICIENTNET_B0_FEATURES, N_TARGETS
+from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, N_TARGETS
 from .utils import LOG
 
 # A finite sentinel for the masked maximum: -inf would make an all-masked max
@@ -35,12 +36,28 @@ NEG_SENTINEL = -1.0e30
 SPATIAL_POOLS = ("avg", "avgmax", "attention")
 
 
-def build_encoder(weights: str = "IMAGENET1K_V1") -> tuple[nn.Module, dict]:
-    """Create the EfficientNet-B0 feature extractor with explicit weight provenance."""
-    import torchvision
-    from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0
+# model.backbone -> (torchvision builder, weights enum) names.
+_BACKBONES = {
+    "efficientnet_b0": ("efficientnet_b0", "EfficientNet_B0_Weights"),
+    "efficientnet_v2_s": ("efficientnet_v2_s", "EfficientNet_V2_S_Weights"),
+}
 
-    info: dict[str, Any] = {"torchvision": torchvision.__version__, "weights_request": str(weights)}
+
+def build_encoder(weights: str = "IMAGENET1K_V1", backbone: str = DEFAULT_BACKBONE) -> tuple[nn.Module, dict]:
+    """Create the EfficientNet feature extractor with explicit weight provenance."""
+    import torchvision
+    import torchvision.models as tvm
+
+    if backbone not in _BACKBONES:
+        raise ValueError(f"Unknown model.backbone={backbone!r}; known: {sorted(_BACKBONES)}")
+    builder_name, weights_name = _BACKBONES[backbone]
+    builder, weights_enum = getattr(tvm, builder_name), getattr(tvm, weights_name)
+
+    info: dict[str, Any] = {
+        "torchvision": torchvision.__version__,
+        "backbone": backbone,
+        "weights_request": str(weights),
+    }
     spec = str(weights)
 
     if spec.lower() in ("none", "random", "null"):
@@ -49,37 +66,37 @@ def build_encoder(weights: str = "IMAGENET1K_V1") -> tuple[nn.Module, dict]:
             "ablation, not a fallback.",
             spec,
         )
-        model = efficientnet_b0(weights=None)
+        model = builder(weights=None)
         info["weights_used"] = "random"
     elif Path(spec).expanduser().exists():
-        model = efficientnet_b0(weights=None)
+        model = builder(weights=None)
         state = torch.load(str(Path(spec).expanduser()), map_location="cpu", weights_only=True)
         state = state.get("state_dict", state)
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             raise RuntimeError(
-                f"Local encoder checkpoint {spec} is missing {len(missing)} parameters (e.g. {missing[:5]}). "
-                "Refusing to continue with a partially initialised encoder."
+                f"Local encoder checkpoint {spec} is missing {len(missing)} parameters (e.g. {missing[:5]}) "
+                f"for backbone {backbone}. Refusing to continue with a partially initialised encoder."
             )
         info["weights_used"] = str(spec)
         info["unexpected_keys"] = len(unexpected)
         LOG.info("Loaded local encoder weights from %s (%d unexpected keys ignored)", spec, len(unexpected))
     else:
         try:
-            enum_value = getattr(EfficientNet_B0_Weights, spec)
+            enum_value = getattr(weights_enum, spec)
         except AttributeError as exc:
             raise ValueError(
-                f"Unknown model.weights={spec!r}. Use an EfficientNet_B0_Weights name "
+                f"Unknown model.weights={spec!r}. Use an {weights_name} name "
                 f"(e.g. IMAGENET1K_V1), an existing local checkpoint path, or 'none'."
             ) from exc
         try:
-            model = efficientnet_b0(weights=enum_value)
+            model = builder(weights=enum_value)
         except Exception as exc:  # download failure, offline machine, proxy, ...
             raise RuntimeError(
-                f"Could not obtain pretrained weights {spec}: {exc}. "
+                f"Could not obtain pretrained weights {weights_name}.{spec}: {exc}. "
                 "Never train silently from random initialisation. Either pre-download the weights "
-                "(TORCH_HOME=<dir> python -c \"from torchvision.models import efficientnet_b0, "
-                'EfficientNet_B0_Weights; efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)"), '
+                f"(TORCH_HOME=<dir> python -c \"from torchvision.models import {builder_name}, "
+                f'{weights_name}; {builder_name}(weights={weights_name}.{spec})"), '
                 "point model.weights at a local checkpoint, or set model.weights=none deliberately."
             ) from exc
         info["weights_used"] = spec
@@ -139,7 +156,7 @@ class SpatialAttentionPool(nn.Module):
         return torch.softmax(self.score(feature_map).flatten(2).float(), dim=-1).view(n, h, w)
 
 
-class EfficientNetB0MIL(nn.Module):
+class EfficientNetMIL(nn.Module):
     """Study-level multi-label classifier over per-slot slice bags."""
 
     def __init__(
@@ -152,23 +169,28 @@ class EfficientNetB0MIL(nn.Module):
         freeze_bn_running_stats: bool = True,
         encoder_chunk_size: int = 0,
         spatial_pool: str = "avg",
+        backbone: str = DEFAULT_BACKBONE,
+        grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if spatial_pool not in SPATIAL_POOLS:
             raise ValueError(f"spatial_pool must be one of {sorted(SPATIAL_POOLS)}, got {spatial_pool!r}")
-        encoder, self.weights_info = build_encoder(weights)
+        self.backbone = str(backbone)
+        encoder, self.weights_info = build_encoder(weights, self.backbone)
         self.features = encoder.features
+        encoder_features = ENCODER_FEATURES[self.backbone]
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.spatial_pool = str(spatial_pool)
         self.attention_pool = (
-            SpatialAttentionPool(EFFICIENTNET_B0_FEATURES) if self.spatial_pool == "attention" else None
+            SpatialAttentionPool(encoder_features) if self.spatial_pool == "attention" else None
         )
         self.n_slots = int(n_slots)
         self.n_targets = int(n_targets)
         # `avgmax` keeps an average and a maximum descriptor per slice, so the slice vector doubles.
-        self.feature_dim = EFFICIENTNET_B0_FEATURES * (2 if self.spatial_pool == "avgmax" else 1)
+        self.feature_dim = encoder_features * (2 if self.spatial_pool == "avgmax" else 1)
         self.freeze_bn_running_stats = bool(freeze_bn_running_stats)
         self.encoder_chunk_size = int(encoder_chunk_size)
+        self.grad_checkpointing = bool(grad_checkpointing)
 
         head_in = self.n_slots * 2 * self.feature_dim + self.n_slots
         self.head_in = head_in
@@ -188,7 +210,7 @@ class EfficientNetB0MIL(nn.Module):
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.eval()  # use the pretrained running statistics; affine params stay trainable
 
-    def train(self, mode: bool = True) -> "EfficientNetB0MIL":
+    def train(self, mode: bool = True) -> "EfficientNetMIL":
         super().train(mode)
         if mode:
             self._apply_bn_policy()
@@ -212,17 +234,24 @@ class EfficientNetB0MIL(nn.Module):
 
         Chunking only limits the size of a single encoder call. During training the
         autograd graph of every chunk is retained until backward, so chunking is not a
-        guaranteed memory saving there - reduce train.microbatch_studies or
-        data.centers_per_series instead.
+        guaranteed memory saving there - model.grad_checkpointing is (it recomputes each
+        encoder stage in backward instead of keeping its activations).
         """
         if triplets.shape[0] == 0:
             return triplets.new_zeros((0, self.feature_dim))
         if self.encoder_chunk_size and self.encoder_chunk_size > 0:
             outputs = [
-                self._pool_map(self.features(chunk)) for chunk in triplets.split(self.encoder_chunk_size, dim=0)
+                self._pool_map(self._run_features(chunk)) for chunk in triplets.split(self.encoder_chunk_size, dim=0)
             ]
             return torch.cat(outputs, dim=0)
-        return self._pool_map(self.features(triplets))
+        return self._pool_map(self._run_features(triplets))
+
+    def _run_features(self, x: torch.Tensor) -> torch.Tensor:
+        if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+            # One segment per stage: only stage boundaries are kept for backward. Stochastic
+            # depth replays identically, the RNG state is preserved by the checkpoint.
+            return checkpoint_sequential(self.features, len(self.features), x, use_reentrant=False)
+        return self.features(x)
 
     # -- Forward ----------------------------------------------------------------------
 
@@ -283,7 +312,8 @@ class EfficientNetB0MIL(nn.Module):
 
     def describe(self) -> dict:
         return {
-            "architecture": "efficientnet_b0_2p5d_mil",
+            "architecture": f"{self.backbone}_2p5d_mil",
+            "backbone": self.backbone,
             "n_slots": self.n_slots,
             "n_targets": self.n_targets,
             "spatial_pool": self.spatial_pool,
@@ -291,15 +321,20 @@ class EfficientNetB0MIL(nn.Module):
             "head_in": self.head_in,
             "freeze_bn_running_stats": self.freeze_bn_running_stats,
             "encoder_chunk_size": self.encoder_chunk_size,
+            "grad_checkpointing": self.grad_checkpointing,
             "weights_info": self.weights_info,
             "n_parameters": int(sum(p.numel() for p in self.parameters())),
             "n_trainable": int(sum(p.numel() for p in self.parameters() if p.requires_grad)),
         }
 
 
-def build_model(cfg, n_slots: int | None = None) -> EfficientNetB0MIL:
+# The original name; selftests and older notebooks import it.
+EfficientNetB0MIL = EfficientNetMIL
+
+
+def build_model(cfg, n_slots: int | None = None) -> EfficientNetMIL:
     slots = n_slots if n_slots is not None else len(cfg.data.series_slots)
-    model = EfficientNetB0MIL(
+    model = EfficientNetMIL(
         n_targets=N_TARGETS,
         n_slots=slots,
         weights=str(cfg.model.weights),
@@ -308,6 +343,8 @@ def build_model(cfg, n_slots: int | None = None) -> EfficientNetB0MIL:
         freeze_bn_running_stats=bool(cfg.model.freeze_bn_running_stats),
         encoder_chunk_size=int(cfg.model.encoder_chunk_size),
         spatial_pool=str(cfg.model.get("spatial_pool", "avg")),
+        backbone=str(cfg.model.get("backbone", DEFAULT_BACKBONE)),
+        grad_checkpointing=bool(cfg.model.get("grad_checkpointing", False)),
     )
     LOG.info("Model: %s", model.describe())
     return model

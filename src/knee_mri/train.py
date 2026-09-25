@@ -26,7 +26,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 from .config import Config, save_config
-from .constants import CHECKPOINT_VERSION, LABELS_VERSION, PREPROCESS_VERSION, SPLITS_VERSION, STUDY_ID, TARGETS
+from .constants import (
+    CHECKPOINT_VERSION, DEFAULT_BACKBONE, LABELS_VERSION, PREPROCESS_VERSION, SPLITS_VERSION, STUDY_ID, TARGETS,
+)
 from .dataset import (
     EpochSampler,
     StudyBagDataset,
@@ -207,8 +209,8 @@ RESUME_CONFIG_KEYS = (
     "train.early_stopping_patience", "train.amp",
 )
 # Model keys that do not change what is computed: the pretrained source is overwritten by
-# the checkpoint, and chunking only bounds memory.
-RESUME_IGNORED_MODEL_KEYS = ("weights", "encoder_chunk_size")
+# the checkpoint, and chunking and gradient checkpointing only bound memory.
+RESUME_IGNORED_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
 
 
 def _dotted(tree: dict, key: str) -> Any:
@@ -339,6 +341,9 @@ class Trainer:
         signature["model"] = {
             k: v for k, v in (signature["model"] or {}).items() if k not in RESUME_IGNORED_MODEL_KEYS
         }
+        # Runs from before model.backbone existed were all B0 and stored no such key.
+        if signature["model"].get("backbone") == DEFAULT_BACKBONE:
+            del signature["model"]["backbone"]
         signature["mode"] = self.mode
         signature["device"] = self.device_spec.device.type
         signature["augment_device"] = self.augment_device
