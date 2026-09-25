@@ -61,6 +61,7 @@ from .utils import (
     autocast_ctx,
     log_environment,
     peak_gpu_memory_gb,
+    release_cached_gpu_memory,
     reset_peak_gpu_memory,
     seed_everything,
     select_device,
@@ -556,7 +557,10 @@ class Trainer:
 
     def validate(self, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
         study_ids, scores = self.predict(self.val_loader)
-        order = {sid: i for i, sid in enumerate(study_ids)}
+        # Eval batches have other shapes than training ones; drop their cached blocks so the
+        # next epoch does not grow a fragmented pool (on Windows it spills into shared memory).
+        release_cached_gpu_memory()
+        order ={sid: i for i, sid in enumerate(study_ids)}
         missing = [s for s in self.reference.study_ids if s not in order]
         if missing:
             raise RuntimeError(

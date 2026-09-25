@@ -35,9 +35,9 @@ SPLITS_VERSION = "splits_v1"
 CHECKPOINT_VERSION = "ckpt_v1"
 
 # torchvision EfficientNet_B0_Weights.IMAGENET1K_V1 preprocessing statistics.
-# NOTE: our three channels are adjacent MRI slices, not RGB. We still default to
-# the pretrained normalisation so the encoder sees inputs in the range it was
-# trained on; `mri_scalar` is offered as a documented ablation.
+# NOTE: our three channels are adjacent MRI slices, not RGB, so the default is a
+# channel-independent `mri_scalar` normalisation (mean 0.5, std 0.25 on the [0, 1]
+# robust-scaled input). The pretrained ImageNet statistics remain available as `imagenet`.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 MRI_SCALAR_MEAN = (0.5, 0.5, 0.5)
