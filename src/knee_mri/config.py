@@ -107,6 +107,7 @@ def resolve_paths(cfg: Config) -> Config:
         "labels_predictions_exclude_borderline_csv",
         "reference_csv",
         "frozen_reference_csv",
+        "laterality_csv",
     ]
 
     paths["data_root"] = str(data_root)
@@ -145,6 +146,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("data.crop_center must be 'foreground', 'foreground_extent' or 'geometric'")
     if data.encoder_normalization not in ("imagenet", "mri_scalar"):
         raise ValueError("data.encoder_normalization must be 'imagenet' or 'mri_scalar'")
+    if not isinstance(data.get("laterality_canonical", False), bool):
+        raise ValueError("data.laterality_canonical must be true or false")
+    if float(data.get("laterality_min_offset_mm", 20.0)) < 0:
+        raise ValueError("data.laterality_min_offset_mm must be >= 0")
 
     if int(cfg.train.microbatch_studies) < 1 or int(cfg.train.accumulation_steps) < 1:
         raise ValueError("train.microbatch_studies and train.accumulation_steps must be >= 1")
@@ -154,6 +159,8 @@ def validate_config(cfg: Config) -> None:
         value = cfg.train.get(key)
         if value is not None and int(value) < (0 if key == "eval_num_workers" else 1):
             raise ValueError(f"train.{key} must be null or a non-negative integer")
+    if not 0.0 <= float(cfg.train.get("ema_decay") or 0.0) < 1.0:
+        raise ValueError("train.ema_decay must be in [0, 1) (0 = off)")
     if cfg.train.amp not in ("auto", "bf16", "fp16", "fp32"):
         raise ValueError("train.amp must be one of auto|bf16|fp16|fp32")
     if str(cfg.augment.get("device", "auto")).lower() not in ("auto", "cpu", "cuda"):
@@ -165,6 +172,11 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"model.spatial_pool must be one of {sorted(SPATIAL_POOLS)}")
     if str(cfg.model.get("backbone", DEFAULT_BACKBONE)) not in ENCODER_FEATURES:
         raise ValueError(f"model.backbone must be one of {sorted(ENCODER_FEATURES)}")
+    if bool(cfg.model.get("target_attention", False)):
+        if str(cfg.model.get("spatial_pool", "avg")) != "avg":
+            raise ValueError("model.target_attention needs model.spatial_pool=avg")
+        if int(cfg.model.get("depth_zones", 3)) < 1 or int(cfg.model.get("attention_dim", 256)) < 8:
+            raise ValueError("model.depth_zones must be >= 1 and model.attention_dim >= 8")
 
     if cfg.labels.borderline_policy not in ("exclude", "as_negative"):
         raise ValueError("labels.borderline_policy must be 'exclude' or 'as_negative'")

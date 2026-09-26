@@ -49,6 +49,7 @@ from .loss import (
     masked_class_normalized_bce,
     window_normalized_bce,
 )
+from .ema import ModelEMA
 from .metrics import evaluate_predictions, selection_metric, soft_target_warning
 from .model import build_model
 from .preprocess import preprocess_hash
@@ -61,7 +62,6 @@ from .utils import (
     autocast_ctx,
     log_environment,
     peak_gpu_memory_gb,
-    release_cached_gpu_memory,
     reset_peak_gpu_memory,
     seed_everything,
     select_device,
@@ -243,6 +243,12 @@ class Trainer:
         self.device_spec = select_device(cfg.train.amp)
         LOG.info("Compute: %s", self.device_spec.describe())
         self.model = model.to(self.device_spec.device)
+        # Weight EMA (train.ema_decay > 0): validated, selected and saved as "model"; the raw
+        # weights keep training and are scored alongside for a paired comparison.
+        self.ema_decay = float(cfg.train.get("ema_decay") or 0.0)
+        self.ema = ModelEMA(self.model, self.ema_decay) if self.ema_decay > 0 else None
+        if self.ema is not None:
+            LOG.info("Weight EMA on (decay %.5f, warmup min(d, (1+t)/(10+t))); selection uses the EMA weights", self.ema_decay)
 
         # Augmentation placement. The datasets resolve this independently from the same
         # config key, so a batch carrying `augment_params` is raw and must be augmented here.
@@ -345,9 +351,22 @@ class Trainer:
         # Runs from before model.backbone existed were all B0 and stored no such key.
         if signature["model"].get("backbone") == DEFAULT_BACKBONE:
             del signature["model"]["backbone"]
+        # The target-attention keys only matter when it is on.
+        if not signature["model"].get("target_attention"):
+            for key in ("target_attention", "attention_dim", "depth_zones"):
+                signature["model"].pop(key, None)
+        # Likewise the laterality keys: only part of the signature when the frame is on.
+        data = dict(signature["data"] or {})
+        if not data.get("laterality_canonical"):
+            data.pop("laterality_canonical", None)
+            data.pop("laterality_min_offset_mm", None)
+        signature["data"] = data
         signature["mode"] = self.mode
         signature["device"] = self.device_spec.device.type
         signature["augment_device"] = self.augment_device
+        # Only when on, so checkpoints from before the key existed still resume.
+        if self.ema_decay > 0:
+            signature["train.ema_decay"] = self.ema_decay
         signature["train_labels"] = _train_label_fingerprint(train_dataset)
         signature["validation_reference"] = _fingerprint(
             list(self.reference.study_ids), self.reference.values.astype(np.float32), self.reference.valid.astype(bool)
@@ -398,6 +417,9 @@ class Trainer:
             return
         self.scheduler.step()
         self.state.global_step += 1
+        ema = getattr(self, "ema", None)
+        if ema is not None:
+            ema.update(self.model)
 
     def _log_progress(self, epoch: int, accumulator: LossAccumulator, n_studies: int, started: float) -> None:
         if self.state.global_step % max(1, int(self.cfg.train.log_every)) != 0:
@@ -539,9 +561,15 @@ class Trainer:
 
     # -- validation ------------------------------------------------------------------
 
+    @property
+    def selected_model(self) -> torch.nn.Module:
+        """The weights that are validated, selected and saved: the EMA when it is on."""
+        return self.ema.module if self.ema is not None else self.model
+
     @torch.inference_mode()
-    def predict(self, loader: DataLoader) -> tuple[list[str], np.ndarray]:
-        self.model.eval()
+    def predict(self, loader: DataLoader, model: torch.nn.Module | None = None) -> tuple[list[str], np.ndarray]:
+        model = self.selected_model if model is None else model
+        model.eval()
         study_ids: list[str] = []
         scores: list[np.ndarray] = []
         for batch in loader:
@@ -549,18 +577,24 @@ class Trainer:
             slice_valid = batch["slice_valid_mask"].to(self.device_spec.device, non_blocking=True)
             present = batch["series_present_mask"].to(self.device_spec.device, non_blocking=True)
             with autocast_ctx(self.device_spec):
-                logits = self.model(images, slice_valid, present)
+                logits = model(images, slice_valid, present)
             scores.append(torch.sigmoid(logits.float()).cpu().numpy())
             study_ids.extend(batch["study_ids"])
         stacked = np.concatenate(scores, axis=0) if scores else np.zeros((0, len(TARGETS)), dtype=np.float32)
         return study_ids, stacked
 
     def validate(self, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
-        study_ids, scores = self.predict(self.val_loader)
-        # Eval batches have other shapes than training ones; drop their cached blocks so the
-        # next epoch does not grow a fragmented pool (on Windows it spills into shared memory).
-        release_cached_gpu_memory()
-        order ={sid: i for i, sid in enumerate(study_ids)}
+        table, summary, predictions = self._score(self.selected_model, epoch)
+        if self.ema is not None:
+            # The raw weights on the same studies: a paired, same-seed EMA-vs-raw comparison.
+            _, raw_summary, _ = self._score(self.model, epoch)
+            summary["raw_macro_roc_auc"] = raw_summary["macro_roc_auc"]
+            summary["raw_selection_score"] = selection_metric(raw_summary, self.selection_name)
+        return table, summary, predictions
+
+    def _score(self, model: torch.nn.Module, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+        study_ids, scores = self.predict(self.val_loader, model)
+        order = {sid: i for i, sid in enumerate(study_ids)}
         missing = [s for s in self.reference.study_ids if s not in order]
         if missing:
             raise RuntimeError(
@@ -604,9 +638,16 @@ class Trainer:
     # -- checkpoints -----------------------------------------------------------------
 
     def checkpoint_payload(self, extra: dict | None = None) -> dict:
+        ema_state = (
+            {"model_raw": self.model.state_dict(), "ema": {"decay": self.ema.decay, "updates": self.ema.updates}}
+            if self.ema is not None
+            else {}
+        )
         return {
             "version": CHECKPOINT_VERSION,
-            "model": self.model.state_dict(),
+            # With EMA on this is the averaged model, so inference loads it unchanged.
+            "model": self.selected_model.state_dict(),
+            **ema_state,
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
@@ -672,6 +713,8 @@ class Trainer:
         """
         payload = self._read_checkpoint(path)
         self.model.load_state_dict(payload["model"])
+        if self.ema is not None:
+            self.ema.reset(self.model)
         LOG.info(
             "Initialised the model from %s (epoch %s of that run); optimizer, schedule, best score and "
             "history start fresh.",
@@ -703,7 +746,12 @@ class Trainer:
                 "continue the same experiment; use train.init_weights for a new run from these weights."
             )
 
-        self.model.load_state_dict(payload["model"])
+        if self.ema is not None:
+            # The resume signature guarantees the checkpoint was written with the same EMA.
+            self.model.load_state_dict(payload["model_raw"])
+            self.ema.load_state_dict(payload["model"], payload["ema"]["updates"])
+        else:
+            self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
@@ -773,6 +821,16 @@ class Trainer:
                 "val_macro_ap": val_summary["macro_average_precision"],
                 "val_macro_f1": val_summary["macro_f1_at_threshold"],
             }
+            if self.ema is not None:
+                record["val_selection_score_raw"] = val_summary["raw_selection_score"]
+                record["val_macro_roc_auc_raw"] = val_summary["raw_macro_roc_auc"]
+                LOG.info(
+                    "epoch %d | EMA %s %.4f vs raw %.4f",
+                    epoch,
+                    self.selection_name,
+                    score,
+                    val_summary["raw_selection_score"],
+                )
             self.state.history.append(record)
             atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
             LOG.info(
@@ -834,6 +892,7 @@ class Trainer:
             "mode": self.mode,
             "fold": int(self.cfg.split.fold),
             "selection_metric": self.selection_name,
+            "ema_decay": self.ema_decay,
             "best_score": self.state.best_score if np.isfinite(self.state.best_score) else None,
             "best_epoch": self.state.best_epoch,
             "epochs_run": self.state.epoch + 1,

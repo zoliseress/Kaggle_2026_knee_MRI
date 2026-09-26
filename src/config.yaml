@@ -24,6 +24,7 @@ paths:
   # training-label experiment is scored against this same file; null = derive it from
   # the current label table, which then moves with the label policy.
   frozen_reference_csv: "work/labels/frozen_reference.csv"
+  laterality_csv: null             # default: <work_dir>/manifest/laterality.csv
 
   work_dir: "work"
   cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
@@ -67,6 +68,11 @@ data:
   cache_dtype: "float16"
   # Data-quality gate: studies with no usable series at all.
   allow_all_missing_studies: false
+  # Bring every study into one medial/lateral frame (laterality.py): right knees mirrored on
+  # coronal/axial, sagittal slices ordered towards lateral. Needs `build-laterality` first.
+  # Not part of the cache hash; the flip happens when a bag is read.
+  laterality_canonical: false
+  laterality_min_offset_mm: 20.0   # geometry fallback: |image-centre x| below this = unresolved
 
 augment:
   enabled: true
@@ -98,6 +104,11 @@ model:
   # How one slice's feature map becomes a vector (see model.py):
   # avg = global average (original) | avgmax = average + maximum | attention = learned weights
   spatial_pool: "avg"
+  # Per-target attention over (slot, depth zone, map half) window tokens, added to the head's
+  # logits (model.py). Meant together with data.laterality_canonical; needs spatial_pool=avg.
+  target_attention: false
+  attention_dim: 256
+  depth_zones: 3
 
 labels:
   source: "auto"                   # auto|details|wide|train_csv
@@ -129,6 +140,9 @@ train:
   max_epochs: 25
   warmup_epochs: 2
   early_stopping_patience: 5
+  # Weight EMA per optimizer step (0 = off). The EMA weights are validated, selected and saved
+  # as best.pt "model"; the raw weights are scored too (history *_raw). 0.999 ~ 1000 steps.
+  ema_decay: 0.0
   encoder_lr: 0.0001
   head_lr: 0.0003
   weight_decay: 0.0001

@@ -11,6 +11,14 @@ Tensor flow
     -> concat fixed-order slots + P presence flags -> [B, P*2*F + P]
     -> Linear(.., 256) -> ReLU -> Dropout -> Linear(256, 12) -> logits
 
+Optional target attention (model.target_attention, needs spatial_pool=avg): every window
+also yields two half-map vectors (column halves of its feature map). With
+data.laterality_canonical these are medial|lateral on coronal/axial and posterior|anterior
+on sagittal, and a window's depth zone (thirds of the valid windows) is medial/central/lateral
+on sagittal. Each target has its own query over all (slot, zone, half) tokens of the study;
+its pooled vector adds a per-target logit to the head's. The per-target output weights start
+at zero, so training starts from exactly the mean/max model.
+
 Padding never enters the mean denominator or the max, a fully missing slot produces
 an exactly zero finite feature vector, and no fake image is ever encoded (that would
 let BatchNorm learn from padding). The model returns logits; sigmoid is applied only
@@ -19,6 +27,7 @@ for metrics and exported predictions. There is no softmax across targets.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +165,72 @@ class SpatialAttentionPool(nn.Module):
         return torch.softmax(self.score(feature_map).flatten(2).float(), dim=-1).view(n, h, w)
 
 
+def depth_zones(valid: torch.Tensor, n_zones: int) -> torch.Tensor:
+    """`[B, P, S]` zone index of each window: its rank among the slot's VALID windows, in thirds (for 3).
+
+    Windows are ordered by slice index, so with the canonical laterality frame the sagittal
+    zones run medial -> lateral. Padded windows get zone 0; they are masked anyway.
+    """
+    rank = valid.long().cumsum(dim=-1) - 1
+    count = valid.long().sum(dim=-1, keepdim=True).clamp_min(1)
+    zone = torch.div(rank.clamp_min(0) * n_zones, count, rounding_mode="floor")
+    return zone.clamp(0, n_zones - 1).masked_fill(~valid, 0)
+
+
+class TargetAttentionReadout(nn.Module):
+    """Per-target attention over a study's (slot, depth zone, map half) window tokens.
+
+    score[t, token] = <key(h), q_t> / sqrt(d) + bias[t, slot, zone, half]; softmax over the
+    study's valid tokens; logit_t = w_t . LayerNorm(sum a * value(h)) + b_t. h carries learned
+    slot, zone and half embeddings, so a target can prefer e.g. lateral sagittal windows.
+    w and b start at zero: the readout adds nothing until it has learned something.
+    """
+
+    def __init__(self, feature_dim: int, n_slots: int, n_targets: int, dim: int = 256, n_zones: int = 3, n_halves: int = 2) -> None:
+        super().__init__()
+        self.dim, self.n_zones, self.n_halves = int(dim), int(n_zones), int(n_halves)
+        self.proj = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, self.dim), nn.GELU())
+        self.slot_emb = nn.Parameter(torch.randn(n_slots, self.dim) * 0.02)
+        self.zone_emb = nn.Parameter(torch.randn(self.n_zones, self.dim) * 0.02)
+        self.half_emb = nn.Parameter(torch.randn(self.n_halves, self.dim) * 0.02)
+        self.key = nn.Linear(self.dim, self.dim)
+        self.value = nn.Linear(self.dim, self.dim)
+        self.query = nn.Parameter(torch.randn(n_targets, self.dim) * 0.02)
+        self.position_bias = nn.Parameter(torch.zeros(n_targets, n_slots, self.n_zones, self.n_halves))
+        self.norm = nn.LayerNorm(self.dim)
+        self.out_weight = nn.Parameter(torch.zeros(n_targets, self.dim))
+        self.out_bias = nn.Parameter(torch.zeros(n_targets))
+
+    def forward(
+        self, tokens: torch.Tensor, valid: torch.Tensor, zones: torch.Tensor, return_attention: bool = False
+    ):
+        """tokens `[B, P, S, H, F]`, valid `[B, P, S]`, zones `[B, P, S]` -> logits `[B, T]`."""
+        b, p, s, halves, _ = tokens.shape
+        h = self.proj(tokens.float())
+        h = h + self.slot_emb.view(1, p, 1, 1, self.dim) + self.zone_emb[zones].unsqueeze(3) + self.half_emb.view(1, 1, 1, halves, self.dim)
+        keys = self.key(h).reshape(b, p * s * halves, self.dim)
+        values = self.value(h).reshape(b, p * s * halves, self.dim)
+
+        scores = torch.einsum("bnd,td->btn", keys, self.query) / math.sqrt(self.dim)
+        slot_index = torch.arange(p, device=tokens.device).view(1, p, 1, 1).expand(b, p, s, halves)
+        zone_index = zones.unsqueeze(-1).expand(b, p, s, halves)
+        half_index = torch.arange(halves, device=tokens.device).view(1, 1, 1, halves).expand(b, p, s, halves)
+        bias = self.position_bias[:, slot_index, zone_index, half_index]  # [T, B, P, S, H]
+        scores = scores + bias.permute(1, 0, 2, 3, 4).reshape(b, -1, p * s * halves)
+
+        token_valid = valid.unsqueeze(-1).expand(b, p, s, halves).reshape(b, 1, p * s * halves)
+        scores = scores.float().masked_fill(~token_valid, float("-inf"))
+        any_valid = token_valid.any(dim=-1, keepdim=True)  # [B, 1, 1]
+        weights = torch.softmax(torch.where(any_valid, scores, torch.zeros_like(scores)), dim=-1)
+        weights = torch.where(any_valid & token_valid, weights, torch.zeros_like(weights))
+        pooled = torch.einsum("btn,bnd->btd", weights, values.float())
+        logits = (self.norm(pooled) * self.out_weight).sum(dim=-1) + self.out_bias
+        logits = torch.where(any_valid.view(b, 1), logits, torch.zeros_like(logits))
+        if return_attention:
+            return logits, weights.view(b, -1, p, s, halves)
+        return logits
+
+
 class EfficientNetMIL(nn.Module):
     """Study-level multi-label classifier over per-slot slice bags."""
 
@@ -171,10 +246,15 @@ class EfficientNetMIL(nn.Module):
         spatial_pool: str = "avg",
         backbone: str = DEFAULT_BACKBONE,
         grad_checkpointing: bool = False,
+        target_attention: bool = False,
+        attention_dim: int = 256,
+        n_depth_zones: int = 3,
     ) -> None:
         super().__init__()
         if spatial_pool not in SPATIAL_POOLS:
             raise ValueError(f"spatial_pool must be one of {sorted(SPATIAL_POOLS)}, got {spatial_pool!r}")
+        if target_attention and spatial_pool != "avg":
+            raise ValueError("model.target_attention needs model.spatial_pool=avg (it pools map halves itself)")
         self.backbone = str(backbone)
         encoder, self.weights_info = build_encoder(weights, self.backbone)
         self.features = encoder.features
@@ -199,6 +279,13 @@ class EfficientNetMIL(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(float(head_dropout)),
             nn.Linear(int(head_hidden), self.n_targets),
+        )
+        self.target_attention = bool(target_attention)
+        self.n_depth_zones = int(n_depth_zones)
+        self.readout = (
+            TargetAttentionReadout(encoder_features, self.n_slots, self.n_targets, int(attention_dim), self.n_depth_zones)
+            if self.target_attention
+            else None
         )
 
     # -- BatchNorm policy -------------------------------------------------------------
@@ -228,6 +315,30 @@ class EfficientNetMIL(nn.Module):
             return torch.cat([averaged, maxed], dim=-1)
         assert self.attention_pool is not None
         return self.attention_pool(feature_map)
+
+    def encode_with_halves(self, triplets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """`[N, 3, H, W] -> ([N, F] global average, [N, 2, F] column-half averages)`.
+
+        The two halves share the middle column when the map width is odd; their mean is then
+        not exactly the global average, which is why both are returned.
+        """
+        def pooled(feature_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            width = feature_map.shape[-1]
+            half = (width + 1) // 2
+            left = feature_map[..., :half].mean(dim=(-2, -1))
+            right = feature_map[..., width - half :].mean(dim=(-2, -1))
+            return self.pool(feature_map).flatten(1), torch.stack([left, right], dim=1)
+
+        if triplets.shape[0] == 0:
+            empty = triplets.new_zeros((0, self.feature_dim))
+            return empty, triplets.new_zeros((0, 2, self.feature_dim))
+        chunks = (
+            triplets.split(self.encoder_chunk_size, dim=0)
+            if self.encoder_chunk_size and self.encoder_chunk_size > 0
+            else (triplets,)
+        )
+        outputs = [pooled(self._run_features(chunk)) for chunk in chunks]
+        return torch.cat([o[0] for o in outputs], dim=0), torch.cat([o[1] for o in outputs], dim=0)
 
     def encode(self, triplets: torch.Tensor) -> torch.Tensor:
         """`[N, 3, H, W] -> [N, feature_dim]`.
@@ -282,8 +393,14 @@ class EfficientNetMIL(nn.Module):
         indices = flat_valid.nonzero(as_tuple=False).squeeze(1)
 
         features = flat_images.new_zeros((b * p * s, self.feature_dim))
+        half_features = flat_images.new_zeros((b * p * s, 2, self.feature_dim)) if self.readout is not None else None
         if indices.numel() > 0:
-            encoded = self.encode(flat_images.index_select(0, indices))
+            selected = flat_images.index_select(0, indices)
+            if half_features is not None:
+                encoded, halves = self.encode_with_halves(selected)
+                half_features = half_features.index_copy(0, indices, halves.to(half_features.dtype))
+            else:
+                encoded = self.encode(selected)
             # index_copy keeps this differentiable and leaves padded rows at exact zero.
             features = features.index_copy(0, indices, encoded.to(features.dtype))
         features = features.view(b, p, s, self.feature_dim).float()
@@ -294,7 +411,12 @@ class EfficientNetMIL(nn.Module):
         flat_slots = slot_features.reshape(b, p * 2 * self.feature_dim)
         presence = series_present_mask.to(flat_slots.dtype)
         head_input = torch.cat([flat_slots, presence], dim=-1)
-        return self.head(head_input)
+        logits = self.head(head_input)
+        if self.readout is not None:
+            assert half_features is not None
+            tokens = half_features.view(b, p, s, 2, self.feature_dim)
+            logits = logits + self.readout(tokens, valid, depth_zones(valid, self.n_depth_zones))
+        return logits
 
     # -- Convenience ------------------------------------------------------------------
 
@@ -304,7 +426,8 @@ class EfficientNetMIL(nn.Module):
             {
                 # The attention scorer is new, like the head: same (higher) learning rate.
                 "params": list(self.head.parameters())
-                + (list(self.attention_pool.parameters()) if self.attention_pool is not None else []),
+                + (list(self.attention_pool.parameters()) if self.attention_pool is not None else [])
+                + (list(self.readout.parameters()) if self.readout is not None else []),
                 "lr": float(head_lr),
                 "weight_decay": float(weight_decay),
             },
@@ -317,6 +440,8 @@ class EfficientNetMIL(nn.Module):
             "n_slots": self.n_slots,
             "n_targets": self.n_targets,
             "spatial_pool": self.spatial_pool,
+            "target_attention": self.target_attention,
+            "n_depth_zones": self.n_depth_zones if self.target_attention else None,
             "feature_dim": self.feature_dim,
             "head_in": self.head_in,
             "freeze_bn_running_stats": self.freeze_bn_running_stats,
@@ -345,6 +470,9 @@ def build_model(cfg, n_slots: int | None = None) -> EfficientNetMIL:
         spatial_pool=str(cfg.model.get("spatial_pool", "avg")),
         backbone=str(cfg.model.get("backbone", DEFAULT_BACKBONE)),
         grad_checkpointing=bool(cfg.model.get("grad_checkpointing", False)),
+        target_attention=bool(cfg.model.get("target_attention", False)),
+        attention_dim=int(cfg.model.get("attention_dim", 256)),
+        n_depth_zones=int(cfg.model.get("depth_zones", 3)),
     )
     LOG.info("Model: %s", model.describe())
     return model

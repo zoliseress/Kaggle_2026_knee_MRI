@@ -208,3 +208,55 @@ def test_train_step_reduces_loss(cfg):
 
 def test_pseudonymous_patient_id(tmp_path):
     selftest.check_pseudonymous_patient_id(tmp_path)
+
+
+def test_ema_update_formula():
+    selftest.check_ema_update_formula()
+
+
+def test_ema_skipped_step():
+    selftest.check_ema_skipped_step()
+
+
+def test_ema_checkpoint_roundtrip(cfg):
+    selftest.check_ema_checkpoint_roundtrip(cfg)
+
+
+def test_ema_off_is_identity(cfg):
+    selftest.check_ema_off_is_identity(cfg)
+
+
+def test_exact_resume_with_ema(cfg):
+    selftest.check_exact_resume_with_ema(cfg)
+
+
+def test_laterality_rules():
+    selftest.check_laterality_rules()
+
+
+def test_laterality_derivation():
+    selftest.check_laterality_derivation()
+
+
+def test_laterality_dataset(cfg, tmp_path):
+    selftest.check_laterality_dataset(cfg, tmp_path)
+
+
+def test_depth_zones():
+    selftest.check_depth_zones()
+
+
+def test_target_attention_masking(cfg):
+    selftest.check_target_attention_masking(cfg)
+
+
+def test_target_attention_starts_as_head(cfg):
+    selftest.check_target_attention_starts_as_head(cfg)
+
+
+def test_target_attention_checkpoints(cfg, tmp_path):
+    selftest.check_target_attention_checkpoints(cfg, tmp_path)
+
+
+def test_target_attention_training_step(cfg):
+    selftest.check_target_attention_training_step(cfg)

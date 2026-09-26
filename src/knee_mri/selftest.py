@@ -1825,6 +1825,12 @@ def _exact_resume_checks(small: Config, tmp) -> str:
     full_params, resumed_params = full.model.state_dict(), resumed.model.state_dict()
     drift = max(float((full_params[k].float() - resumed_params[k].float()).abs().max()) for k in full_params)
     assert drift <= 1e-6, f"model weights differ after resume (max {drift:.2e})"
+    if full.ema is not None:
+        full_ema, resumed_ema = full.ema.state_dict(), resumed.ema.state_dict()
+        ema_drift = max(float((full_ema[k].float() - resumed_ema[k].float()).abs().max()) for k in full_ema)
+        assert ema_drift <= 1e-6, f"EMA weights differ after resume (max {ema_drift:.2e})"
+        assert full.ema.updates == resumed.ema.updates == full.state.global_step, "EMA update count not restored"
+    saved_params = full.selected_model.state_dict()  # what last.pt stores as "model"
 
     # Another experiment must not resume from this checkpoint ...
     other = resume_cfg.copy()
@@ -1841,7 +1847,11 @@ def _exact_resume_checks(small: Config, tmp) -> str:
     other.train.init_weights = str(tmp / "full" / "last.pt")
     tuned = build(other, "tuned")
     assert tuned.state.epoch == 0 and not tuned.state.history and tuned.state.best_score == float("-inf")
-    assert all(torch.equal(v, full_params[k]) for k, v in tuned.model.state_dict().items()), "init_weights not loaded"
+    assert all(torch.equal(v, saved_params[k]) for k, v in tuned.model.state_dict().items()), "init_weights not loaded"
+    if tuned.ema is not None:
+        assert tuned.ema.updates == 0 and all(
+            torch.equal(v, saved_params[k]) for k, v in tuned.ema.state_dict().items()
+        ), "init_weights must restart the EMA from the loaded weights"
     other.train.resume = other.train.init_weights
     try:
         build(other, "both")
@@ -1869,6 +1879,469 @@ def check_train_step_reduces_loss(cfg: Config) -> str:
         losses.append(float(output.loss.detach()))
     assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
     return f"loss {losses[0]:.4f} -> {losses[-1]:.4f} over 6 steps"
+
+
+# --------------------------------------------------------------------------------------
+# Laterality: one medial/lateral frame for right and left knees
+# --------------------------------------------------------------------------------------
+
+
+def check_laterality_rules() -> str:
+    """Tag parsing, the geometry threshold, the flip table and the gap_ok reversal."""
+    from .laterality import apply_canonical, canonical_ops, image_center_x, side_from_center_x, side_from_tag
+
+    assert side_from_tag([None, "", "B", "RIGHT"]) == "R" and side_from_tag(["l"]) == "L" and side_from_tag(["B", float("nan")]) == ""
+    assert side_from_center_x(-80.0, 20.0) == "R" and side_from_center_x(35.0, 20.0) == "L"
+    assert side_from_center_x(-12.0, 20.0) == "" and side_from_center_x(float("nan"), 20.0) == ""
+    # identity orientation, 100 x 200 pixels of 0.5 mm: centre = IPP + (200*0.5/2, 100*0.5/2)
+    assert math.isclose(image_center_x([-100.0, 0, 0], [1, 0, 0, 0, 1, 0], [0.5, 0.5], 100, 200), -50.0)
+
+    table = {
+        ("R", "coronal", -1.0): (False, True),
+        ("L", "coronal", -1.0): (False, False),
+        ("R", "axial", 1.0): (False, True),
+        ("L", "axial", 1.0): (False, False),
+        # sagittal: index follows the normal; lateral is -x for a right knee, +x for a left one
+        ("R", "sagittal", -1.0): (False, False),
+        ("R", "sagittal", 1.0): (True, False),
+        ("L", "sagittal", -1.0): (True, False),
+        ("L", "sagittal", 1.0): (False, False),
+        ("L", "sagittal", float("nan")): (False, False),
+        ("", "coronal", -1.0): (False, False),
+        ("", "sagittal", 1.0): (False, False),
+    }
+    for (side, plane, nx), expected in table.items():
+        assert canonical_ops(side, plane, nx) == expected, f"{side} {plane} nx={nx}: {canonical_ops(side, plane, nx)} != {expected}"
+
+    image = np.arange(4 * 2 * 3, dtype=np.float32).reshape(4, 2, 3)
+    gap_ok = np.array([True, False, True])  # gap between slices 1 and 2 is unusable
+    out, gaps = apply_canonical(image, gap_ok, reverse_slices=True, flip_columns=True)
+    assert np.array_equal(out, image[::-1, :, ::-1]) and out.flags["C_CONTIGUOUS"]
+    assert gaps.tolist() == [True, False, True][::-1], "gap_ok must follow the slice reversal"
+    out, gaps = apply_canonical(image, gap_ok, reverse_slices=False, flip_columns=False)
+    assert out is image and gaps is gap_ok, "no-op must not copy"
+    return "tag > geometry (|x| >= offset), right knees mirrored on coronal/axial, sagittal ordered to lateral, gaps follow"
+
+
+def check_laterality_derivation() -> str:
+    """Tag first, geometry second, unresolved near the midline; normal_x from the selected sagittal volume."""
+    from .laterality import derive_laterality
+
+    manifest = pd.DataFrame(
+        {
+            STUDY_ID: ["a", "a", "b", "c", "d", "d"],
+            "volume_id": ["a_sag", "a_cor", "b_sag", "c_cor", "d_sag", "d_other_sag"],
+            "laterality": ["L", "", "", "", "RIGHT", "RIGHT"],
+            "normal_x": [-1.0, 0.0, 1.0, 0.0, 1.0, -1.0],
+        }
+    )
+    selection = pd.DataFrame(
+        {
+            STUDY_ID: ["a", "a", "b", "b", "c", "d", "d"],
+            "slot": ["sagittal", "coronal", "sagittal", "axial", "coronal", "sagittal", "coronal"],
+            "volume_id": ["a_sag", "a_cor", "b_sag", "b_ax", "c_cor", "d_sag", "d_cor"],
+            "selected": [True] * 7,
+            "path": ["-", "a_cor", "-", "b_ax", "c_cor", "-", "d_cor"],
+        }
+    )
+    centre_x = {"a_cor": -90.0, "b_ax": -75.0, "c_cor": 5.0, "d_cor": 60.0}  # a: tag L beats geometry R
+    table = derive_laterality(manifest, selection, min_offset_mm=20.0, workers=1, center_x_reader=centre_x.get).set_index(STUDY_ID)
+    assert table.loc["a", "side"] == "L" and table.loc["a", "side_source"] == "tag" and table.loc["a", "geometry_side"] == "R"
+    assert table.loc["b", "side"] == "R" and table.loc["b", "side_source"] == "geometry"
+    assert table.loc["c", "side"] == "" and table.loc["c", "side_source"] == "unresolved"
+    assert table.loc["d", "side"] == "R" and table.loc["d", "sagittal_normal_x"] == 1.0, "normal_x of the SELECTED sagittal volume"
+    assert table.loc["a", "sagittal_normal_x"] == -1.0 and np.isnan(table.loc["c", "sagittal_normal_x"])
+    return "tag wins, geometry fills in, |x| < offset stays unresolved, sagittal normal from the selected volume"
+
+
+class _SideAwareExpectedDataset(_InMemoryStudyBagDataset):
+    """The expected bags, built by flipping the synthetic volume by hand (laterality off)."""
+
+    SIDES: dict = {}
+
+    def _load_slot(self, study: str, slot: str) -> tuple[np.ndarray | None, dict]:
+        image, meta = super()._load_slot(study, slot)
+        side, reverse_sagittal = self.SIDES[study]
+        if slot in ("coronal", "axial") and side == "R":
+            image = np.flip(image, axis=-1).copy()
+        if slot == "sagittal" and reverse_sagittal:
+            image = np.flip(image, axis=0).copy()
+        return image, meta
+
+
+def check_laterality_dataset(cfg: Config, tmp_dir) -> str:
+    """data.laterality_canonical flips exactly the bags the table says, validation and training alike."""
+    from pathlib import Path
+
+    path = Path(tmp_dir) / "laterality.csv"
+    pd.DataFrame(
+        {
+            STUDY_ID: ["study0", "study1", "study2"],
+            "side": ["R", "L", ""],
+            "side_source": ["tag", "geometry", "unresolved"],
+            "tag_side": ["R", "", ""],
+            "geometry_side": ["R", "L", ""],
+            "center_x_mm": [-80.0, 70.0, 3.0],
+            "sagittal_normal_x": [-1.0, -1.0, -1.0],
+        }
+    ).to_csv(path, index=False)
+    # study0 (R, nx<0): mirror coronal/axial, sagittal already lateral-ward; study1 (L, nx<0):
+    # reverse sagittal only; study2: untouched.
+    _SideAwareExpectedDataset.SIDES = {"study0": ("R", False), "study1": ("L", True), "study2": ("", False)}
+
+    on = cfg.copy()
+    on.data.series_slots = ["sagittal", "coronal", "axial"]
+    on.data.laterality_canonical = True
+    on.paths.laterality_csv = str(path)
+    off = on.copy()
+    off.data.laterality_canonical = False
+    ids = ["study0", "study1", "study2"]
+    for train in (False, True):
+        actual = _InMemoryStudyBagDataset(on, ids, None, train=train)
+        expected = _SideAwareExpectedDataset(off, ids, None, train=train)
+        plain = _InMemoryStudyBagDataset(off, ids, None, train=train)
+        for i, study in enumerate(ids):
+            a, e, n = actual[(i, 1)], expected[(i, 1)], plain[(i, 1)]
+            assert torch.equal(a["images"], e["images"]), f"{study} (train={train}) not in the canonical frame"
+            assert a["meta"]["laterality_side"] == ["R", "L", ""][i]
+            changed = not torch.equal(a["images"], n["images"])
+            assert changed == (study != "study2"), f"{study}: flip applied={changed}"
+    missing = on.copy()
+    missing.paths.laterality_csv = str(Path(tmp_dir) / "absent.csv")
+    try:
+        _InMemoryStudyBagDataset(missing, ids, None, train=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a missing laterality table was accepted")
+    return "R mirrored on coronal/axial, L sagittal reversed, unresolved untouched; missing table refused"
+
+
+# --------------------------------------------------------------------------------------
+# Target attention over (slot, depth zone, map half) tokens
+# --------------------------------------------------------------------------------------
+
+
+def _target_attention_model(cfg: Config, enabled: bool, seed: int = 0):
+    from .model import build_model
+
+    built = cfg.copy()
+    built.model.weights = "none"
+    built.model.head_dropout = 0.0
+    built.model.target_attention = enabled
+    torch.manual_seed(seed)
+    return build_model(built).eval()
+
+
+def check_depth_zones() -> str:
+    """Zones are thirds of the VALID windows in slice order; padding gets zone 0."""
+    from .model import depth_zones
+
+    valid = torch.zeros((1, 3, 6), dtype=torch.bool)
+    valid[0, 0] = True  # 6 valid windows
+    valid[0, 1, :5] = True  # 5 valid, 1 padded
+    valid[0, 2, :1] = True  # a single window
+    zones = depth_zones(valid, 3)[0].tolist()
+    assert zones[0] == [0, 0, 1, 1, 2, 2], zones[0]
+    assert zones[1] == [0, 0, 1, 1, 2, 0], zones[1]
+    assert zones[2] == [0, 0, 0, 0, 0, 0], zones[2]
+    return "6 -> 001122, 5 valid -> 00112 + padded 0, single window -> 0"
+
+
+def check_target_attention_starts_as_head(cfg: Config) -> str:
+    """Zero output weights: the enabled model reproduces the mean/max model exactly, and learns from there."""
+    wide = cfg.copy()
+    wide.data.image_size = 64  # a 2x2 map, so the two halves differ
+    base = _target_attention_model(wide, enabled=False, seed=3)
+    attn = _target_attention_model(wide, enabled=True, seed=3)
+    missing, unexpected = attn.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected and all(k.startswith("readout.") for k in missing), (missing, unexpected)
+    batch = _random_batch(wide, b=2, seed=4)
+    batch["slice_valid_mask"][1, 0, 2:] = False  # padding in one slot
+    batch["series_present_mask"][1, 2] = False  # a missing slot
+    inputs = (batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+    with torch.no_grad():
+        expected, actual = base(*inputs), attn(*inputs)
+    assert torch.allclose(expected, actual, atol=1e-6), "the readout must add exactly 0 at initialisation"
+
+    attn.train()
+    attn(*inputs).sum().backward()
+    readout = attn.readout
+    assert readout is not None and float(readout.out_weight.grad.abs().max()) > 0, "output weights get no gradient"
+    groups = attn.parameter_groups(encoder_lr=1e-4, head_lr=3e-4, weight_decay=0.0)
+    head_params = {id(q) for q in groups[1]["params"]}
+    assert all(id(q) in head_params for q in readout.parameters()), "the readout must use the head lr"
+    n_params = sum(q.numel() for q in readout.parameters())
+    return f"identical logits at init with padding and a missing slot; readout ({n_params / 1e3:.0f}k params) trains at the head lr"
+
+
+def check_target_attention_masking(cfg: Config) -> str:
+    """Weights sum to 1 over valid tokens, never touch padding, follow the position bias; empty studies stay finite."""
+    from .model import TargetAttentionReadout, depth_zones
+
+    torch.manual_seed(0)
+    readout = TargetAttentionReadout(feature_dim=16, n_slots=3, n_targets=N_TARGETS, dim=8, n_zones=3).eval()
+    tokens = torch.randn(2, 3, 6, 2, 16)
+    valid = torch.ones((2, 3, 6), dtype=torch.bool)
+    valid[0, 1, 4:] = False
+    valid[1] = False  # a study without any window
+    zones = depth_zones(valid, 3)
+    with torch.no_grad():
+        readout.position_bias.zero_()
+        readout.position_bias[3, 0, 2, 1] = 30.0  # target 3: sagittal slot, last zone, second half
+        logits, weights = readout(tokens, valid, zones, return_attention=True)
+    assert torch.isfinite(logits).all() and torch.equal(logits[1], torch.zeros(N_TARGETS)), "empty study must give 0"
+    sums = weights[0].sum(dim=(1, 2, 3))
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), f"weights do not sum to 1: {sums}"
+    assert float(weights[0][:, 1, 4:].abs().max()) == 0.0, "padded windows received attention"
+    assert float(weights[1].abs().max()) == 0.0
+    focus = float(weights[0, 3, 0, 4:, 1].sum())  # zone 2 of slot 0 = windows 4, 5; half 1
+    assert focus > 0.99, f"position bias did not steer target 3 (mass {focus:.3f})"
+    return f"normalised over valid tokens, padding and empty studies safe, bias steers attention ({focus:.3f})"
+
+
+def check_target_attention_checkpoints(cfg: Config, tmp_dir) -> str:
+    """Inference rebuilds the readout from the checkpoint; older checkpoints stay plain; laterality is enforced."""
+    from pathlib import Path
+
+    from .constants import CHECKPOINT_VERSION
+    from .evaluate import load_checkpoint_for_inference
+
+    def save(model, tree, name):
+        path = Path(tmp_dir) / name
+        torch.save(
+            {
+                "version": CHECKPOINT_VERSION,
+                "target_order": list(TARGETS),
+                "config": tree,
+                "model_description": model.describe(),
+                "model": model.state_dict(),
+            },
+            path,
+        )
+        return path
+
+    trained = cfg.copy()
+    trained.model.weights = "none"
+    trained.model.target_attention = True
+    trained.data.laterality_canonical = True
+    model = _target_attention_model(cfg, enabled=True, seed=8)
+    with torch.no_grad():
+        model.readout.out_weight.normal_()  # a trained readout that matters
+    path = save(model, trained.to_dict(), "attn.pt")
+    batch = _random_batch(cfg, b=1, seed=9)
+    inputs = (batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+    caller = cfg.copy()
+    caller.model.target_attention = False
+    caller.data.laterality_canonical = True
+    loaded, _ = load_checkpoint_for_inference(caller, path)
+    with torch.no_grad():
+        assert loaded.describe()["target_attention"] and torch.allclose(model(*inputs), loaded(*inputs), atol=1e-6)
+
+    # A checkpoint written before these keys existed: plain model, trained without the frame.
+    legacy = _target_attention_model(cfg, enabled=False, seed=8)
+    tree = cfg.copy().to_dict()
+    for key in ("target_attention", "attention_dim", "depth_zones"):
+        tree["model"].pop(key, None)
+    for key in ("laterality_canonical", "laterality_min_offset_mm"):
+        tree["data"].pop(key, None)
+    description = legacy.describe()
+    for key in ("target_attention", "n_depth_zones"):
+        description.pop(key, None)
+    legacy_path = Path(tmp_dir) / "legacy.pt"
+    torch.save(
+        {"version": CHECKPOINT_VERSION, "target_order": list(TARGETS), "config": tree,
+         "model_description": description, "model": legacy.state_dict()},
+        legacy_path,
+    )
+    plain_caller = cfg.copy()
+    plain_caller.model.target_attention = True  # must not decide an old checkpoint's architecture
+    plain_caller.data.laterality_canonical = False
+    assert not load_checkpoint_for_inference(plain_caller, legacy_path)[0].describe()["target_attention"]
+    for checkpoint, wrong_frame in ((legacy_path, True), (path, False)):
+        mismatched = cfg.copy()
+        mismatched.data.laterality_canonical = wrong_frame
+        try:
+            load_checkpoint_for_inference(mismatched, checkpoint)
+        except ValueError as error:
+            assert "data.laterality_canonical" in str(error), error
+        else:
+            raise AssertionError(f"{checkpoint.name}: inputs in the wrong laterality frame were accepted")
+    return "readout rebuilt from the checkpoint; legacy = plain + no frame; a laterality-frame mismatch is refused"
+
+
+def check_target_attention_training_step(cfg: Config) -> str:
+    """The full synthetic training path runs with target attention and the laterality keys off."""
+    import tempfile
+    from pathlib import Path
+
+    from .train import run_synthetic
+
+    small = cfg.copy()
+    small.model.target_attention = True
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    with tempfile.TemporaryDirectory(prefix="knee_mri_tattn_") as tmp:
+        small.paths.output_dir = str(Path(tmp))
+        try:
+            run_synthetic(small, n_studies=8, epochs=1, name="tattn")
+            history = pd.read_csv(Path(tmp) / "tattn" / "history.csv")
+        finally:
+            remove_file_logging(tmp)
+    assert np.isfinite(history["train_loss"]).all()
+    return f"synthetic epoch with target attention: train loss {float(history['train_loss'].iloc[-1]):.4f}"
+
+
+# --------------------------------------------------------------------------------------
+# Weight EMA
+# --------------------------------------------------------------------------------------
+
+
+def check_ema_update_formula() -> str:
+    """ema_t = d_t * ema_{t-1} + (1 - d_t) * param_t with d_t = min(decay, (1+t)/(10+t)); buffers copied."""
+    from .ema import ModelEMA
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.BatchNorm1d(2))
+    ema = ModelEMA(model, decay=0.9)
+    expected = {k: v.detach().clone().double() for k, v in model.named_parameters()}
+    decays = []
+    for t in range(1, 101):
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(torch.randn_like(parameter))
+            model[1].running_mean.add_(1.0)
+        d = min(0.9, (1.0 + t) / (10.0 + t))
+        decays.append(d)
+        assert math.isclose(ema.current_decay(), d), f"step {t}: decay {ema.current_decay()} != {d}"
+        ema.update(model)
+        for name, parameter in model.named_parameters():
+            expected[name] = d * expected[name] + (1 - d) * parameter.detach().double()
+    got = dict(ema.module.named_parameters())
+    err = max(float((got[k].double() - v).abs().max()) for k, v in expected.items())
+    assert err < 1e-5, f"EMA deviates from the recursion by {err:.2e}"
+    assert torch.equal(ema.module[1].running_mean, model[1].running_mean), "buffers must be copied, not averaged"
+    assert ema.updates == 100 and decays[0] == 2 / 11 and decays[-1] == 0.9 and decays[78] < 0.9
+    assert not any(p.requires_grad for p in ema.module.parameters()), "the EMA copy must not collect gradients"
+    return f"100 updates match the warmed-up recursion (max err {err:.1e}; d: {decays[0]:.3f} -> {decays[-1]:.3f})"
+
+
+def check_ema_skipped_step() -> str:
+    """An overflow-skipped optimizer step must not move the EMA."""
+    from types import SimpleNamespace
+
+    from .ema import ModelEMA
+    from .train import Trainer, TrainState, make_scheduler
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    cfg = load_config(resolve=False)
+    cfg.train.grad_clip = 1.0
+    trainer = SimpleNamespace(
+        cfg=cfg,
+        model=model,
+        optimizer=optimizer,
+        scheduler=make_scheduler(optimizer, warmup_steps=2, total_steps=10),
+        scaler=torch.amp.GradScaler("cpu", init_scale=2.0**8),
+        state=TrainState(),
+        ema=ModelEMA(model, decay=0.5),
+    )
+    x = torch.ones(4, 2)
+
+    def step(loss_scale: float) -> None:
+        optimizer.zero_grad(set_to_none=True)
+        trainer.scaler.scale(model(x).sum() * loss_scale).backward()
+        Trainer._optimizer_step(trainer)
+
+    step(1.0)
+    assert trainer.ema.updates == 1
+    before = trainer.ema.module.weight.detach().clone()
+    step(float("inf"))
+    assert trainer.ema.updates == 1 and torch.equal(trainer.ema.module.weight, before), "a skipped step moved the EMA"
+    step(1.0)
+    assert trainer.ema.updates == 2
+    return "the EMA is updated once per optimizer step actually taken, never on a skipped one"
+
+
+def _ema_synthetic_trainer(cfg: Config, tmp, name: str, ema_decay: float, epochs: int = 2):
+    from .train import build_synthetic_trainer
+
+    small = cfg.copy()
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.microbatch_studies = 1
+    small.train.accumulation_steps = 2
+    small.train.early_stopping_patience = 10
+    small.train.resume = None
+    small.train.init_weights = None
+    small.train.ema_decay = ema_decay
+    small.paths.output_dir = str(tmp)
+    return build_synthetic_trainer(small, n_studies=6, epochs=epochs, name=name)
+
+
+def check_ema_checkpoint_roundtrip(cfg: Config) -> str:
+    """best/last.pt store the EMA as "model": inference reproduces the trainer's EMA predictions."""
+    import tempfile
+    from pathlib import Path
+
+    from .evaluate import load_checkpoint_for_inference
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_ema_") as tmp:
+        try:
+            trainer = _ema_synthetic_trainer(cfg, Path(tmp), "ema", ema_decay=0.9)
+            trainer.fit()
+            history = pd.DataFrame(trainer.state.history)
+            for column in ("val_selection_score_raw", "val_macro_roc_auc_raw"):
+                assert column in history and history[column].notna().all(), f"history lacks {column}"
+            payload = torch.load(Path(tmp) / "ema" / "last.pt", map_location="cpu", weights_only=False)
+            assert payload["ema"]["updates"] == trainer.state.global_step > 0
+            for key, value in trainer.ema.state_dict().items():
+                assert torch.equal(payload["model"][key].cpu(), value.cpu()), f"'model' is not the EMA ({key})"
+            for key, value in trainer.model.state_dict().items():
+                assert torch.equal(payload["model_raw"][key].cpu(), value.cpu()), f"'model_raw' is not the raw model ({key})"
+            differs = any(
+                not torch.equal(payload["model"][k], payload["model_raw"][k])
+                for k in payload["model"]
+                if payload["model"][k].is_floating_point()
+            )
+            assert differs, "EMA and raw weights are identical - the average did nothing"
+
+            _, expected = trainer.predict(trainer.val_loader)
+            _, raw = trainer.predict(trainer.val_loader, trainer.model)
+            loaded, _ = load_checkpoint_for_inference(trainer.cfg, Path(tmp) / "ema" / "last.pt")
+            _, actual = trainer.predict(trainer.val_loader, loaded.to(trainer.device_spec.device))
+            assert np.allclose(expected, actual, atol=1e-6), "the loaded checkpoint does not reproduce the EMA predictions"
+            assert not np.allclose(raw, actual, atol=1e-6), "inference loaded the raw weights, not the EMA"
+        finally:
+            remove_file_logging(tmp)
+    return "last.pt 'model' = EMA ('model_raw' kept for resume); inference reproduces the EMA scores; *_raw logged"
+
+
+def check_ema_off_is_identity(cfg: Config) -> str:
+    """ema_decay = 0 leaves the payload, history and resume signature exactly as before."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_noema_") as tmp:
+        try:
+            trainer = _ema_synthetic_trainer(cfg, Path(tmp), "noema", ema_decay=0.0, epochs=1)
+            trainer.fit()
+            assert trainer.ema is None and trainer.selected_model is trainer.model
+            payload = torch.load(Path(tmp) / "noema" / "last.pt", map_location="cpu", weights_only=False)
+            assert "model_raw" not in payload and "ema" not in payload
+            assert not any(c.endswith("_raw") for c in pd.DataFrame(trainer.state.history).columns)
+            assert "train.ema_decay" not in trainer.resume_signature, "the signature would refuse older checkpoints"
+        finally:
+            remove_file_logging(tmp)
+    return "EMA off: no model_raw/ema in the payload, no *_raw history columns, unchanged resume signature"
+
+
+def check_exact_resume_with_ema(cfg: Config) -> str:
+    """The exact-resume guarantee also holds for the raw weights AND the EMA."""
+    ema_cfg = cfg.copy()
+    ema_cfg.train.ema_decay = 0.9
+    return check_exact_resume(ema_cfg)
 
 
 # --------------------------------------------------------------------------------------
@@ -1914,6 +2387,13 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
             ("nonfinite_scores_rejected", check_nonfinite_scores_rejected),
             ("skipped_amp_step", check_skipped_amp_step),
+            ("ema_update_formula", check_ema_update_formula),
+            ("laterality_rules", check_laterality_rules),
+            ("laterality_derivation", check_laterality_derivation),
+            ("laterality_dataset", lambda: check_laterality_dataset(small, tmp_dir)),
+            ("depth_zones", check_depth_zones),
+            ("target_attention_masking", lambda: check_target_attention_masking(small)),
+            ("ema_skipped_step", check_ema_skipped_step),
             ("soft_reference", check_soft_reference),
             ("bootstrap_keeps_soft", check_bootstrap_keeps_soft),
             ("crop_edge_fill", check_crop_edge_fill),
@@ -1933,6 +2413,12 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("sigmoid_not_softmax", lambda: check_sigmoid_outputs(small)),
                 ("checkpoint_roundtrip", lambda: check_checkpoint_roundtrip(small, tmp_dir)),
                 ("exact_resume", lambda: check_exact_resume(small)),
+                ("exact_resume_with_ema", lambda: check_exact_resume_with_ema(small)),
+                ("ema_checkpoint_roundtrip", lambda: check_ema_checkpoint_roundtrip(small)),
+                ("ema_off_is_identity", lambda: check_ema_off_is_identity(small)),
+                ("target_attention_starts_as_head", lambda: check_target_attention_starts_as_head(small)),
+                ("target_attention_checkpoints", lambda: check_target_attention_checkpoints(small, tmp_dir)),
+                ("target_attention_training_step", lambda: check_target_attention_training_step(small)),
                 ("inference_architecture", lambda: check_inference_architecture(small, tmp_dir)),
                 ("backbone_choice", lambda: check_backbone_choice(small)),
                 ("grad_checkpointing_is_exact", lambda: check_grad_checkpointing_is_exact(small)),

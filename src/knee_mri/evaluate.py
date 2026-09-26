@@ -25,12 +25,18 @@ from .utils import LOG, atomic_write_dataframe, atomic_write_json, autocast_ctx,
 # Input keys the dataset applies at inference time that the model's weights depend on. A
 # mismatch feeds the model other inputs than it was trained on - with identical tensor
 # shapes for a reordered slot list or another normalisation, so nothing would crash.
-INFERENCE_DATA_KEYS = ("data.image_size", "data.series_slots", "data.centers_per_series", "data.encoder_normalization")
+INFERENCE_DATA_KEYS = (
+    "data.image_size", "data.series_slots", "data.centers_per_series", "data.encoder_normalization",
+    "data.laterality_canonical",
+)
 # Model keys that are not architecture: the pretrained source (the checkpoint replaces it)
 # and the memory-only chunking / gradient checkpointing, which the inference host may tune.
 # A checkpoint without model.backbone predates the key and is B0 (the config default).
 RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
-ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "feature_dim", "head_in")
+ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "target_attention", "feature_dim", "head_in")
+# What a checkpoint written before a key existed was trained with: absent means the default,
+# never "skip the check" - an old model must not silently receive mirrored inputs.
+INFERENCE_DATA_DEFAULTS = {"data.laterality_canonical": False}
 
 
 def load_checkpoint_for_inference(
@@ -59,7 +65,8 @@ def load_checkpoint_for_inference(
     stored_cfg = Config(stored_tree)
     mismatched = {}
     for key in INFERENCE_DATA_KEYS:
-        stored, current = stored_cfg.get_dotted(key), cfg.get_dotted(key)
+        stored = stored_cfg.get_dotted(key, INFERENCE_DATA_DEFAULTS.get(key))
+        current = cfg.get_dotted(key, INFERENCE_DATA_DEFAULTS.get(key))
         if stored is None:
             continue
         differs = list(stored) != list(current) if isinstance(stored, (list, tuple)) else stored != current
@@ -80,6 +87,7 @@ def load_checkpoint_for_inference(
     stored_model = stored_tree.get("model")
     if stored_model:
         build_cfg.set_dotted("model.backbone", stored_model.get("backbone", DEFAULT_BACKBONE))
+        build_cfg.set_dotted("model.target_attention", bool(stored_model.get("target_attention", False)))
         for key, value in stored_model.items():
             if key not in RUNTIME_MODEL_KEYS:
                 build_cfg.set_dotted(f"model.{key}", value)

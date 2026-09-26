@@ -43,6 +43,7 @@ from torch.utils.data import Dataset, Sampler
 from .config import Config
 from .constants import IMAGENET_MEAN, IMAGENET_STD, MRI_SCALAR_MEAN, MRI_SCALAR_STD, N_TARGETS
 from .labels import LabelTable
+from .laterality import apply_canonical, canonical_ops, laterality_path, load_laterality
 from .preprocess import cache_path, preprocess_hash, read_cache_entry
 from .utils import LOG
 
@@ -386,6 +387,27 @@ class StudyBagDataset(Dataset):
         self.mean = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
         self.std = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
         self.failures: dict[str, str] = {}
+        # data.laterality_canonical: mirror / reorder every study into one medial-lateral frame
+        # (see laterality.py). Studies without a resolved side are used as they are.
+        self.laterality: dict[str, tuple[str, float]] | None = None
+        if bool(cfg.data.get("laterality_canonical", False)):
+            table = load_laterality(laterality_path(cfg))
+            self.laterality = {s: table.get(s, ("", float("nan"))) for s in self.study_ids}
+            missing = sum(1 for s in self.study_ids if s not in table)
+            unresolved = sum(1 for side, _ in self.laterality.values() if side not in ("R", "L"))
+            LOG.info(
+                "Laterality canonical frame: %d studies, %d right / %d left, %d unresolved (%d absent from the table)",
+                len(self.study_ids),
+                sum(1 for side, _ in self.laterality.values() if side == "R"),
+                sum(1 for side, _ in self.laterality.values() if side == "L"),
+                unresolved,
+                missing,
+            )
+            if missing > 0.01 * max(1, len(self.study_ids)):
+                raise ValueError(
+                    f"{missing}/{len(self.study_ids)} studies are absent from the laterality table "
+                    f"{laterality_path(cfg)}; rebuild it (`build-laterality`) for this study set."
+                )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -439,6 +461,10 @@ class StudyBagDataset(Dataset):
                 slot_slices.append(0)
                 continue
             gap_ok = np.asarray(meta.get("gap_ok", []), dtype=bool) if meta.get("gap_ok") is not None else None
+            if self.laterality is not None:
+                side, sagittal_normal_x = self.laterality[study]
+                reverse, flip = canonical_ops(side, slot, sagittal_normal_x)
+                image, gap_ok = apply_canonical(image, gap_ok, reverse, flip)
             rng = self._rng(index, p, epoch)
             centers, valid = bin_centers(image.shape[0], self.n_centers, rng if self.train else None)
             bag, subs = build_bag(image, centers, valid, gap_ok)
@@ -485,6 +511,7 @@ class StudyBagDataset(Dataset):
                 "slot_slices": slot_slices,
                 "gap_substitutions": int(substitutions),
                 "n_valid_centers": int(slice_valid.sum()),
+                "laterality_side": self.laterality[study][0] if self.laterality is not None else None,
             },
         }
         if augment_params is not None:
