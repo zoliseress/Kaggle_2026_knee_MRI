@@ -254,14 +254,3 @@ def reset_peak_gpu_memory() -> None:
             torch.cuda.reset_peak_memory_stats()
     except Exception:  # pragma: no cover - environment dependent
         pass
-
-
-def release_cached_gpu_memory() -> None:
-    """Return the caching allocator's unused blocks to the driver (e.g. after validation)."""
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # pragma: no cover - environment dependent
-        pass

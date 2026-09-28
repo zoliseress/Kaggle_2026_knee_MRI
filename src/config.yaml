@@ -109,6 +109,10 @@ model:
   target_attention: false
   attention_dim: 256
   depth_zones: 3
+  # Side pooling (model.py): the head gets one mean/max per side of each slot (coronal/axial
+  # column halves = medial | lateral, sagittal depth zones = medial / central / lateral)
+  # instead of one per slot. Needs data.laterality_canonical and spatial_pool=avg.
+  side_pooling: false
 
 labels:
   source: "auto"                   # auto|details|wide|train_csv

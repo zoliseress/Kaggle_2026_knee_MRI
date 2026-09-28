@@ -353,8 +353,12 @@ class Trainer:
             del signature["model"]["backbone"]
         # The target-attention keys only matter when it is on.
         if not signature["model"].get("target_attention"):
-            for key in ("target_attention", "attention_dim", "depth_zones"):
+            for key in ("target_attention", "attention_dim"):
                 signature["model"].pop(key, None)
+        if not signature["model"].get("side_pooling"):
+            signature["model"].pop("side_pooling", None)
+        if not (signature["model"].get("target_attention") or signature["model"].get("side_pooling")):
+            signature["model"].pop("depth_zones", None)
         # Likewise the laterality keys: only part of the signature when the frame is on.
         data = dict(signature["data"] or {})
         if not data.get("laterality_canonical"):

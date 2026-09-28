@@ -2193,6 +2193,146 @@ def check_target_attention_training_step(cfg: Config) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Side pooling: one mean/max per side of each slot
+# --------------------------------------------------------------------------------------
+
+
+def _side_pooling_model(cfg: Config, seed: int = 0, target_attention: bool = False):
+    from .model import build_model
+
+    built = cfg.copy()
+    built.model.weights = "none"
+    built.model.head_dropout = 0.0
+    built.model.side_pooling = True
+    built.model.target_attention = target_attention
+    torch.manual_seed(seed)
+    return build_model(built).eval()
+
+
+def check_side_pooling_features(cfg: Config) -> str:
+    """Head input = per-zone (sagittal) / per-half (coronal, axial) masked mean and max, by hand."""
+    from .model import depth_zones, masked_max, masked_mean
+
+    wide = cfg.copy()
+    wide.data.image_size = 64  # a 2x2 map: two distinct column halves
+    wide.data.series_slots = ["sagittal", "coronal", "axial"]
+    wide.data.centers_per_series = 5
+    model = _side_pooling_model(wide, seed=5)
+    f = model.feature_dim
+    assert model.slot_sides == ("zones", "halves", "halves")
+    assert model.head_in == (3 + 2 + 2) * 2 * f + 3, model.head_in
+
+    batch = _random_batch(wide, b=2, seed=6)
+    batch["slice_valid_mask"][1, 0, 3:] = False  # 3 sagittal windows: one per zone
+    batch["slice_valid_mask"][1, 1, 1:] = False  # a single coronal window
+    batch["series_present_mask"][1, 2] = False  # no axial series
+    images, slice_valid, present = batch["images"], batch["slice_valid_mask"], batch["series_present_mask"]
+    b, p, n = slice_valid.shape
+    valid = slice_valid & present.unsqueeze(-1)
+    with torch.no_grad():
+        encoded, halves = model.encode_with_halves(images.reshape(b * p * n, *images.shape[3:]))
+        features = encoded.view(b, p, n, f) * valid.unsqueeze(-1)
+        halves = halves.view(b, p, n, 2, f) * valid[..., None, None]
+        zones = depth_zones(valid, model.n_depth_zones)
+        pooled = model.side_pooled(features, halves, valid, zones)
+        logits = model(images, slice_valid, present)
+        expected_logits = model.head(torch.cat([pooled, present.float()], dim=-1))
+    assert torch.allclose(logits, expected_logits, atol=1e-5), "forward does not feed side_pooled to the head"
+
+    for study in range(b):
+        parts = []
+        # sagittal: windows of each depth zone, in slice order
+        for zone in range(3):
+            keep = [i for i in range(n) if valid[study, 0, i] and int(zones[study, 0, i]) == zone]
+            parts.append(("mean", features[study, 0, keep].mean(0) if keep else torch.zeros(f)))
+        for zone in range(3):
+            keep = [i for i in range(n) if valid[study, 0, i] and int(zones[study, 0, i]) == zone]
+            parts.append(("max", features[study, 0, keep].max(0).values if keep else torch.zeros(f)))
+        for slot in (1, 2):
+            keep = [i for i in range(n) if valid[study, slot, i]]
+            for stat in ("mean", "max"):
+                for half in range(2):
+                    x = halves[study, slot, keep, half]
+                    value = (x.mean(0) if stat == "mean" else x.max(0).values) if keep else torch.zeros(f)
+                    parts.append((stat, value))
+        manual = torch.cat([v for _, v in parts])
+        assert torch.allclose(pooled[study], manual, atol=1e-5), f"study {study}: side features differ from the manual pooling"
+    assert float(pooled[1, -4 * f :].abs().max()) == 0.0, "a missing slot must give exact zeros"
+
+    # What the head still has from the plain model: the slot mean and the sagittal max.
+    blocks = pooled.view(b, -1, f)
+    slot_mean = masked_mean(features, valid)
+    assert torch.allclose((blocks[:, 6] + blocks[:, 7]) / 2, slot_mean[:, 1], atol=1e-5), "coronal half means must average to the slot mean"
+    sag_max = torch.stack([blocks[:, 3], blocks[:, 4], blocks[:, 5]]).max(dim=0).values
+    assert torch.allclose(sag_max, masked_max(features, valid)[:, 0], atol=1e-6), "zone maxes must give the sagittal max"
+    return f"head_in {model.head_in}: zones x (mean, max) sagittal, halves x (mean, max) coronal/axial; padding and missing slots exact"
+
+
+def check_side_pooling_checkpoints(cfg: Config, tmp_dir) -> str:
+    """Inference rebuilds side pooling from the checkpoint; the config refuses it without the canonical frame."""
+    from pathlib import Path
+
+    from .config import validate_config
+    from .constants import CHECKPOINT_VERSION
+    from .evaluate import load_checkpoint_for_inference
+
+    trained = cfg.copy()
+    trained.model.weights = "none"
+    trained.model.side_pooling = True
+    trained.model.target_attention = True
+    trained.data.laterality_canonical = True
+    model = _side_pooling_model(cfg, seed=11, target_attention=True)
+    path = Path(tmp_dir) / "side.pt"
+    torch.save(
+        {"version": CHECKPOINT_VERSION, "target_order": list(TARGETS), "config": trained.to_dict(),
+         "model_description": model.describe(), "model": model.state_dict()},
+        path,
+    )
+    caller = cfg.copy()
+    caller.model.side_pooling = False
+    caller.data.laterality_canonical = True
+    loaded, _ = load_checkpoint_for_inference(caller, path)
+    batch = _random_batch(cfg, b=1, seed=12)
+    inputs = (batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+    with torch.no_grad():
+        assert loaded.describe()["side_pooling"] and torch.allclose(model(*inputs), loaded(*inputs), atol=1e-6)
+
+    wrong = cfg.copy()
+    wrong.model.side_pooling = True
+    wrong.data.laterality_canonical = False
+    try:
+        validate_config(wrong)
+    except ValueError as error:
+        assert "laterality_canonical" in str(error), error
+    else:
+        raise AssertionError("side pooling without the canonical laterality frame was accepted")
+    return "side pooling rebuilt from the checkpoint (caller off); refused without data.laterality_canonical"
+
+
+def check_side_pooling_training_step(cfg: Config) -> str:
+    """The full synthetic training path runs with side pooling and target attention together."""
+    import tempfile
+    from pathlib import Path
+
+    from .train import run_synthetic
+
+    small = cfg.copy()
+    small.model.side_pooling = True
+    small.model.target_attention = True
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    with tempfile.TemporaryDirectory(prefix="knee_mri_side_") as tmp:
+        small.paths.output_dir = str(Path(tmp))
+        try:
+            run_synthetic(small, n_studies=8, epochs=1, name="side")
+            history = pd.read_csv(Path(tmp) / "side" / "history.csv")
+        finally:
+            remove_file_logging(tmp)
+    assert np.isfinite(history["train_loss"]).all()
+    return f"synthetic epoch with side pooling: train loss {float(history['train_loss'].iloc[-1]):.4f}"
+
+
+# --------------------------------------------------------------------------------------
 # Weight EMA
 # --------------------------------------------------------------------------------------
 
@@ -2419,6 +2559,9 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("target_attention_starts_as_head", lambda: check_target_attention_starts_as_head(small)),
                 ("target_attention_checkpoints", lambda: check_target_attention_checkpoints(small, tmp_dir)),
                 ("target_attention_training_step", lambda: check_target_attention_training_step(small)),
+                ("side_pooling_features", lambda: check_side_pooling_features(small)),
+                ("side_pooling_checkpoints", lambda: check_side_pooling_checkpoints(small, tmp_dir)),
+                ("side_pooling_training_step", lambda: check_side_pooling_training_step(small)),
                 ("inference_architecture", lambda: check_inference_architecture(small, tmp_dir)),
                 ("backbone_choice", lambda: check_backbone_choice(small)),
                 ("grad_checkpointing_is_exact", lambda: check_grad_checkpointing_is_exact(small)),

@@ -19,6 +19,14 @@ on sagittal. Each target has its own query over all (slot, zone, half) tokens of
 its pooled vector adds a per-target logit to the head's. The per-target output weights start
 at zero, so training starts from exactly the mean/max model.
 
+Optional side pooling (model.side_pooling, needs spatial_pool=avg): the head no longer sees
+one mean/max per slot but one per SIDE of it - the two column halves of coronal/axial
+(medial | lateral in the canonical frame) and the depth zones of sagittal (medial / central /
+lateral). The slot mean is the mean of the half means (even map width) and the sagittal max
+is the max of the zone maxes, so little is lost (only the coronal/axial max of whole-slice
+averages); what is gained is that a linear head can tell a medial from a lateral finding:
+    coronal/axial [B, 2 halves * (mean, max) * F], sagittal [B, zones * (mean, max) * F]
+
 Padding never enters the mean denominator or the max, a fully missing slot produces
 an exactly zero finite feature vector, and no fake image is ever encoded (that would
 let BatchNorm learn from padding). The model returns logits; sigmoid is applied only
@@ -35,7 +43,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint_sequential
 
-from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, N_TARGETS
+from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, N_TARGETS, PLANES
 from .utils import LOG
 
 # A finite sentinel for the masked maximum: -inf would make an all-masked max
@@ -249,12 +257,16 @@ class EfficientNetMIL(nn.Module):
         target_attention: bool = False,
         attention_dim: int = 256,
         n_depth_zones: int = 3,
+        side_pooling: bool = False,
+        slot_names: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         if spatial_pool not in SPATIAL_POOLS:
             raise ValueError(f"spatial_pool must be one of {sorted(SPATIAL_POOLS)}, got {spatial_pool!r}")
         if target_attention and spatial_pool != "avg":
             raise ValueError("model.target_attention needs model.spatial_pool=avg (it pools map halves itself)")
+        if side_pooling and spatial_pool != "avg":
+            raise ValueError("model.side_pooling needs model.spatial_pool=avg (it pools map halves itself)")
         self.backbone = str(backbone)
         encoder, self.weights_info = build_encoder(weights, self.backbone)
         self.features = encoder.features
@@ -272,7 +284,18 @@ class EfficientNetMIL(nn.Module):
         self.encoder_chunk_size = int(encoder_chunk_size)
         self.grad_checkpointing = bool(grad_checkpointing)
 
-        head_in = self.n_slots * 2 * self.feature_dim + self.n_slots
+        self.n_depth_zones = int(n_depth_zones)
+        self.side_pooling = bool(side_pooling)
+        names = list(slot_names) if slot_names is not None else list(PLANES[: self.n_slots])
+        if len(names) != self.n_slots:
+            raise ValueError(f"slot_names {names} do not match n_slots={self.n_slots}")
+        # How each slot is split into sides: sagittal by depth zone (slice order), the others by map half.
+        self.slot_sides = tuple("zones" if str(n).lower().startswith("sag") else "halves" for n in names)
+        if self.side_pooling:
+            parts_per_slot = [self.n_depth_zones if mode == "zones" else 2 for mode in self.slot_sides]
+        else:
+            parts_per_slot = [1] * self.n_slots
+        head_in = sum(parts_per_slot) * 2 * self.feature_dim + self.n_slots
         self.head_in = head_in
         self.head = nn.Sequential(
             nn.Linear(head_in, int(head_hidden)),
@@ -281,7 +304,6 @@ class EfficientNetMIL(nn.Module):
             nn.Linear(int(head_hidden), self.n_targets),
         )
         self.target_attention = bool(target_attention)
-        self.n_depth_zones = int(n_depth_zones)
         self.readout = (
             TargetAttentionReadout(encoder_features, self.n_slots, self.n_targets, int(attention_dim), self.n_depth_zones)
             if self.target_attention
@@ -393,7 +415,8 @@ class EfficientNetMIL(nn.Module):
         indices = flat_valid.nonzero(as_tuple=False).squeeze(1)
 
         features = flat_images.new_zeros((b * p * s, self.feature_dim))
-        half_features = flat_images.new_zeros((b * p * s, 2, self.feature_dim)) if self.readout is not None else None
+        needs_halves = self.readout is not None or self.side_pooling
+        half_features = flat_images.new_zeros((b * p * s, 2, self.feature_dim)) if needs_halves else None
         if indices.numel() > 0:
             selected = flat_images.index_select(0, indices)
             if half_features is not None:
@@ -404,19 +427,50 @@ class EfficientNetMIL(nn.Module):
             # index_copy keeps this differentiable and leaves padded rows at exact zero.
             features = features.index_copy(0, indices, encoded.to(features.dtype))
         features = features.view(b, p, s, self.feature_dim).float()
+        tokens = half_features.view(b, p, s, 2, self.feature_dim).float() if half_features is not None else None
+        zones = depth_zones(valid, self.n_depth_zones) if needs_halves else None
 
-        mean_features = masked_mean(features, valid)
-        max_features = masked_max(features, valid)
-        slot_features = torch.cat([mean_features, max_features], dim=-1)  # [B, P, 2*1280]
-        flat_slots = slot_features.reshape(b, p * 2 * self.feature_dim)
+        if self.side_pooling:
+            assert tokens is not None and zones is not None
+            flat_slots = self.side_pooled(features, tokens, valid, zones)
+        else:
+            mean_features = masked_mean(features, valid)
+            max_features = masked_max(features, valid)
+            slot_features = torch.cat([mean_features, max_features], dim=-1)  # [B, P, 2*1280]
+            flat_slots = slot_features.reshape(b, p * 2 * self.feature_dim)
         presence = series_present_mask.to(flat_slots.dtype)
         head_input = torch.cat([flat_slots, presence], dim=-1)
         logits = self.head(head_input)
         if self.readout is not None:
-            assert half_features is not None
-            tokens = half_features.view(b, p, s, 2, self.feature_dim)
-            logits = logits + self.readout(tokens, valid, depth_zones(valid, self.n_depth_zones))
+            assert tokens is not None and zones is not None
+            logits = logits + self.readout(tokens, valid, zones)
         return logits
+
+    def side_pooled(
+        self, features: torch.Tensor, halves: torch.Tensor, valid: torch.Tensor, zones: torch.Tensor
+    ) -> torch.Tensor:
+        """`[B, P, S, F]`, `[B, P, S, 2, F]` -> `[B, sum(parts) * 2 * F]`: mean and max per side of each slot.
+
+        Per slot in order: [mean part 0, .., mean part k, max part 0, .., max part k]; a part
+        is a depth zone (sagittal) or a column half (coronal/axial). An empty part (a missing
+        slot, or a zone without windows in a very short series) is exactly zero.
+        """
+        b = features.shape[0]
+        out = []
+        for slot, mode in enumerate(self.slot_sides):
+            slot_valid = valid[:, slot]  # [B, S]
+            if mode == "zones":
+                parts = [
+                    (features[:, slot], slot_valid & (zones[:, slot] == zone)) for zone in range(self.n_depth_zones)
+                ]
+            else:
+                parts = [(halves[:, slot, :, half], slot_valid) for half in range(2)]
+            # masked_mean / masked_max take [B, P, S, F] and [B, P, S]; one "slot" per part here.
+            stacked = torch.stack([f for f, _ in parts], dim=1)
+            masks = torch.stack([m for _, m in parts], dim=1)
+            out.append(masked_mean(stacked, masks).reshape(b, -1))
+            out.append(masked_max(stacked, masks).reshape(b, -1))
+        return torch.cat(out, dim=-1)
 
     # -- Convenience ------------------------------------------------------------------
 
@@ -441,7 +495,9 @@ class EfficientNetMIL(nn.Module):
             "n_targets": self.n_targets,
             "spatial_pool": self.spatial_pool,
             "target_attention": self.target_attention,
-            "n_depth_zones": self.n_depth_zones if self.target_attention else None,
+            "n_depth_zones": self.n_depth_zones if (self.target_attention or self.side_pooling) else None,
+            "side_pooling": self.side_pooling,
+            "slot_sides": list(self.slot_sides) if self.side_pooling else None,
             "feature_dim": self.feature_dim,
             "head_in": self.head_in,
             "freeze_bn_running_stats": self.freeze_bn_running_stats,
@@ -473,6 +529,8 @@ def build_model(cfg, n_slots: int | None = None) -> EfficientNetMIL:
         target_attention=bool(cfg.model.get("target_attention", False)),
         attention_dim=int(cfg.model.get("attention_dim", 256)),
         n_depth_zones=int(cfg.model.get("depth_zones", 3)),
+        side_pooling=bool(cfg.model.get("side_pooling", False)),
+        slot_names=list(cfg.data.series_slots)[:slots] if len(cfg.data.series_slots) >= slots else None,
     )
     LOG.info("Model: %s", model.describe())
     return model

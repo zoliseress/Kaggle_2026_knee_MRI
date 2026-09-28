@@ -177,6 +177,16 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("model.target_attention needs model.spatial_pool=avg")
         if int(cfg.model.get("depth_zones", 3)) < 1 or int(cfg.model.get("attention_dim", 256)) < 8:
             raise ValueError("model.depth_zones must be >= 1 and model.attention_dim >= 8")
+    if bool(cfg.model.get("side_pooling", False)):
+        if str(cfg.model.get("spatial_pool", "avg")) != "avg":
+            raise ValueError("model.side_pooling needs model.spatial_pool=avg")
+        if int(cfg.model.get("depth_zones", 3)) < 1:
+            raise ValueError("model.depth_zones must be >= 1")
+        if not bool(cfg.data.get("laterality_canonical", False)):
+            raise ValueError(
+                "model.side_pooling needs data.laterality_canonical=true: without the canonical frame the "
+                "halves and zones mix medial and lateral across right and left knees"
+            )
 
     if cfg.labels.borderline_policy not in ("exclude", "as_negative"):
         raise ValueError("labels.borderline_policy must be 'exclude' or 'as_negative'")

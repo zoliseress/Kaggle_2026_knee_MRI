@@ -33,7 +33,7 @@ INFERENCE_DATA_KEYS = (
 # and the memory-only chunking / gradient checkpointing, which the inference host may tune.
 # A checkpoint without model.backbone predates the key and is B0 (the config default).
 RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
-ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "target_attention", "feature_dim", "head_in")
+ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "target_attention", "side_pooling", "feature_dim", "head_in")
 # What a checkpoint written before a key existed was trained with: absent means the default,
 # never "skip the check" - an old model must not silently receive mirrored inputs.
 INFERENCE_DATA_DEFAULTS = {"data.laterality_canonical": False}
@@ -88,6 +88,7 @@ def load_checkpoint_for_inference(
     if stored_model:
         build_cfg.set_dotted("model.backbone", stored_model.get("backbone", DEFAULT_BACKBONE))
         build_cfg.set_dotted("model.target_attention", bool(stored_model.get("target_attention", False)))
+        build_cfg.set_dotted("model.side_pooling", bool(stored_model.get("side_pooling", False)))
         for key, value in stored_model.items():
             if key not in RUNTIME_MODEL_KEYS:
                 build_cfg.set_dotted(f"model.{key}", value)
