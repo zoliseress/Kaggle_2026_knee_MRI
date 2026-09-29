@@ -50,6 +50,7 @@ from .loss import (
     window_normalized_bce,
 )
 from .ema import ModelEMA
+from .encoders import ADAPTER_VERSIONS
 from .metrics import evaluate_predictions, selection_metric, soft_target_warning
 from .model import build_model
 from .preprocess import preprocess_hash
@@ -349,8 +350,18 @@ class Trainer:
             k: v for k, v in (signature["model"] or {}).items() if k not in RESUME_IGNORED_MODEL_KEYS
         }
         # Runs from before model.backbone existed were all B0 and stored no such key.
+        backbone = str(signature["model"].get("backbone", DEFAULT_BACKBONE))
         if signature["model"].get("backbone") == DEFAULT_BACKBONE:
             del signature["model"]["backbone"]
+        # Freeze policy: part of the experiment, but only stored when it is not the original
+        # train-everything, so checkpoints from before the key existed still resume.
+        if signature["model"].get("encoder_trainable", "all") == "all":
+            signature["model"].pop("encoder_trainable", None)
+        if signature["model"].get("encoder_trainable") != "last_n":
+            signature["model"].pop("encoder_trainable_units", None)
+        # The adapters added after the EfficientNets carry their version (token handling etc.).
+        if not backbone.startswith("efficientnet"):
+            signature["encoder_adapter_version"] = ADAPTER_VERSIONS[backbone]
         # The target-attention keys only matter when it is on.
         if not signature["model"].get("target_attention"):
             for key in ("target_attention", "attention_dim"):
@@ -663,6 +674,7 @@ class Trainer:
             "target_order": list(TARGETS),
             "config": self.cfg.to_dict(),
             "model_description": self.model.describe(),
+            "encoder": self.encoder_record(),
             "mode": self.mode,
             "versions": {
                 "checkpoint": CHECKPOINT_VERSION,
@@ -687,6 +699,22 @@ class Trainer:
                 "augment": self.augment_generator.get_state(),
             },
             **(extra or {}),
+        }
+
+    def encoder_record(self) -> dict:
+        """Encoder identity, weight provenance, freeze policy and the input normalisation actually applied."""
+        description = self.model.describe()
+        mean, std = normalization_stats(self.cfg)
+        return {
+            "backbone": description["backbone"],
+            "model_id": description.get("encoder_model_id"),
+            "adapter_version": description.get("encoder_adapter_version"),
+            "out_channels": description.get("encoder_out_channels"),
+            "input_size": int(self.cfg.data.image_size),
+            "trainable": description.get("encoder_trainable"),
+            "trainable_units": description.get("encoder_trainable_units"),
+            "weights_source": description.get("weights_info"),
+            "normalization": {"profile": str(self.cfg.data.encoder_normalization), "mean": list(mean), "std": list(std)},
         }
 
     def save_checkpoint(self, name: str, extra: dict | None = None) -> Path:
@@ -716,6 +744,12 @@ class Trainer:
         new run may use other labels, another reference or another selection metric.
         """
         payload = self._read_checkpoint(path)
+        stored_backbone = ((payload.get("config") or {}).get("model") or {}).get("backbone", DEFAULT_BACKBONE)
+        if stored_backbone != self.model.backbone:
+            raise ValueError(
+                f"train.init_weights={path} is a {stored_backbone} checkpoint but model.backbone={self.model.backbone}. "
+                "Switching the backbone is a new experiment: start it from the backbone's pretrained weights."
+            )
         self.model.load_state_dict(payload["model"])
         if self.ema is not None:
             self.ema.reset(self.model)

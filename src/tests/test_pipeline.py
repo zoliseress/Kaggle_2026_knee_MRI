@@ -260,3 +260,15 @@ def test_target_attention_checkpoints(cfg, tmp_path):
 
 def test_target_attention_training_step(cfg):
     selftest.check_target_attention_training_step(cfg)
+
+
+def test_side_pooling_features(cfg):
+    selftest.check_side_pooling_features(cfg)
+
+
+def test_side_pooling_checkpoints(cfg, tmp_path):
+    selftest.check_side_pooling_checkpoints(cfg, tmp_path)
+
+
+def test_side_pooling_training_step(cfg):
+    selftest.check_side_pooling_training_step(cfg)

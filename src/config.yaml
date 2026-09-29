@@ -1,4 +1,5 @@
 # RSNA knee MRI - EfficientNet (B0 / V2-S) 2.5D MIL baseline.
+# Other encoders: config.dinov2_vits14.yaml, config.radimagenet_resnet50.yaml.
 # These values are starting hypotheses, not tuned optima.
 # Every key can be overridden from the CLI, e.g.: --set data.image_size=288
 
@@ -11,6 +12,7 @@ paths:
   dicom_root: null                 # default: <data_root>/train_series
   # train_csv: "F:/Kaggle/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
   train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
+  # train_csv: "F:/Kaggle/data/train_v3.csv"     # soft labels (qwen+gpt)
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -63,7 +65,7 @@ data:
   adjacent_slices: 3
   crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)
   intensity_percentiles: [1.0, 99.0]
-  encoder_normalization: "mri_scalar"  # imagenet|mri_scalar
+  encoder_normalization: "mri_scalar"  # mri_scalar|imagenet|radimagenet_torch (the last one: RadImageNet ResNet-50 only)
   monochrome1_policy: "invert"       # invert|keep
   cache_dtype: "float16"
   # Data-quality gate: studies with no usable series at all.
@@ -89,11 +91,16 @@ augment:
   noise_std: 0.01
 
 model:
-  # efficientnet_b0 | efficientnet_v2_s. Both give 1280 features at stride 32, so the head
-  # and pooling are unchanged. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
+  # efficientnet_b0 | efficientnet_v2_s | radimagenet_resnet50 | dinov2_vits14 (encoders.py).
+  # b0 / v2_s give 1280 features at stride 32. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
   #   b0: 6.3 GB, 10.4 train study/s | v2_s: 11.1 GB, 5.6 study/s | v2_s + grad_checkpointing: 4.1 GB, 4.0 study/s
+  # Switching the backbone is a new experiment: its pretrained weights, not another backbone's checkpoint.
   backbone: "efficientnet_b0"
   weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth (of the chosen backbone)
+  # Which encoder parameters train: all | frozen (head only) | last_n (the last
+  # encoder_trainable_units stages/blocks). Frozen parts also run in eval mode (BN statistics).
+  encoder_trainable: "all"
+  encoder_trainable_units: 0       # only read with encoder_trainable=last_n
   # Recompute each encoder stage in backward instead of storing its activations: less
   # training memory for ~30% less throughput, identical results. Only if microbatch/size would OOM.
   grad_checkpointing: false

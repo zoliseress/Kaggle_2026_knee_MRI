@@ -1,15 +1,20 @@
-"""EfficientNet encoder (B0 or V2-S) + masked multiple-instance pooling over slice bags.
+"""2D slice encoder (model.backbone) + masked multiple-instance pooling over slice bags.
 
 Tensor flow
 -----------
     [B, P, S, 3, H, W] -> gather valid triplets -> [N_valid, 3, H, W]
-    -> EfficientNet features (model.backbone) -> spatial pooling (model.spatial_pool) -> [N_valid, F]
-       avg: global average (1280) | avgmax: average and maximum (2560)
-       attention: softmax-weighted average over the map (1280), zero-initialised to avg
+    -> encoder adapter (encoders.py) -> feature map [N_valid, C, Hf, Wf]
+       efficientnet_b0 / _v2_s: C=1280, 7x7 at 224 px | radimagenet_resnet50: C=2048, 7x7
+       dinov2_vits14: C=384, 16x16 patch-token map at 224 px
+    -> spatial pooling (model.spatial_pool) -> [N_valid, F]
+       avg: global average (C) | avgmax: average and maximum (2C)
+       attention: softmax-weighted average over the map (C), zero-initialised to avg
     -> scatter back to [B, P, S, F] (differentiable)
     -> masked mean and feature-wise masked max over S -> [B, P, 2*F]
     -> concat fixed-order slots + P presence flags -> [B, P*2*F + P]
     -> Linear(.., 256) -> ReLU -> Dropout -> Linear(256, 12) -> logits
+
+Every width downstream of the encoder comes from the adapter's `out_channels`.
 
 Optional target attention (model.target_attention, needs spatial_pool=avg): every window
 also yields two half-map vectors (column halves of its feature map). With
@@ -36,14 +41,12 @@ for metrics and exported predictions. There is no softmax across targets.
 from __future__ import annotations
 
 import math
-from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint_sequential
 
 from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, N_TARGETS, PLANES
+from .encoders import build_encoder, build_encoder_adapter  # noqa: F401  (build_encoder: public, EfficientNet only)
 from .utils import LOG
 
 # A finite sentinel for the masked maximum: -inf would make an all-masked max
@@ -51,77 +54,6 @@ from .utils import LOG
 NEG_SENTINEL = -1.0e30
 # How one slice's H x W feature map becomes a vector. avg = the original global average.
 SPATIAL_POOLS = ("avg", "avgmax", "attention")
-
-
-# model.backbone -> (torchvision builder, weights enum) names.
-_BACKBONES = {
-    "efficientnet_b0": ("efficientnet_b0", "EfficientNet_B0_Weights"),
-    "efficientnet_v2_s": ("efficientnet_v2_s", "EfficientNet_V2_S_Weights"),
-}
-
-
-def build_encoder(weights: str = "IMAGENET1K_V1", backbone: str = DEFAULT_BACKBONE) -> tuple[nn.Module, dict]:
-    """Create the EfficientNet feature extractor with explicit weight provenance."""
-    import torchvision
-    import torchvision.models as tvm
-
-    if backbone not in _BACKBONES:
-        raise ValueError(f"Unknown model.backbone={backbone!r}; known: {sorted(_BACKBONES)}")
-    builder_name, weights_name = _BACKBONES[backbone]
-    builder, weights_enum = getattr(tvm, builder_name), getattr(tvm, weights_name)
-
-    info: dict[str, Any] = {
-        "torchvision": torchvision.__version__,
-        "backbone": backbone,
-        "weights_request": str(weights),
-    }
-    spec = str(weights)
-
-    if spec.lower() in ("none", "random", "null"):
-        LOG.warning(
-            "model.weights=%s: the encoder starts from RANDOM initialisation. This is an intentional "
-            "ablation, not a fallback.",
-            spec,
-        )
-        model = builder(weights=None)
-        info["weights_used"] = "random"
-    elif Path(spec).expanduser().exists():
-        model = builder(weights=None)
-        state = torch.load(str(Path(spec).expanduser()), map_location="cpu", weights_only=True)
-        state = state.get("state_dict", state)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing:
-            raise RuntimeError(
-                f"Local encoder checkpoint {spec} is missing {len(missing)} parameters (e.g. {missing[:5]}) "
-                f"for backbone {backbone}. Refusing to continue with a partially initialised encoder."
-            )
-        info["weights_used"] = str(spec)
-        info["unexpected_keys"] = len(unexpected)
-        LOG.info("Loaded local encoder weights from %s (%d unexpected keys ignored)", spec, len(unexpected))
-    else:
-        try:
-            enum_value = getattr(weights_enum, spec)
-        except AttributeError as exc:
-            raise ValueError(
-                f"Unknown model.weights={spec!r}. Use an {weights_name} name "
-                f"(e.g. IMAGENET1K_V1), an existing local checkpoint path, or 'none'."
-            ) from exc
-        try:
-            model = builder(weights=enum_value)
-        except Exception as exc:  # download failure, offline machine, proxy, ...
-            raise RuntimeError(
-                f"Could not obtain pretrained weights {weights_name}.{spec}: {exc}. "
-                "Never train silently from random initialisation. Either pre-download the weights "
-                f"(TORCH_HOME=<dir> python -c \"from torchvision.models import {builder_name}, "
-                f'{weights_name}; {builder_name}(weights={weights_name}.{spec})"), '
-                "point model.weights at a local checkpoint, or set model.weights=none deliberately."
-            ) from exc
-        info["weights_used"] = spec
-        info["weights_meta"] = {
-            "num_params": getattr(enum_value, "meta", {}).get("num_params"),
-            "categories": len(getattr(enum_value, "meta", {}).get("categories", []) or []),
-        }
-    return model, info
 
 
 def masked_mean(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -240,7 +172,11 @@ class TargetAttentionReadout(nn.Module):
 
 
 class EfficientNetMIL(nn.Module):
-    """Study-level multi-label classifier over per-slot slice bags."""
+    """Study-level multi-label classifier over per-slot slice bags.
+
+    The name is historical: the encoder is any adapter from encoders.py (model.backbone).
+    It lives in `self.features`, so EfficientNet checkpoints keep their `features.<i>.…` keys.
+    """
 
     def __init__(
         self,
@@ -259,6 +195,9 @@ class EfficientNetMIL(nn.Module):
         n_depth_zones: int = 3,
         side_pooling: bool = False,
         slot_names: list[str] | tuple[str, ...] | None = None,
+        image_size: int | None = None,
+        encoder_trainable: str = "all",
+        encoder_trainable_units: int = 0,
     ) -> None:
         super().__init__()
         if spatial_pool not in SPATIAL_POOLS:
@@ -268,9 +207,22 @@ class EfficientNetMIL(nn.Module):
         if side_pooling and spatial_pool != "avg":
             raise ValueError("model.side_pooling needs model.spatial_pool=avg (it pools map halves itself)")
         self.backbone = str(backbone)
-        encoder, self.weights_info = build_encoder(weights, self.backbone)
-        self.features = encoder.features
-        encoder_features = ENCODER_FEATURES[self.backbone]
+        # The adapter maps [N, 3, H, W] -> [N, C, Hf, Wf]; image_size only matters for DINOv2,
+        # whose position embeddings are built for exactly that input.
+        self.features = build_encoder_adapter(
+            self.backbone,
+            weights,
+            image_size=image_size,
+            freeze=str(encoder_trainable),
+            trainable_units=int(encoder_trainable_units),
+            grad_checkpointing=bool(grad_checkpointing),
+        )
+        self.weights_info = self.features.weights_info
+        encoder_features = int(self.features.out_channels)
+        if encoder_features != ENCODER_FEATURES[self.backbone]:
+            raise RuntimeError(
+                f"{self.backbone} adapter gives {encoder_features} channels, expected {ENCODER_FEATURES[self.backbone]}"
+            )
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.spatial_pool = str(spatial_pool)
         self.attention_pool = (
@@ -282,7 +234,6 @@ class EfficientNetMIL(nn.Module):
         self.feature_dim = encoder_features * (2 if self.spatial_pool == "avgmax" else 1)
         self.freeze_bn_running_stats = bool(freeze_bn_running_stats)
         self.encoder_chunk_size = int(encoder_chunk_size)
-        self.grad_checkpointing = bool(grad_checkpointing)
 
         self.n_depth_zones = int(n_depth_zones)
         self.side_pooling = bool(side_pooling)
@@ -310,14 +261,26 @@ class EfficientNetMIL(nn.Module):
             else None
         )
 
-    # -- BatchNorm policy -------------------------------------------------------------
+    # -- Encoder policies -------------------------------------------------------------
+
+    @property
+    def encoder(self) -> nn.Module:
+        """The encoder adapter (the same module as `features`)."""
+        return self.features
+
+    @property
+    def grad_checkpointing(self) -> bool:
+        return bool(self.features.grad_checkpointing)
+
+    @grad_checkpointing.setter
+    def grad_checkpointing(self, enabled: bool) -> None:
+        self.features.grad_checkpointing = bool(enabled)
 
     def _apply_bn_policy(self) -> None:
-        if not self.freeze_bn_running_stats:
-            return
-        for module in self.features.modules():
-            if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                module.eval()  # use the pretrained running statistics; affine params stay trainable
+        # Frozen encoder units run in eval mode (pretrained BN statistics, no dropout); with
+        # freeze_bn_running_stats every encoder BN keeps its running statistics, while the
+        # affine parameters of trainable units still train.
+        self.features.apply_train_policy(self.freeze_bn_running_stats)
 
     def train(self, mode: bool = True) -> "EfficientNetMIL":
         super().train(mode)
@@ -367,8 +330,9 @@ class EfficientNetMIL(nn.Module):
 
         Chunking only limits the size of a single encoder call. During training the
         autograd graph of every chunk is retained until backward, so chunking is not a
-        guaranteed memory saving there - model.grad_checkpointing is (it recomputes each
-        encoder stage in backward instead of keeping its activations).
+        guaranteed memory saving there. model.grad_checkpointing lowers it (each encoder stage
+        or transformer block is recomputed in backward instead of keeping its activations);
+        freezing encoder units lowers it too, since frozen units keep no autograd graph.
         """
         if triplets.shape[0] == 0:
             return triplets.new_zeros((0, self.feature_dim))
@@ -380,10 +344,7 @@ class EfficientNetMIL(nn.Module):
         return self._pool_map(self._run_features(triplets))
 
     def _run_features(self, x: torch.Tensor) -> torch.Tensor:
-        if self.grad_checkpointing and self.training and torch.is_grad_enabled():
-            # One segment per stage: only stage boundaries are kept for backward. Stochastic
-            # depth replays identically, the RNG state is preserved by the checkpoint.
-            return checkpoint_sequential(self.features, len(self.features), x, use_reentrant=False)
+        # Gradient checkpointing is the adapter's own (per stage / per transformer block).
         return self.features(x)
 
     # -- Forward ----------------------------------------------------------------------
@@ -475,16 +436,24 @@ class EfficientNetMIL(nn.Module):
     # -- Convenience ------------------------------------------------------------------
 
     def parameter_groups(self, encoder_lr: float, head_lr: float, weight_decay: float) -> list[dict]:
+        """[encoder, head] AdamW groups with every trainable parameter exactly once.
+
+        Frozen encoder parameters are left out. The encoder group stays first even when it
+        is empty (encoder_trainable=frozen), so param_groups[0]/[1] keep meaning encoder/head.
+        """
+        encoder = [p for p in self.features.parameters() if p.requires_grad]
+        # The attention scorer and readout are new, like the head: same (higher) learning rate.
+        head_modules = [self.head] + [m for m in (self.attention_pool, self.readout) if m is not None]
+        head = [p for m in head_modules for p in m.parameters() if p.requires_grad]
+        grouped = {id(p) for p in encoder + head}
+        if len(grouped) != len(encoder) + len(head):
+            raise RuntimeError("a parameter is in both the encoder and the head group")
+        ungrouped = [n for n, p in self.named_parameters() if p.requires_grad and id(p) not in grouped]
+        if ungrouped:
+            raise RuntimeError(f"trainable parameters missing from the optimizer groups: {ungrouped[:5]}")
         return [
-            {"params": list(self.features.parameters()), "lr": float(encoder_lr), "weight_decay": float(weight_decay)},
-            {
-                # The attention scorer is new, like the head: same (higher) learning rate.
-                "params": list(self.head.parameters())
-                + (list(self.attention_pool.parameters()) if self.attention_pool is not None else [])
-                + (list(self.readout.parameters()) if self.readout is not None else []),
-                "lr": float(head_lr),
-                "weight_decay": float(weight_decay),
-            },
+            {"params": encoder, "lr": float(encoder_lr), "weight_decay": float(weight_decay)},
+            {"params": head, "lr": float(head_lr), "weight_decay": float(weight_decay)},
         ]
 
     def describe(self) -> dict:
@@ -503,6 +472,7 @@ class EfficientNetMIL(nn.Module):
             "freeze_bn_running_stats": self.freeze_bn_running_stats,
             "encoder_chunk_size": self.encoder_chunk_size,
             "grad_checkpointing": self.grad_checkpointing,
+            **self.features.describe(),
             "weights_info": self.weights_info,
             "n_parameters": int(sum(p.numel() for p in self.parameters())),
             "n_trainable": int(sum(p.numel() for p in self.parameters() if p.requires_grad)),
@@ -531,6 +501,9 @@ def build_model(cfg, n_slots: int | None = None) -> EfficientNetMIL:
         n_depth_zones=int(cfg.model.get("depth_zones", 3)),
         side_pooling=bool(cfg.model.get("side_pooling", False)),
         slot_names=list(cfg.data.series_slots)[:slots] if len(cfg.data.series_slots) >= slots else None,
+        image_size=int(cfg.data.image_size),
+        encoder_trainable=str(cfg.model.get("encoder_trainable", "all")),
+        encoder_trainable_units=int(cfg.model.get("encoder_trainable_units", 0) or 0),
     )
     LOG.info("Model: %s", model.describe())
     return model

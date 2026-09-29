@@ -50,15 +50,52 @@ from .train import window_sizes
 from .utils import LOG, remove_file_logging
 
 
+# Smallest input each backbone accepts in the synthetic checks: EfficientNet 32 px (a 1x1 map),
+# ResNet-50 64 px (2x2), DINOv2 56 px (4x4 patches; a multiple of 14 - 32 and 64 are refused).
+TINY_SIZES = {"efficientnet_b0": 32, "efficientnet_v2_s": 32, "radimagenet_resnet50": 64, "dinov2_vits14": 56}
+# Smallest input whose map is at least 2 wide, for checks that need two distinct column halves
+# or a non-trivial spatial softmax: EfficientNet / ResNet 64 px (2x2), DINOv2 56 px (4x4).
+WIDE_SIZES = {"efficientnet_b0": 64, "efficientnet_v2_s": 64, "radimagenet_resnet50": 64, "dinov2_vits14": 56}
+
+
+def _backbone_of(cfg: Config) -> str:
+    from .constants import DEFAULT_BACKBONE
+
+    return str(cfg.model.get("backbone", DEFAULT_BACKBONE))
+
+
 def tiny_config(cfg: Config) -> Config:
-    """A small, fast variant of the real config: same code path, cheap tensors."""
+    """A small, fast variant of the real config: same code path, cheap tensors, the backbone's tiny size."""
     small = cfg.copy()
-    small.data.image_size = 32
+    small.data.image_size = TINY_SIZES[_backbone_of(cfg)]
     small.data.centers_per_series = 4
     small.model.weights = "none"  # deliberate: the check is about masking, not pretraining
     small.model.head_hidden = 32
     small.train.microbatch_studies = 2
     return small
+
+
+def wide_config(cfg: Config) -> Config:
+    """`cfg` at the smallest size its backbone maps to at least 2x2."""
+    wide = cfg.copy()
+    wide.data.image_size = WIDE_SIZES[_backbone_of(cfg)]
+    return wide
+
+
+def efficientnet_config(cfg: Config, backbone: str = "efficientnet_b0") -> Config:
+    """`cfg` switched to an EfficientNet, for the checks about EfficientNet behaviour itself.
+
+    Everything else (data, train, labels) stays as configured; the RadImageNet-only input
+    profile falls back to the project default.
+    """
+    chosen = cfg.copy()
+    chosen.model.backbone = backbone
+    chosen.model.weights = "none"
+    chosen.model.encoder_trainable = "all"
+    chosen.data.image_size = TINY_SIZES[backbone]
+    if chosen.data.encoder_normalization == "radimagenet_torch":
+        chosen.data.encoder_normalization = "mri_scalar"
+    return chosen
 
 
 def _tiny_model(cfg: Config, seed: int = 0) -> EfficientNetB0MIL:
@@ -188,15 +225,16 @@ def check_spatial_pool_training_step(cfg: Config) -> str:
     small.train.num_workers = 0
     with tempfile.TemporaryDirectory(prefix="knee_mri_pool_") as tmp:
         small.paths.output_dir = str(Path(tmp))
-        run_synthetic(small, n_studies=8, epochs=1, name="pool_check")
-        history = pd.read_csv(Path(tmp) / "pool_check" / "history.csv")
-        remove_file_logging(tmp)
+        try:
+            run_synthetic(small, n_studies=8, epochs=1, name="pool_check")
+            history = pd.read_csv(Path(tmp) / "pool_check" / "history.csv")
+        finally:
+            remove_file_logging(tmp)  # also on failure: Windows cannot delete an open run.log
     assert np.isfinite(history["train_loss"]).all()
 
     # A map wider than 1x1 is needed: with a single position the softmax is always 1 and
     # the scorer has, correctly, no gradient. The selftest config would give exactly that.
-    wide = cfg.copy()
-    wide.data.image_size = 64  # EfficientNet stride 32 -> a 2x2 map
+    wide = wide_config(efficientnet_config(cfg))  # _pool_model is an EfficientNet-B0: 64 px -> 2x2
     model = _pool_model(wide, "attention").train()
     batch = _random_batch(wide, b=2, seed=5)
     logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
@@ -205,8 +243,9 @@ def check_spatial_pool_training_step(cfg: Config) -> str:
     grad = model.attention_pool.score[2].weight.grad
     assert grad is not None and float(grad.abs().max()) > 0, "the attention scorer received no gradient"
 
-    flat = _pool_model(cfg, "attention").train()  # image_size 32 -> 1x1 map
-    single = _random_batch(cfg, b=2, seed=5)
+    flat_cfg = efficientnet_config(cfg)  # B0 at 32 px -> a 1x1 map, whatever backbone is configured
+    flat = _pool_model(flat_cfg, "attention").train()
+    single = _random_batch(flat_cfg, b=2, seed=5)
     flat(single["images"], single["slice_valid_mask"], single["series_present_mask"]).sum().backward()
     assert float(flat.attention_pool.score[2].weight.grad.abs().max()) == 0.0, "a 1x1 map cannot be re-weighted"
     groups = model.parameter_groups(encoder_lr=1e-4, head_lr=3e-4, weight_decay=0.0)
@@ -670,9 +709,11 @@ def check_global_training_step(cfg: Config) -> str:
     small.train.num_workers = 0
     with tempfile.TemporaryDirectory(prefix="knee_mri_global_") as tmp:
         small.paths.output_dir = str(Path(tmp))
-        run_synthetic(small, n_studies=8, epochs=2, name="global_check")
-        history = pd.read_csv(Path(tmp) / "global_check" / "history.csv")
-        remove_file_logging(tmp)
+        try:
+            run_synthetic(small, n_studies=8, epochs=2, name="global_check")
+            history = pd.read_csv(Path(tmp) / "global_check" / "history.csv")
+        finally:
+            remove_file_logging(tmp)
     assert history["train_objective"].notna().all() and np.isfinite(history["train_objective"]).all()
     assert int(history["optimizer_steps"].iloc[0]) <= 3
     return f"synthetic run with the global policy: {len(history)} epochs, objective {history['train_objective'].round(4).tolist()}"
@@ -1487,6 +1528,11 @@ def check_augment_device_equivalence(cfg: Config) -> str:
     small = cfg.copy()
     small.augment.enabled = True
     small.augment.noise_std = 0.0
+    # No model is built here, so the backbone's input size does not apply: the check keeps its
+    # 32 px. Bit-identity is a property of the kernels at that size - at 64 px PyTorch's CPU
+    # pow with a broadcast tensor exponent (batched gamma) differs from pow(float) (per-series
+    # gamma) by 1 ulp in single elements (seen with torch 2.13; 32/56/96/224 px are exact).
+    small.data.image_size = 32
     n_slots, n_centers = len(small.data.series_slots), int(small.data.centers_per_series)
     size = int(small.data.image_size)
 
@@ -2050,8 +2096,7 @@ def check_depth_zones() -> str:
 
 def check_target_attention_starts_as_head(cfg: Config) -> str:
     """Zero output weights: the enabled model reproduces the mean/max model exactly, and learns from there."""
-    wide = cfg.copy()
-    wide.data.image_size = 64  # a 2x2 map, so the two halves differ
+    wide = wide_config(cfg)  # a map at least 2 wide, so the two halves differ
     base = _target_attention_model(wide, enabled=False, seed=3)
     attn = _target_attention_model(wide, enabled=True, seed=3)
     missing, unexpected = attn.load_state_dict(base.state_dict(), strict=False)
@@ -2213,8 +2258,7 @@ def check_side_pooling_features(cfg: Config) -> str:
     """Head input = per-zone (sagittal) / per-half (coronal, axial) masked mean and max, by hand."""
     from .model import depth_zones, masked_max, masked_mean
 
-    wide = cfg.copy()
-    wide.data.image_size = 64  # a 2x2 map: two distinct column halves
+    wide = wide_config(cfg)  # a map at least 2 wide: two distinct column halves
     wide.data.series_slots = ["sagittal", "coronal", "axial"]
     wide.data.centers_per_series = 5
     model = _side_pooling_model(wide, seed=5)
@@ -2485,12 +2529,622 @@ def check_exact_resume_with_ema(cfg: Config) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Encoder adapters (encoders.py): architecture checks with RANDOM weights. Nothing here
+# downloads or reads a pretrained file; the real-weight checks live in
+# tests/test_pretrained_encoders.py and skip when the weights are not available.
+# --------------------------------------------------------------------------------------
+
+# Expected [C, Hf, Wf] of each adapter's map at 224 px (and DINOv2 at 336 px).
+EXPECTED_MAPS_224 = {
+    "efficientnet_b0": (1280, 7, 7),
+    "efficientnet_v2_s": (1280, 7, 7),
+    "radimagenet_resnet50": (2048, 7, 7),
+    "dinov2_vits14": (384, 16, 16),
+}
+NEW_BACKBONES = ("radimagenet_resnet50", "dinov2_vits14")
+
+
+def _backbone_cfg(cfg: Config, backbone: str, **model_keys) -> Config:
+    """`cfg` switched to `backbone` with random weights, its tiny size and its normalisation."""
+    from .constants import RECOMMENDED_NORMALIZATION
+
+    chosen = cfg.copy()
+    chosen.model.backbone = backbone
+    chosen.model.weights = "none"
+    chosen.model.head_dropout = 0.0
+    chosen.data.image_size = WIDE_SIZES[backbone]  # 2-column maps, so the half split is real
+    chosen.data.encoder_normalization = RECOMMENDED_NORMALIZATION.get(backbone, cfg.data.encoder_normalization)
+    for key, value in model_keys.items():
+        chosen.model[key] = value
+    return chosen
+
+
+def _backbone_model(cfg: Config, backbone: str, seed: int = 0, **model_keys):
+    from .model import build_model
+
+    torch.manual_seed(seed)
+    return build_model(_backbone_cfg(cfg, backbone, **model_keys)).eval()
+
+
+def _padded_batch(cfg: Config, b: int = 2, seed: int = 0) -> dict:
+    """A batch with padded centres, an absent slot and one completely empty study."""
+    batch = _random_batch(cfg, b=b, seed=seed)
+    batch["slice_valid_mask"][0, 0, -1] = False  # padded centre
+    batch["slice_valid_mask"][0, 2] = False  # absent slot
+    batch["series_present_mask"][0, 2] = False
+    batch["slice_valid_mask"][-1] = False  # a study without any series
+    batch["series_present_mask"][-1] = False
+    return batch
+
+
+def check_encoder_feature_maps(cfg: Config) -> str:
+    """Every backbone gives its documented map at 224 px and finite [B, 12] logits."""
+    from .encoders import build_encoder_adapter
+    from .model import EfficientNetMIL
+
+    x = torch.randn((2, 3, 224, 224), generator=torch.Generator().manual_seed(0))
+    shapes = {}
+    for backbone, expected in EXPECTED_MAPS_224.items():
+        torch.manual_seed(0)
+        model = EfficientNetMIL(n_slots=3, weights="none", backbone=backbone, head_hidden=16, image_size=224).eval()
+        encoder = model.features
+        with torch.no_grad():
+            feature_map = encoder(x)
+        assert tuple(feature_map.shape) == (2, *expected), f"{backbone}: {tuple(feature_map.shape)} != {(2, *expected)}"
+        assert encoder.out_channels == expected[0] and encoder.feature_map_size(224) == expected[1:], backbone
+        assert torch.isfinite(feature_map).all(), backbone
+        shapes[backbone] = tuple(feature_map.shape[1:])
+
+        batch = {
+            "images": torch.randn((1, 3, 2, 3, 224, 224), generator=torch.Generator().manual_seed(1)),
+            "slice_valid_mask": torch.ones((1, 3, 2), dtype=torch.bool),
+            "series_present_mask": torch.ones((1, 3), dtype=torch.bool),
+        }
+        with torch.no_grad():
+            logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+        assert logits.shape == (1, N_TARGETS) and torch.isfinite(logits).all(), backbone
+        assert model.feature_dim == expected[0] and model.head[0].in_features == 3 * 2 * expected[0] + 3, backbone
+
+    torch.manual_seed(0)
+    dino336 = build_encoder_adapter("dinov2_vits14", "none", image_size=336).eval()
+    with torch.no_grad():
+        big = dino336(torch.randn((1, 3, 336, 336)))
+    assert tuple(big.shape) == (1, 384, 24, 24), tuple(big.shape)
+    return f"maps at 224 px: {shapes}; dinov2 at 336 px: {tuple(big.shape[1:])}; finite [B, 12] logits"
+
+
+def check_new_backbone_masking(cfg: Config) -> str:
+    """Padded centres and absent slots never reach the new encoders and cannot cause NaN."""
+    counts = {}
+    for backbone in NEW_BACKBONES:
+        model = _backbone_model(cfg, backbone, seed=1)
+        chosen = _backbone_cfg(cfg, backbone)
+        batch = _padded_batch(chosen, b=3, seed=2)
+        valid = batch["slice_valid_mask"] & batch["series_present_mask"].unsqueeze(-1)
+        encoded = []
+        hook = model.features.register_forward_hook(lambda _m, inputs, _o: encoded.append(inputs[0].shape[0]))
+        try:
+            with torch.no_grad():
+                base = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+                assert sum(encoded) == int(valid.sum()), f"{backbone}: encoded {sum(encoded)} of {int(valid.sum())} valid"
+                polluted = batch["images"].clone()
+                polluted[~valid] = float("nan")  # would poison every output if padding were encoded
+                other = model(polluted, batch["slice_valid_mask"], batch["series_present_mask"])
+                encoded.clear()
+                empty = model(batch["images"], torch.zeros_like(valid), torch.zeros_like(batch["series_present_mask"]))
+                assert not encoded, f"{backbone}: an all-missing batch still called the encoder"
+        finally:
+            hook.remove()
+        assert torch.isfinite(base).all() and torch.equal(base, other), f"{backbone}: padding changed the logits"
+        assert torch.isfinite(empty).all(), f"{backbone}: all-missing batch is not finite"
+        counts[backbone] = int(valid.sum())
+    return f"only valid windows encoded {counts}; NaN in padding leaves the logits identical and finite"
+
+
+def check_new_backbone_pooling_options(cfg: Config) -> str:
+    """Spatial pooling, side pooling and target attention run on the new adapters' maps."""
+    widths = {}
+    for backbone in NEW_BACKBONES:
+        chosen = _backbone_cfg(cfg, backbone)
+        batch = _padded_batch(chosen, b=2, seed=3)
+        channels = EXPECTED_MAPS_224[backbone][0]
+        for pool, width in (("avg", channels), ("avgmax", 2 * channels), ("attention", channels)):
+            model = _backbone_model(cfg, backbone, seed=4, spatial_pool=pool)
+            with torch.no_grad():
+                logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+            assert model.feature_dim == width and logits.shape == (2, N_TARGETS) and torch.isfinite(logits).all()
+
+        model = _backbone_model(cfg, backbone, seed=5, side_pooling=True, target_attention=True)
+        n_zones = int(model.n_depth_zones)
+        assert model.head_in == (n_zones + 2 + 2) * 2 * channels + 3, f"{backbone}: head_in {model.head_in}"
+        with torch.no_grad():
+            triplets = batch["images"][0, 0, :2]
+            global_avg, halves = model.encode_with_halves(triplets)
+            logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+        assert global_avg.shape == (2, channels) and halves.shape == (2, 2, channels)
+        assert torch.allclose(halves.mean(dim=1), global_avg, atol=1e-5), f"{backbone}: even-width halves must average to the map"
+        assert logits.shape == (2, N_TARGETS) and torch.isfinite(logits).all(), backbone
+        # The readout's output weights start at zero: it adds nothing until it has learned.
+        assert float(model.readout.out_weight.detach().abs().max()) == 0.0
+        widths[backbone] = model.head_in
+    return f"avg/avgmax/attention, side pooling + target attention finite on the new maps (side-pooled head_in {widths})"
+
+
+def check_dino_patch_grid(cfg: Config) -> str:
+    """DINOv2 patch tokens -> map: prefix tokens dropped, row-major order, explicit sizes only."""
+    import copy
+
+    from .encoders import DinoV2Encoder, build_encoder_adapter, dinov2_grid
+
+    assert dinov2_grid(224) == (16, 16) and dinov2_grid(336) == (24, 24)
+    refused = []
+    for size in (320, 384):
+        for build in (lambda s: dinov2_grid(s), lambda s: DinoV2Encoder("none", s)):
+            try:
+                build(size)
+            except ValueError as error:
+                assert "multiple of the DINOv2 patch size 14" in str(error), error
+            else:
+                raise AssertionError(f"image size {size} was accepted by the DINOv2 adapter")
+        bad = cfg.copy()
+        bad.model.backbone, bad.model.weights = "dinov2_vits14", "lvd142m"
+        bad.data.image_size, bad.data.encoder_normalization = size, "imagenet"
+        try:
+            validate_config(bad)
+        except ValueError as error:
+            assert "image_size" in str(error), error
+            refused.append(size)
+        else:
+            raise AssertionError(f"validate_config accepted data.image_size={size} for DINOv2")
+
+    torch.manual_seed(0)
+    encoder = build_encoder_adapter("dinov2_vits14", "none", image_size=56).eval()
+    x = torch.randn((2, 3, 56, 56), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        ours = encoder(x)
+        reference = encoder.model.forward_intermediates(
+            x, indices=[len(encoder.model.blocks) - 1], norm=True, output_fmt="NCHW", intermediates_only=True
+        )[0]
+    assert ours.shape == reference.shape == (2, 384, 4, 4), (ours.shape, reference.shape)
+    agreement = float((ours - reference).abs().max())
+    assert agreement < 1e-5, f"patch map differs from timm's own NCHW intermediates by {agreement:.2e}"
+
+    # Independent of timm's reshaping: no blocks, no norm, zero position embeddings, a CLS token
+    # of 777 and a patch embedding that returns each patch's mean in channel 0. Patch (i, j) of
+    # the input holds 10*i + j, so the map must read back exactly that grid and never 777.
+    probe = copy.deepcopy(encoder)
+    model = probe.model
+    model.blocks, model.norm = torch.nn.Sequential(), torch.nn.Identity()
+    with torch.no_grad():
+        model.pos_embed.zero_()
+        model.cls_token.fill_(777.0)
+        model.patch_embed.proj.weight.zero_()
+        model.patch_embed.proj.bias.zero_()
+        model.patch_embed.proj.weight[0].fill_(1.0 / (3 * 14 * 14))
+    grid = torch.arange(4).view(4, 1) * 10.0 + torch.arange(4).view(1, 4)
+    image = grid.repeat_interleave(14, 0).repeat_interleave(14, 1).expand(1, 3, 56, 56).contiguous()
+    with torch.no_grad():
+        read_back = probe(image)[0, 0]
+    assert torch.allclose(read_back, grid, atol=1e-4), f"patch order broken:\n{read_back}"
+    with torch.no_grad():
+        assert float(probe(image).abs().max()) < 700.0, "the CLS token leaked into the map"
+
+    tokens = torch.zeros((1, encoder.num_prefix_tokens + 15, 384))
+    try:
+        encoder.patch_tokens_to_map(tokens, 56, 56)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a wrong patch-token count was reshaped silently")
+    try:
+        encoder(torch.zeros((1, 3, 70, 70)))
+    except ValueError as error:
+        assert "built for 56x56" in str(error), error
+    else:
+        raise AssertionError("an input of another size than the built one was accepted")
+    return (
+        f"CLS dropped ({encoder.num_prefix_tokens} prefix token), row-major 4x4 grid read back exactly, equals timm "
+        f"NCHW intermediates (max diff {agreement:.1e}); sizes {refused} refused; 224 -> 16x16, 336 -> 24x24"
+    )
+
+
+def _gradient_split(model) -> tuple[list[str], list[str], list[str]]:
+    """(trainable with a non-zero gradient, trainable without one, frozen with a gradient)."""
+    moving, silent, leaking = [], [], []
+    for name, parameter in model.features.named_parameters():
+        if parameter.requires_grad:
+            (moving if parameter.grad is not None and float(parameter.grad.abs().sum()) > 0 else silent).append(name)
+        elif parameter.grad is not None:
+            leaking.append(name)
+    return moving, silent, leaking
+
+
+def check_freeze_policies(cfg: Config) -> str:
+    """After backward only the unfrozen units have gradients; frozen units stay in eval mode.
+
+    ResNet with trainable BN statistics shows the two policies are separate: layer4's running
+    statistics move, the frozen stem and layer1-3 keep theirs - also after a later train().
+    """
+    cases = [
+        ("dinov2_vits14", "last_n", 2, lambda n: n.startswith(("model.blocks.10.", "model.blocks.11.", "model.norm."))),
+        ("dinov2_vits14", "frozen", 0, lambda n: False),
+        ("dinov2_vits14", "all", 0, lambda n: True),
+        ("radimagenet_resnet50", "last_n", 1, lambda n: n.startswith("layer4.")),
+        ("radimagenet_resnet50", "last_n", 3, lambda n: n.startswith(("layer2.", "layer3.", "layer4."))),
+        ("radimagenet_resnet50", "frozen", 0, lambda n: False),
+        ("efficientnet_b0", "last_n", 2, lambda n: n.startswith(("7.", "8."))),
+    ]
+    summary = []
+    for backbone, mode, units, expected in cases:
+        chosen = _backbone_cfg(cfg, backbone, encoder_trainable=mode, encoder_trainable_units=units)
+        chosen.model.freeze_bn_running_stats = False
+        torch.manual_seed(0)
+        from .model import build_model
+
+        model = build_model(chosen)
+        model.eval()
+        model.train()  # the policy must survive a later train() call
+        for name, parameter in model.features.named_parameters():
+            assert parameter.requires_grad == expected(name), f"{backbone}/{mode}: requires_grad wrong for {name}"
+        frozen = model.features.frozen_modules()
+        assert all(not m.training for f in frozen for m in f.modules()), f"{backbone}/{mode}: a frozen unit is in train mode"
+
+        bn_before = {k: v.clone() for k, v in model.features.state_dict().items() if "running_mean" in k}
+        batch = _random_batch(chosen, b=1, seed=6)
+        logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+        logits.square().mean().backward()
+        moving, silent, leaking = _gradient_split(model)
+        assert not silent, f"{backbone}/{mode}: trainable parameters without gradient {silent[:4]}"
+        assert not leaking, f"{backbone}/{mode}: frozen parameters received gradients {leaking[:4]}"
+        assert all(p.grad is not None for p in model.head.parameters()), "the head must always train"
+        if backbone == "radimagenet_resnet50":
+            after = model.features.state_dict()
+            for key, value in bn_before.items():
+                changed = not torch.equal(value, after[key])
+                assert changed == expected(key.replace("running_mean", "weight")), f"{mode}: BN statistics of {key} changed={changed}"
+        summary.append(f"{backbone}/{mode}{units or ''}: {len(moving)} trained")
+    return "; ".join(summary)
+
+
+def check_parameter_groups_complete(cfg: Config) -> str:
+    """Optimizer groups: every trainable parameter exactly once, frozen ones never, encoder first."""
+    from .model import build_model
+
+    cases = [
+        ("efficientnet_b0", "all", 0, {}),
+        ("dinov2_vits14", "last_n", 4, {"target_attention": True}),
+        ("dinov2_vits14", "frozen", 0, {"spatial_pool": "attention"}),
+        ("radimagenet_resnet50", "last_n", 1, {"side_pooling": True}),
+    ]
+    out = []
+    for backbone, mode, units, extra in cases:
+        chosen = _backbone_cfg(cfg, backbone, encoder_trainable=mode, encoder_trainable_units=units, **extra)
+        torch.manual_seed(0)
+        model = build_model(chosen)
+        groups = model.parameter_groups(encoder_lr=1e-4, head_lr=3e-4, weight_decay=1e-4)
+        ids = [id(p) for g in groups for p in g["params"]]
+        trainable = {id(p) for p in model.parameters() if p.requires_grad}
+        assert len(ids) == len(set(ids)), f"{backbone}/{mode}: a parameter appears twice"
+        assert set(ids) == trainable, f"{backbone}/{mode}: groups != trainable parameters"
+        encoder_ids = {id(p) for p in model.features.parameters() if p.requires_grad}
+        assert {id(p) for p in groups[0]["params"]} == encoder_ids and groups[0]["lr"] == 1e-4 and groups[1]["lr"] == 3e-4
+        optimizer = torch.optim.AdamW(groups)  # an empty encoder group (frozen) must be accepted
+        assert len(optimizer.param_groups) == 2
+        out.append(f"{backbone}/{mode}: {len(groups[0]['params'])}+{len(groups[1]['params'])}")
+    return "each trainable parameter once, frozen excluded - " + "; ".join(out)
+
+
+def check_normalization_profiles(cfg: Config) -> str:
+    """Each profile is applied exactly once, identically on the worker and the device path.
+
+    The dataset (worker path) output, de-normalised with the profile, must reproduce the raw
+    [0, 1] volume slices exactly - normalising twice (or never) would not. With identity
+    augmentation parameters the batched device path must produce the same tensor; on a
+    CUDA machine it runs on the GPU, otherwise the comparison is on the CPU (and says so).
+    """
+    from .constants import NORMALIZATION_PROFILES
+    from .dataset import augment_batch
+
+    assert normalization_stats(_profile_cfg(cfg, "radimagenet_torch")) == ((0.5,) * 3, (0.5,) * 3)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    worst = {}
+    for profile in NORMALIZATION_PROFILES:
+        chosen = _profile_cfg(cfg, profile)
+        mean, std = (torch.tensor(v).view(1, 3, 1, 1) for v in normalization_stats(chosen))
+
+        worker = _InMemoryStudyBagDataset(chosen, ["study3"], None, train=True)  # augment off: worker path
+        assert not worker.defer_augment
+        item = worker[0]
+        for p, slot in enumerate(chosen.data.series_slots):
+            volume = torch.from_numpy(worker._load_slot("study3", slot)[0])
+            raw = item["images"][p] * std + mean
+            for s in range(raw.shape[0]):
+                if not bool(item["slice_valid_mask"][p, s]):
+                    assert float(item["images"][p, s].abs().max()) == 0.0
+                    continue
+                middle = raw[s, 1]
+                j = int((volume - middle).abs().flatten(1).max(dim=1).values.argmin())
+                assert float((volume[j] - middle).abs().max()) < 1e-5, f"{profile}: not normalised exactly once"
+
+        # The deferred (device) path: the worker emits the RAW [0, 1] bag of the same centres,
+        # and augment_batch normalises it. Forced on every machine - without a GPU the worker
+        # would otherwise augment itself - so both paths start from the same raw image; the
+        # augmentation is the identity, so only the normalisation is compared.
+        deferred_cfg = chosen.copy()
+        deferred_cfg.augment.enabled, deferred_cfg.augment.noise_std = True, 0.0
+        deferred_cfg.data.cache_dtype = "float32"  # float16 transport would quantise these float32 test volumes
+        deferred = _InMemoryStudyBagDataset(deferred_cfg, ["study3"], None, train=True)
+        deferred.defer_augment = True
+        batch = collate_studies([deferred[0]])
+        assert "augment_params" in batch and float(batch["images"].min()) >= 0.0 and float(batch["images"].max()) <= 1.0
+        assert torch.equal(batch["slice_valid_mask"][0], item["slice_valid_mask"]), "the two paths drew other centres"
+        identity = torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0], dtype=torch.float64).repeat(1, len(chosen.data.series_slots), 1)
+        got = augment_batch(
+            batch["images"].float().to(device),
+            identity.to(device),
+            batch["slice_valid_mask"].to(device),
+            batch["series_present_mask"].to(device),
+            mean.view(1, 1, 1, 3, 1, 1).to(device),
+            std.view(1, 1, 1, 3, 1, 1).to(device),
+        ).cpu()[0]
+        diff = float((got - item["images"]).abs().max())
+        assert diff < 1e-4, f"{profile}: worker and {device} normalisation differ by {diff:.2e}"
+        worst[profile] = diff
+    where = "on the GPU" if device == "cuda" else "on the CPU only - NO GPU available, the GPU comparison did not run"
+    return f"each profile applied exactly once; worker vs device path {where}, max diff {worst}"
+
+
+def _profile_cfg(cfg: Config, profile: str) -> Config:
+    chosen = cfg.copy()
+    chosen.data.encoder_normalization = profile
+    chosen.augment.enabled = False
+    chosen.data.laterality_canonical = False
+    return chosen
+
+
+def check_legacy_efficientnet_state_keys(cfg: Config) -> str:
+    """The EfficientNet adapters keep the exact state_dict keys and shapes of the pre-adapter model.
+
+    The fixture was written by model.py at commit a9e5155 (before encoders.py); every existing
+    EfficientNet checkpoint therefore loads strictly, without a key migration.
+    """
+    import json
+    from pathlib import Path
+
+    from .model import EfficientNetMIL
+
+    fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "legacy_efficientnet_state_keys.json"
+    stored = json.loads(fixture.read_text(encoding="utf-8"))["models"]
+    variants = {"avg": {}, "attention": {"spatial_pool": "attention"}, "target_attention": {"target_attention": True}}
+    for name, keys in stored.items():
+        backbone, variant = name.split("/")
+        model = EfficientNetMIL(n_slots=3, weights="none", head_hidden=32, backbone=backbone, **variants[variant])
+        now = {k: list(v.shape) for k, v in model.state_dict().items()}
+        assert list(now) == list(keys), f"{name}: state_dict keys changed ({set(now) ^ set(keys)})"
+        assert now == keys, f"{name}: a parameter shape changed"
+    return f"{len(stored)} EfficientNet variants keep their pre-adapter state_dict keys and shapes"
+
+
+def check_backbone_resume_signature(cfg: Config) -> str:
+    """Resume refuses another freeze policy or adapter; an old B0 signature is unchanged; init_weights
+    from another backbone is refused."""
+    from types import SimpleNamespace
+
+    from .train import EvaluationReference, Trainer
+
+    dataset = SyntheticBagDataset(cfg, n_studies=2)
+    reference = EvaluationReference(["a"], np.zeros((1, N_TARGETS), dtype=np.float32), np.ones((1, N_TARGETS), dtype=bool))
+
+    def signature(run_cfg: Config) -> dict:
+        trainer = SimpleNamespace(
+            cfg=run_cfg, mode="fold", device_spec=SimpleNamespace(device=torch.device("cpu")),
+            augment_device="cpu", ema_decay=0.0, reference=reference,
+        )
+        return Trainer._resume_signature(trainer, dataset)
+
+    legacy = efficientnet_config(cfg)
+    for key in ("encoder_trainable", "encoder_trainable_units"):
+        legacy.model.pop(key, None)  # a B0 config from before the keys existed
+    current = efficientnet_config(cfg)
+    current.model.encoder_trainable, current.model.encoder_trainable_units = "all", 4
+    assert signature(legacy) == signature(current), "the default freeze policy changed the B0 resume signature"
+
+    dino = _backbone_cfg(cfg, "dinov2_vits14", encoder_trainable="last_n", encoder_trainable_units=4)
+    base = signature(dino)
+    assert base.get("encoder_adapter_version") == "dinov2_patch_tokens_v1"
+    for key, value in (("encoder_trainable_units", 2), ("encoder_trainable", "frozen"), ("encoder_trainable", "all")):
+        other = dino.copy()
+        other.model[key] = value
+        assert signature(other) != base, f"model.{key}={value} was not detected by the resume check"
+    other_backbone = _backbone_cfg(cfg, "radimagenet_resnet50", encoder_trainable="last_n", encoder_trainable_units=4)
+    assert signature(other_backbone) != base
+
+    b0_payload = {"config": legacy.to_dict(), "model": {}}
+    stub = SimpleNamespace(model=_backbone_model(cfg, "radimagenet_resnet50"), ema=None, _read_checkpoint=lambda _p: b0_payload)
+    try:
+        Trainer.load_weights(stub, "b0.pt")
+    except ValueError as error:
+        assert "new experiment" in str(error), error
+    else:
+        raise AssertionError("init_weights from an EfficientNet checkpoint into ResNet-50 was accepted")
+    return "freeze policy and adapter changes are refused on resume; old B0 signature unchanged; cross-backbone init refused"
+
+
+def check_new_backbone_grad_checkpointing(cfg: Config) -> str:
+    """Backbone-specific checkpointing leaves logits and gradients unchanged - also with partly
+    frozen encoders, where a reentrant checkpoint would silently drop the trainable gradients."""
+    from .model import build_model
+
+    worst = {}
+    for backbone, units in (("dinov2_vits14", 2), ("radimagenet_resnet50", 2)):
+        results = []
+        for enabled in (False, True):
+            chosen = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=units, grad_checkpointing=enabled)
+            torch.manual_seed(0)
+            model = build_model(chosen).train()
+            batch = _random_batch(chosen, b=1, seed=7)
+            logits = model(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+            logits.square().mean().backward()
+            grads = {n: p.grad.clone() for n, p in model.features.named_parameters() if p.grad is not None}
+            results.append((logits.detach(), grads, model.grad_checkpointing))
+        (plain, plain_grads, off), (ckpt, ckpt_grads, on) = results
+        assert not off and on
+        assert torch.allclose(plain, ckpt, atol=1e-5), f"{backbone}: checkpointing changed the forward pass"
+        assert plain_grads.keys() == ckpt_grads.keys() and plain_grads, f"{backbone}: gradients lost under checkpointing"
+        worst[backbone] = max(float((plain_grads[k] - ckpt_grads[k]).abs().max()) for k in plain_grads)
+        assert worst[backbone] < 1e-5, f"{backbone}: gradients differ by {worst[backbone]:.2e}"
+    return f"identical logits and encoder gradients with checkpointing on partly frozen encoders (max diff {worst})"
+
+
+def check_radimagenet_loader(cfg: Config, tmp_dir) -> str:
+    """The RadImageNet loader on a file in the official format (random tensors, not the real weights).
+
+    Accepts exactly the demo's Backbone state_dict (backbone.{0,1,4,5,6,7}.*), loads every
+    parameter and BN buffer, and refuses a missing, extra, mis-shaped, foreign-named or
+    non-finite entry instead of loading partially.
+    """
+    from pathlib import Path
+
+    import torchvision
+
+    from .encoders import RadImageNetResNet50Encoder
+
+    torch.manual_seed(0)
+    official = torch.nn.Module()
+    official.backbone = torch.nn.Sequential(*list(torchvision.models.resnet50(weights=None).children())[:9])
+    with torch.no_grad():
+        for module in official.modules():
+            if isinstance(module, torch.nn.BatchNorm2d):
+                module.running_mean.normal_()
+                module.running_var.uniform_(0.5, 2.0)
+                module.num_batches_tracked.fill_(7)
+    state = official.state_dict()
+    good = Path(tmp_dir) / "ResNet50_official_format.pt"
+    torch.save(state, good)
+
+    encoder = RadImageNetResNet50Encoder(str(good))
+    loaded = encoder.state_dict()
+    assert len(loaded) == len(state) == 318, (len(loaded), len(state))
+    renamed = {
+        "backbone.0.": "conv1.", "backbone.1.": "bn1.", "backbone.4.": "layer1.",
+        "backbone.5.": "layer2.", "backbone.6.": "layer3.", "backbone.7.": "layer4.",
+    }
+
+    def torchvision_name(key: str) -> str:
+        prefix = key[: key.index(".", len("backbone.")) + 1]
+        return renamed[prefix] + key[len(prefix):]
+
+    for key, value in state.items():
+        assert torch.equal(loaded[torchvision_name(key)], value), f"{key} not loaded"
+    assert encoder.weights_info["n_bn_buffers"] == 53 * 3 and encoder.weights_info["sha256"]
+
+    broken = {
+        "missing BN buffer": {k: v for k, v in state.items() if k != "backbone.7.2.bn3.running_var"},
+        "extra classifier": {**state, "backbone.9.weight": torch.zeros(12, 2048)},
+        "wrong shape": {**state, "backbone.0.weight": torch.zeros(64, 1, 7, 7)},
+        "torchvision names": {torchvision_name(k): v for k, v in state.items()},
+        "non-finite": {**state, "backbone.1.running_mean": torch.full((64,), float("nan"))},
+    }
+    for label, bad_state in broken.items():
+        path = Path(tmp_dir) / f"ResNet50_{label.replace(' ', '_')}.pt"
+        torch.save(bad_state, path)
+        try:
+            RadImageNetResNet50Encoder(str(path))
+        except (ValueError, RuntimeError):
+            pass
+        else:
+            raise AssertionError(f"RadImageNet loader accepted a file with {label}")
+    try:
+        RadImageNetResNet50Encoder(str(Path(tmp_dir) / "does_not_exist.pt"))
+    except FileNotFoundError as error:
+        assert "never substituted" in str(error), error
+    else:
+        raise AssertionError("a missing RadImageNet file did not raise")
+    return f"official Backbone format loads all 318 tensors (159 BN buffers); {len(broken)} broken variants and a missing file refused"
+
+
+def check_new_backbone_training_roundtrip(cfg: Config) -> str:
+    """Synthetic train epoch -> best.pt -> offline rebuild (no network, no pretrained file) -> same predictions."""
+    import socket
+    import tempfile
+    from pathlib import Path
+    from unittest import mock
+
+    from .evaluate import load_checkpoint_for_inference
+    from .train import build_synthetic_trainer
+
+    def no_network(*_args, **_kwargs):
+        raise RuntimeError("network access during an offline checkpoint load")
+
+    out = []
+    for backbone, pretrained in (("dinov2_vits14", "lvd142m"), ("radimagenet_resnet50", "Z:/nowhere/RadImageNet/ResNet50.pt")):
+        run_cfg = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=1, side_pooling=True)
+        run_cfg.train.num_workers = run_cfg.train.eval_num_workers = 0
+        run_cfg.train.microbatch_studies, run_cfg.train.accumulation_steps = 1, 2
+        with tempfile.TemporaryDirectory(prefix=f"knee_mri_{backbone}_") as tmp:
+            run_cfg.paths.output_dir = tmp
+            try:
+                trainer = build_synthetic_trainer(run_cfg, n_studies=4, epochs=1, name="run")
+                trainer.fit()
+                best = Path(tmp) / "run" / "best.pt"
+                payload = torch.load(best, map_location="cpu", weights_only=False)
+                record = payload["encoder"]
+                assert record["backbone"] == backbone and record["normalization"]["profile"] == run_cfg.data.encoder_normalization
+                assert record["trainable"] == "last_n" and record["trainable_units"] == 1 and record["adapter_version"]
+                assert payload["model_description"]["encoder_model_id"] == record["model_id"]
+
+                # Pretend the run started from pretrained weights that this machine does not have.
+                payload["config"]["model"]["weights"] = pretrained
+                torch.save(payload, best)
+                blocked = [mock.patch.object(socket.socket, "connect", no_network)]
+                try:
+                    import huggingface_hub
+
+                    blocked.append(mock.patch.object(huggingface_hub, "hf_hub_download", no_network))
+                except ImportError:  # pragma: no cover
+                    pass
+                for patcher in blocked:
+                    patcher.start()
+                try:
+                    loaded, _ = load_checkpoint_for_inference(Config(payload["config"]), best)
+                finally:
+                    for patcher in blocked:
+                        patcher.stop()
+                assert loaded.weights_info["weights_used"] == "random", "inference must not load pretrained weights"
+
+                trained = trainer.selected_model.cpu().eval()
+                batch = _padded_batch(run_cfg, b=2, seed=9)
+                with torch.no_grad():
+                    expected = trained(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+                    actual = loaded.cpu()(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+                assert torch.equal(expected, actual), f"{backbone}: offline reload predictions differ"
+
+                if backbone == "dinov2_vits14":
+                    other = Config(payload["config"])
+                    other.data.image_size = 112
+                    try:
+                        load_checkpoint_for_inference(other, best, allow_data_overrides=["data.image_size"])
+                    except ValueError as error:
+                        assert "trained at data.image_size=56" in str(error), error
+                    else:
+                        raise AssertionError("a DINOv2 checkpoint was rebuilt for another input size")
+                out.append(f"{backbone} (loss {trainer.state.history[-1]['train_loss']:.3f})")
+            finally:
+                remove_file_logging(tmp)
+    return "train -> best.pt -> offline strict reload gives identical logits: " + ", ".join(out)
+
+
+# --------------------------------------------------------------------------------------
 
 
 def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, str]]:
     import tempfile
 
+    # `small` keeps the configured backbone (at its tiny size): the generic MIL, training,
+    # resume and checkpoint checks also exercise DINOv2 / ResNet-50 when those are configured.
+    # `effnet` is for the checks about EfficientNet behaviour itself (they build a B0/V2-S).
     small = tiny_config(cfg)
+    effnet = efficientnet_config(small)
     results: list[tuple[str, bool, str]] = []
 
     with tempfile.TemporaryDirectory(prefix="knee_mri_selftest_") as tmp_dir:
@@ -2511,9 +3165,9 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("global_no_dilution", check_global_no_dilution),
             ("eval_loader_budget", lambda: check_eval_loader_budget(cfg)),
             ("explicit_run_selection", check_explicit_run_selection),
-            ("attention_pool_starts_as_average", lambda: check_attention_pool_starts_as_average(small)),
-            ("spatial_pool_shapes", lambda: check_spatial_pool_shapes(small)),
-            ("focal_signal_survives_pooling", lambda: check_focal_signal_survives_pooling(small)),
+            ("attention_pool_starts_as_average", lambda: check_attention_pool_starts_as_average(effnet)),
+            ("spatial_pool_shapes", lambda: check_spatial_pool_shapes(effnet)),
+            ("focal_signal_survives_pooling", lambda: check_focal_signal_survives_pooling(effnet)),
             ("single_class_auc_is_na", check_single_class_auc),
             ("label_join_by_key", check_label_join),
             ("empty_numeric_is_unknown", check_empty_numeric_is_unknown),
@@ -2546,12 +3200,12 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
         ]
         if not quick:
             checks += [
-                ("padding_invariance", lambda: check_padding_invariance(small)),
-                ("missing_slot_is_zero", lambda: check_missing_slot(small)),
-                ("masked_label_gradients", lambda: check_masked_label_gradients(small)),
-                ("gradient_accumulation", lambda: check_accumulation(small)),
-                ("sigmoid_not_softmax", lambda: check_sigmoid_outputs(small)),
-                ("checkpoint_roundtrip", lambda: check_checkpoint_roundtrip(small, tmp_dir)),
+                ("padding_invariance", lambda: check_padding_invariance(effnet)),
+                ("missing_slot_is_zero", lambda: check_missing_slot(effnet)),
+                ("masked_label_gradients", lambda: check_masked_label_gradients(effnet)),
+                ("gradient_accumulation", lambda: check_accumulation(effnet)),
+                ("sigmoid_not_softmax", lambda: check_sigmoid_outputs(effnet)),
+                ("checkpoint_roundtrip", lambda: check_checkpoint_roundtrip(effnet, tmp_dir)),
                 ("exact_resume", lambda: check_exact_resume(small)),
                 ("exact_resume_with_ema", lambda: check_exact_resume_with_ema(small)),
                 ("ema_checkpoint_roundtrip", lambda: check_ema_checkpoint_roundtrip(small)),
@@ -2563,15 +3217,27 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("side_pooling_checkpoints", lambda: check_side_pooling_checkpoints(small, tmp_dir)),
                 ("side_pooling_training_step", lambda: check_side_pooling_training_step(small)),
                 ("inference_architecture", lambda: check_inference_architecture(small, tmp_dir)),
-                ("backbone_choice", lambda: check_backbone_choice(small)),
-                ("grad_checkpointing_is_exact", lambda: check_grad_checkpointing_is_exact(small)),
-                ("legacy_checkpoint_is_b0", lambda: check_legacy_checkpoint_is_b0(small, tmp_dir)),
-                ("train_step_reduces_loss", lambda: check_train_step_reduces_loss(small)),
+                ("backbone_choice", lambda: check_backbone_choice(effnet)),
+                ("grad_checkpointing_is_exact", lambda: check_grad_checkpointing_is_exact(effnet)),
+                ("legacy_checkpoint_is_b0", lambda: check_legacy_checkpoint_is_b0(effnet, tmp_dir)),
+                ("train_step_reduces_loss", lambda: check_train_step_reduces_loss(effnet)),
                 ("epoch_reaches_workers", lambda: check_epoch_reaches_workers(small)),
                 ("window_training_step", lambda: check_window_training_step(small)),
                 ("global_training_step", lambda: check_global_training_step(small)),
                 ("float16_transport", lambda: check_float16_transport(small)),
                 ("spatial_pool_training_step", lambda: check_spatial_pool_training_step(small)),
+                ("legacy_efficientnet_state_keys", lambda: check_legacy_efficientnet_state_keys(small)),
+                ("encoder_feature_maps", lambda: check_encoder_feature_maps(small)),
+                ("new_backbone_masking", lambda: check_new_backbone_masking(small)),
+                ("new_backbone_pooling_options", lambda: check_new_backbone_pooling_options(small)),
+                ("dino_patch_grid", lambda: check_dino_patch_grid(small)),
+                ("freeze_policies", lambda: check_freeze_policies(small)),
+                ("parameter_groups_complete", lambda: check_parameter_groups_complete(small)),
+                ("normalization_profiles", lambda: check_normalization_profiles(small)),
+                ("backbone_resume_signature", lambda: check_backbone_resume_signature(small)),
+                ("new_backbone_grad_checkpointing", lambda: check_new_backbone_grad_checkpointing(small)),
+                ("radimagenet_loader", lambda: check_radimagenet_loader(small, tmp_dir)),
+                ("new_backbone_training_roundtrip", lambda: check_new_backbone_training_roundtrip(small)),
             ]
 
         for name, function in checks:

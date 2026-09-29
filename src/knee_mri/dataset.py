@@ -41,7 +41,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from .config import Config
-from .constants import IMAGENET_MEAN, IMAGENET_STD, MRI_SCALAR_MEAN, MRI_SCALAR_STD, N_TARGETS
+from .constants import N_TARGETS, NORMALIZATION_PROFILES
 from .labels import LabelTable
 from .laterality import apply_canonical, canonical_ops, laterality_path, load_laterality
 from .preprocess import cache_path, preprocess_hash, read_cache_entry
@@ -49,9 +49,15 @@ from .utils import LOG
 
 
 def normalization_stats(cfg: Config) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    if cfg.data.encoder_normalization == "mri_scalar":
-        return MRI_SCALAR_MEAN, MRI_SCALAR_STD
-    return IMAGENET_MEAN, IMAGENET_STD
+    """(mean, std) of the data.encoder_normalization profile, applied once to the [0, 1] slices.
+
+    The one place both augmentation paths (dataset worker and `augment_batch`), validation
+    and inference take the encoder input statistics from.
+    """
+    profile = str(cfg.data.encoder_normalization)
+    if profile not in NORMALIZATION_PROFILES:
+        raise ValueError(f"data.encoder_normalization={profile!r}; known: {sorted(NORMALIZATION_PROFILES)}")
+    return NORMALIZATION_PROFILES[profile]
 
 
 def bin_centers(n_slices: int, n_centers: int, rng: np.random.Generator | None) -> tuple[np.ndarray, np.ndarray]:

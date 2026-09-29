@@ -1,5 +1,7 @@
-# RSNA knee MRI - EfficientNet (B0 / V2-S) 2.5D MIL baseline.
-# Other encoders: config.dinov2_vits14.yaml, config.radimagenet_resnet50.yaml.
+# RSNA knee MRI - RadImageNet ResNet-50 encoder in the 2.5D MIL model (example config).
+# Same pipeline as config.yaml; only data.encoder_normalization and the model encoder keys
+# differ. The freeze setting below is a starting experiment, not a tuned optimum.
+#   python -m knee_mri.cli train --config src/config.radimagenet_resnet50.yaml --mode fold
 # These values are starting hypotheses, not tuned optima.
 # Every key can be overridden from the CLI, e.g.: --set data.image_size=288
 
@@ -8,10 +10,10 @@ seed: 42
 paths:
   # Root of the competition export. All *_csv / dicom_root entries below default
   # to the usual layout under this root when left as null.
-  data_root: "/ai-storage/Temp/SZ/kaggle_knee/data"
+  data_root: "F:/Kaggle/data"
   dicom_root: null                 # default: <data_root>/train_series
-  # train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
-  train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v2.csv"     # soft labels
+  # train_csv: "F:/Kaggle/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
+  train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -28,7 +30,7 @@ paths:
   laterality_csv: null             # default: <work_dir>/manifest/laterality.csv
 
   work_dir: "work"
-  cache_dir: "/workssd/zseress/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
+  cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
   output_dir: null                 # default: <work_dir>/runs
 
 manifest:
@@ -64,7 +66,9 @@ data:
   adjacent_slices: 3
   crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)
   intensity_percentiles: [1.0, 99.0]
-  encoder_normalization: "mri_scalar"  # mri_scalar|imagenet|radimagenet_torch (the last one: RadImageNet ResNet-50 only)
+  # The official RadImageNet PyTorch demo feeds (uint8 - 127.5) * 2 / 255: [0, 1] -> [-1, 1],
+  # i.e. mean 0.5 / std 0.5 per channel on our [0, 1] robust-scaled slices.
+  encoder_normalization: "radimagenet_torch"
   monochrome1_policy: "invert"       # invert|keep
   cache_dtype: "float16"
   # Data-quality gate: studies with no usable series at all.
@@ -94,12 +98,15 @@ model:
   # b0 / v2_s give 1280 features at stride 32. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
   #   b0: 6.3 GB, 10.4 train study/s | v2_s: 11.1 GB, 5.6 study/s | v2_s + grad_checkpointing: 4.1 GB, 4.0 study/s
   # Switching the backbone is a new experiment: its pretrained weights, not another backbone's checkpoint.
-  backbone: "efficientnet_b0"
-  weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth (of the chosen backbone)
-  # Which encoder parameters train: all | frozen (head only) | last_n (the last
-  # encoder_trainable_units stages/blocks). Frozen parts also run in eval mode (BN statistics).
-  encoder_trainable: "all"
-  encoder_trainable_units: 0       # only read with encoder_trainable=last_n
+  backbone: "radimagenet_resnet50"
+  # The official RadImageNet PyTorch weights: RadImageNet_pytorch/ResNet50.pt from
+  # RadImageNet_pytorch.zip (linked from github.com/BMEII-AI/RadImageNet). No download, no
+  # ImageNet substitute: the file must exist (relative paths: cwd, then the repository root).
+  weights: "work/pretrained/RadImageNet_pytorch/ResNet50.pt"
+  # Starting experiment: only the last residual stage (layer4) trains; stem and layer1-3 stay
+  # frozen and in eval mode.
+  encoder_trainable: "last_n"
+  encoder_trainable_units: 1
   # Recompute each encoder stage in backward instead of storing its activations: less
   # training memory for ~30% less throughput, identical results. Only if microbatch/size would OOM.
   grad_checkpointing: false
@@ -164,7 +171,7 @@ train:
   eval_num_workers: 4
   eval_prefetch_factor: 2
   amp: "auto"                      # auto|bf16|fp16|fp32
-  eval_batch_studies: 4
+  eval_batch_studies: 2
   log_every: 20
   resume: null                     # path to last.pt: continue the SAME run exactly (checked)
   init_weights: null               # path to a checkpoint: NEW run from its weights (fresh optimizer/best/history)

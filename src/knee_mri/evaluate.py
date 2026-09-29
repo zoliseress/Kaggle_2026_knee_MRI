@@ -33,7 +33,11 @@ INFERENCE_DATA_KEYS = (
 # and the memory-only chunking / gradient checkpointing, which the inference host may tune.
 # A checkpoint without model.backbone predates the key and is B0 (the config default).
 RUNTIME_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
-ARCHITECTURE_KEYS = ("architecture", "n_slots", "n_targets", "spatial_pool", "target_attention", "side_pooling", "feature_dim", "head_in")
+ARCHITECTURE_KEYS = (
+    "architecture", "n_slots", "n_targets", "spatial_pool", "target_attention", "side_pooling", "feature_dim", "head_in",
+    # Encoder identity (absent from checkpoints written before the adapters: then not compared).
+    "encoder_model_id", "encoder_adapter_version", "encoder_out_channels", "encoder_input_size",
+)
 # What a checkpoint written before a key existed was trained with: absent means the default,
 # never "skip the check" - an old model must not silently receive mirrored inputs.
 INFERENCE_DATA_DEFAULTS = {"data.laterality_canonical": False}
@@ -82,7 +86,8 @@ def load_checkpoint_for_inference(
     for key, (stored, current) in mismatched.items():
         LOG.warning("%s: %s override accepted - trained with %r, inferring with %r", path, key, stored, current)
 
-    # Architecture from the checkpoint, runtime knobs from the caller, no pretrained download.
+    # Architecture from the checkpoint, runtime knobs from the caller. weights=none: the bare
+    # architecture, no download and no pretrained file - the checkpoint supplies every weight.
     build_cfg = cfg.copy()
     stored_model = stored_tree.get("model")
     if stored_model:
@@ -95,6 +100,15 @@ def load_checkpoint_for_inference(
     else:
         LOG.warning("%s carries no model config; building the architecture from the current config", path)
     build_cfg.model.weights = "none"
+    if str(build_cfg.model.get("backbone", DEFAULT_BACKBONE)) == "dinov2_vits14":
+        # DINOv2 is built for one input size (its position embeddings); no override can change it.
+        trained_size = int(stored_cfg.get_dotted("data.image_size"))
+        if int(cfg.data.image_size) != trained_size:
+            raise ValueError(
+                f"{path}: the dinov2_vits14 encoder was trained at data.image_size={trained_size}; the inference "
+                f"config uses {cfg.data.image_size}. DINOv2 inputs must have the trained size."
+            )
+        build_cfg.data.image_size = trained_size
     model = build_model(build_cfg, n_slots=len(stored_cfg.get_dotted("data.series_slots") or cfg.data.series_slots))
     stored_description, built = payload.get("model_description") or {}, model.describe()
     differing = [k for k in ARCHITECTURE_KEYS if k in stored_description and stored_description[k] != built[k]]

@@ -1,4 +1,5 @@
-"""RSNA knee MRI: study-level multi-label classification with EfficientNet-B0 2.5D MIL.
+"""RSNA knee MRI: study-level multi-label classification with a 2.5D MIL model
+(EfficientNet-B0 by default; EfficientNet-V2-S, RadImageNet ResNet-50 or DINOv2 ViT-S/14 encoders).
 
 Modules
 -------
@@ -11,7 +12,8 @@ Modules
     preprocess  deterministic preprocessing and the full-series cache
     splits      immutable, group-disjoint folds
     dataset     2.5D bags, masks and coherent augmentation
-    model       EfficientNet-B0 + masked mean/max MIL pooling
+    encoders    encoder adapters: [N, 3, H, W] -> [N, C, Hf, Wf], weights, freezing
+    model       encoder adapter + masked mean/max MIL pooling
     loss        masked, class-normalised BCE
     metrics     fixed-reference validation metrics
     train       training loop and run modes

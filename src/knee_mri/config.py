@@ -9,14 +9,34 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
 
-from .constants import DEFAULT_BACKBONE, ENCODER_FEATURES, PLANES, TARGETS
+from .constants import (
+    DEFAULT_BACKBONE,
+    DINOV2_PATCH_SIZE,
+    ENCODER_FEATURES,
+    ENCODER_UNITS,
+    NORMALIZATION_PROFILES,
+    PLANES,
+    RECOMMENDED_NORMALIZATION,
+    TARGETS,
+)
 
 SPATIAL_POOLS = ("avg", "avgmax", "attention")
+ENCODER_TRAINABLE = ("all", "frozen", "last_n")
+# model.weights values that are not a file path, per backbone. Anything else must be an existing
+# file (checked when the encoder is built). RadImageNet has no download: its file is required.
+BACKBONE_WEIGHT_NAMES = {
+    "efficientnet_b0": None,  # any torchvision EfficientNet_B0_Weights name, e.g. IMAGENET1K_V1
+    "efficientnet_v2_s": None,
+    "radimagenet_resnet50": (),
+    "dinov2_vits14": ("lvd142m",),
+}
+_LOG = logging.getLogger("knee_mri")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "src" / "config.yaml"
@@ -123,8 +143,12 @@ def resolve_paths(cfg: Config) -> Config:
 def validate_config(cfg: Config) -> None:
     """Fail fast on settings the architecture or the data contract cannot honour."""
     data = cfg.data
-    if int(data.image_size) < 32 or int(data.image_size) % 8 != 0:
-        raise ValueError(f"data.image_size must be a multiple of 8 and >= 32, got {data.image_size}")
+    if int(data.image_size) < 32:
+        raise ValueError(f"data.image_size must be >= 32, got {data.image_size}")
+    # The divisibility rule is the backbone's: multiples of 8 for the CNNs here, multiples of
+    # the 14 px patch for DINOv2 (validate_encoder_config).
+    if str(cfg.model.get("backbone", DEFAULT_BACKBONE)) != "dinov2_vits14" and int(data.image_size) % 8 != 0:
+        raise ValueError(f"data.image_size must be a multiple of 8 for the CNN backbones, got {data.image_size}")
     if int(data.adjacent_slices) != 3:
         raise ValueError(
             "data.adjacent_slices must be 3: the torchvision EfficientNet stem expects "
@@ -144,8 +168,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("data.fov_mm must be positive")
     if data.crop_center not in ("foreground", "foreground_extent", "geometric"):
         raise ValueError("data.crop_center must be 'foreground', 'foreground_extent' or 'geometric'")
-    if data.encoder_normalization not in ("imagenet", "mri_scalar"):
-        raise ValueError("data.encoder_normalization must be 'imagenet' or 'mri_scalar'")
+    if data.encoder_normalization not in NORMALIZATION_PROFILES:
+        raise ValueError(f"data.encoder_normalization must be one of {sorted(NORMALIZATION_PROFILES)}")
     if not isinstance(data.get("laterality_canonical", False), bool):
         raise ValueError("data.laterality_canonical must be true or false")
     if float(data.get("laterality_min_offset_mm", 20.0)) < 0:
@@ -170,8 +194,7 @@ def validate_config(cfg: Config) -> None:
 
     if str(cfg.model.get("spatial_pool", "avg")) not in SPATIAL_POOLS:
         raise ValueError(f"model.spatial_pool must be one of {sorted(SPATIAL_POOLS)}")
-    if str(cfg.model.get("backbone", DEFAULT_BACKBONE)) not in ENCODER_FEATURES:
-        raise ValueError(f"model.backbone must be one of {sorted(ENCODER_FEATURES)}")
+    validate_encoder_config(cfg)
     if bool(cfg.model.get("target_attention", False)):
         if str(cfg.model.get("spatial_pool", "avg")) != "avg":
             raise ValueError("model.target_attention needs model.spatial_pool=avg")
@@ -213,6 +236,61 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("split.fold must be in [0, n_folds)")
     if cfg.split.grouping not in ("auto", "patient", "study"):
         raise ValueError("split.grouping must be one of auto|patient|study")
+
+
+def validate_encoder_config(cfg: Config) -> None:
+    """Backbone, its pretrained source, input size, normalisation profile and freeze policy."""
+    backbone = str(cfg.model.get("backbone", DEFAULT_BACKBONE))
+    if backbone not in ENCODER_FEATURES:
+        raise ValueError(f"model.backbone must be one of {sorted(ENCODER_FEATURES)}, got {backbone!r}")
+
+    weights = str(cfg.model.get("weights", "none"))
+    names = BACKBONE_WEIGHT_NAMES[backbone]
+    is_named = weights.lower() in ("none", "random", "null") or (names is not None and weights in names)
+    looks_like_file = any(ch in weights for ch in "/\\") or weights.endswith((".pt", ".pth", ".safetensors", ".bin"))
+    if names is not None and not is_named and not looks_like_file:
+        options = ", ".join([repr(n) for n in names] + ["a local weight file of that backbone"])
+        raise ValueError(
+            f"model.weights={weights!r} is not a pretrained source of {backbone}: use {options}, "
+            f"or 'none'. Weights of another backbone are never substituted"
+            + (" (RadImageNet: RadImageNet_pytorch/ResNet50.pt)." if backbone == "radimagenet_resnet50" else ".")
+        )
+
+    size = int(cfg.data.image_size)
+    if backbone == "dinov2_vits14" and size % DINOV2_PATCH_SIZE != 0:
+        raise ValueError(
+            f"data.image_size={size} is not a multiple of the DINOv2 patch size {DINOV2_PATCH_SIZE}. The "
+            "dinov2_vits14 adapter does no padding, cropping or resizing; use e.g. 224 (16x16 patches) or "
+            "336 (24x24 patches)."
+        )
+
+    profile = str(cfg.data.encoder_normalization)
+    if profile == "radimagenet_torch" and backbone != "radimagenet_resnet50":
+        raise ValueError(
+            "data.encoder_normalization=radimagenet_torch belongs to the RadImageNet PyTorch weights; "
+            f"it is not a profile for {backbone}"
+        )
+    recommended = RECOMMENDED_NORMALIZATION.get(backbone)
+    if recommended is not None and profile != recommended:
+        _LOG.warning(
+            "data.encoder_normalization=%s with model.backbone=%s, whose pretrained weights expect %s. "
+            "Fine as a deliberate ablation; otherwise set data.encoder_normalization=%s.",
+            profile,
+            backbone,
+            recommended,
+            recommended,
+        )
+
+    mode = str(cfg.model.get("encoder_trainable", "all"))
+    if mode not in ENCODER_TRAINABLE:
+        raise ValueError(f"model.encoder_trainable must be one of {ENCODER_TRAINABLE}, got {mode!r}")
+    if mode == "last_n":
+        units = int(cfg.model.get("encoder_trainable_units", 0) or 0)
+        if not 1 <= units <= ENCODER_UNITS[backbone]:
+            raise ValueError(
+                f"model.encoder_trainable=last_n needs model.encoder_trainable_units in [1, {ENCODER_UNITS[backbone]}] "
+                f"for {backbone}, got {units}"
+            )
 
 
 def load_config(
