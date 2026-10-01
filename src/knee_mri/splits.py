@@ -31,6 +31,12 @@ ROLE_TRAIN_POOL = "train_pool"
 ROLE_REFERENCE_HOLDOUT = "reference_holdout"
 
 
+def splits_path(cfg: Config) -> Path:
+    """paths.splits_csv, or the historical <work_dir>/splits/splits.csv when it is unset."""
+    configured = cfg.paths.get("splits_csv")
+    return Path(configured) if configured else Path(cfg.paths.work_dir) / "splits" / "splits.csv"
+
+
 @dataclass
 class GroupingDecision:
     source: str  # "patient" | "study"
@@ -253,7 +259,7 @@ def make_splits(
                 crossing,
             )
 
-    out_path = Path(out_path) if out_path else Path(cfg.paths.work_dir) / "splits" / "splits.csv"
+    out_path = Path(out_path) if out_path else splits_path(cfg)
     if out_path.exists():
         LOG.warning("Overwriting existing %s - evaluation references change with it.", out_path)
     atomic_write_dataframe(splits, out_path)
@@ -273,6 +279,64 @@ def make_splits(
         },
     )
     LOG.info("Splits written: %s (%s)", out_path, summary["per_fold"])
+    return splits
+
+
+FIXED_VALIDATION_FOLD = 0
+FIXED_TRAIN_FOLD = 1
+
+
+def make_fixed_split(
+    cfg: Config,
+    train_ids: list[str],
+    validation_ids: list[str],
+    out_path: str | Path | None = None,
+    sources: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """One fixed train/validation partition instead of CV folds.
+
+    Written in the splits.csv schema: validation studies get fold 0, training studies
+    fold 1, so `split.fold=0` trains on the first set and validates on the second. The
+    two sets must be disjoint - an overlap is a label leak, never silently resolved.
+    """
+    train_set = set(str(s) for s in train_ids)
+    val_set = set(str(s) for s in validation_ids)
+    if not train_set or not val_set:
+        raise ValueError(f"Both sets need studies: {len(train_set)} training, {len(val_set)} validation.")
+    overlap = train_set & val_set
+    if overlap:
+        raise ValueError(
+            f"{len(overlap)} studies are in both the training and the validation set, e.g. {sorted(overlap)[:3]}. "
+            "Remove them from the training CSV first."
+        )
+
+    rows = [
+        {
+            STUDY_ID: study,
+            "group": f"study::{study}",
+            "group_source": "study",
+            "role": ROLE_TRAIN_POOL,
+            "fold": FIXED_VALIDATION_FOLD if study in val_set else FIXED_TRAIN_FOLD,
+        }
+        for study in sorted(train_set | val_set)
+    ]
+    splits = pd.DataFrame(rows)
+
+    out_path = Path(out_path) if out_path else splits_path(cfg)
+    atomic_write_dataframe(splits, out_path)
+    atomic_write_json(
+        out_path.with_name("splits_meta.json"),
+        {
+            "version": SPLITS_VERSION,
+            "mode": "fixed_holdout",
+            "group_source": "study",
+            "validation_fold": FIXED_VALIDATION_FOLD,
+            "n_train": len(train_set),
+            "n_validation": len(val_set),
+            "sources": sources or {},
+        },
+    )
+    LOG.info("Fixed split written: %s (%d training, %d validation studies)", out_path, len(train_set), len(val_set))
     return splits
 
 
@@ -306,7 +370,7 @@ def split_summary(splits: pd.DataFrame, table: LabelTable | None) -> dict:
 
 
 def load_splits(cfg: Config, path: str | Path | None = None) -> pd.DataFrame:
-    path = Path(path) if path else Path(cfg.paths.work_dir) / "splits" / "splits.csv"
+    path = Path(path) if path else splits_path(cfg)
     if not path.exists():
         raise FileNotFoundError(f"splits.csv not found: {path}. Run `python -m knee_mri.cli make-splits` first.")
     return pd.read_csv(path, dtype={STUDY_ID: "string"})

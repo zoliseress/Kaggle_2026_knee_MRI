@@ -54,7 +54,7 @@ from .encoders import ADAPTER_VERSIONS
 from .metrics import evaluate_predictions, selection_metric, soft_target_warning
 from .model import build_model
 from .preprocess import preprocess_hash
-from .splits import assert_group_disjoint, fold_study_ids, load_splits
+from .splits import assert_group_disjoint, fold_study_ids, load_splits, splits_path
 from .utils import (
     LOG,
     add_file_logging,
@@ -1116,6 +1116,11 @@ def _prepare_real_run(
         LOG.warning("%s", reference.note)
 
     _report_split_label_counts(label_table, train_ids, val_ids, run_dir)
+    if cfg.paths.get("frozen_reference_csv"):
+        LOG.info(
+            "Validation is scored against %s; the validation rows of the label counts above are not used.",
+            cfg.paths.frozen_reference_csv,
+        )
 
     train_ds = StudyBagDataset(cfg, train_ids, label_table, train=True)
     val_ds = StudyBagDataset(cfg, val_ids, label_table, train=False)
@@ -1125,7 +1130,7 @@ def _prepare_real_run(
         "label_source": label_table.source,
         "label_policy": label_table.policy,
         "prep_hash": preprocess_hash(cfg),
-        "splits_file": str(Path(cfg.paths.work_dir) / "splits" / "splits.csv"),
+        "splits_file": str(splits_path(cfg)),
         "readiness": readiness.details,
         "readiness_ok": readiness.ok,
         "n_excluded_train": len(excluded_train),

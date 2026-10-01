@@ -45,7 +45,7 @@ from .loss import (
 )
 from .metrics import evaluate_predictions, soft_roc_auc
 from .model import EfficientNetB0MIL, masked_max, masked_mean
-from .splits import assert_group_disjoint, make_splits
+from .splits import assert_group_disjoint, fold_study_ids, make_fixed_split, make_splits
 from .train import window_sizes
 from .utils import LOG, remove_file_logging
 
@@ -1292,6 +1292,57 @@ def check_group_separation(tmp_dir) -> str:
     pairs = splits.groupby("group")["fold"].nunique()
     assert int(pairs.max()) == 1, "a patient group was split across folds"
     return "patient groups stay inside one fold"
+
+
+def check_fixed_split(tmp_dir) -> str:
+    """make-fixed-split: validation studies are fold 0, training fold 1; overlap is refused."""
+    from pathlib import Path
+
+    cfg = load_config(resolve=False)
+    train = [f"t{i:02d}" for i in range(10)]
+    val = [f"v{i:02d}" for i in range(4)]
+    splits = make_fixed_split(cfg, train, val, out_path=Path(tmp_dir) / "fixed" / "splits.csv")
+    assert_group_disjoint(splits, 0)
+    got_train, got_val = fold_study_ids(splits, 0)
+    assert got_train == sorted(train) and got_val == sorted(val), (got_train, got_val)
+    try:
+        make_fixed_split(cfg, train, val + ["t03"], out_path=Path(tmp_dir) / "fixed" / "overlap.csv")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a study in both sets must be an error")
+    return "fold 0 = validation set, fold 1 = training set, overlap refused"
+
+
+def check_freeze_reference_from_csv(tmp_dir) -> str:
+    """freeze-reference --from-csv: empty cells are invalid, non-binary values are refused."""
+    from pathlib import Path
+
+    from .cli import main as cli_main
+    from .train import EvaluationReference
+
+    ids = ["r2", "r0", "r1"]
+    frame = pd.DataFrame(np.zeros((3, len(TARGETS))), columns=TARGETS)
+    frame.iloc[0, 0] = 1.0
+    frame.iloc[1, 3] = np.nan
+    frame.insert(0, STUDY_ID, ids)
+    src = Path(tmp_dir) / "ref_wide.csv"
+    frame.to_csv(src, index=False)
+    out = Path(tmp_dir) / "frozen_from_csv.csv"
+    assert cli_main(["freeze-reference", "--from-csv", str(src), "--out", str(out)]) == 0
+    loaded = EvaluationReference.from_csv(out, ids)
+    assert loaded.values[0, 0] == 1.0 and loaded.valid[0, 0]
+    assert not loaded.valid[1, 3] and int((~loaded.valid).sum()) == 1
+
+    frame.iloc[2, 5] = 0.5
+    frame.to_csv(src, index=False)
+    try:
+        cli_main(["freeze-reference", "--from-csv", str(src), "--out", str(out), "--force"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a non-binary reference value must be an error")
+    return "empty cells frozen as invalid, 0.5 refused"
 
 
 def check_pseudonymous_patient_id(tmp_dir) -> str:
@@ -3177,6 +3228,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("statuses_all_targets", lambda: check_statuses_all_targets(tmp_dir)),
             ("details_missing_values", lambda: check_details_missing_values(tmp_dir)),
             ("frozen_reference_roundtrip", lambda: check_frozen_reference_roundtrip(tmp_dir)),
+            ("freeze_reference_from_csv", lambda: check_freeze_reference_from_csv(tmp_dir)),
             ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
             ("nonfinite_scores_rejected", check_nonfinite_scores_rejected),
@@ -3194,6 +3246,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("foreground_extent_center", check_foreground_extent_center),
             ("patient_group_separation", lambda: check_group_separation(tmp_dir)),
             ("pseudonymous_patient_id", lambda: check_pseudonymous_patient_id(tmp_dir)),
+            ("fixed_split", lambda: check_fixed_split(tmp_dir)),
             ("dataset_contract", lambda: check_dataset_contract(small)),
             ("augment_device_resolution", lambda: check_augment_device_resolution(small)),
             ("augment_device_equivalence", lambda: check_augment_device_equivalence(small)),

@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from .config import load_config
-from .constants import STUDY_ID
+from .constants import STUDY_ID, TARGETS
 from .utils import LOG, atomic_write_json, log_environment, seed_everything
 
 
@@ -163,6 +163,27 @@ def cmd_make_splits(args: argparse.Namespace) -> int:
         patient_audit=patient_audit,
         train_df=train_df,
         reference_study_ids=reference_ids,
+    )
+    return 0
+
+
+def cmd_make_fixed_split(args: argparse.Namespace) -> int:
+    from .schema import read_id_csv
+    from .splits import make_fixed_split, splits_path
+
+    cfg = _load(args)
+    out = splits_path(cfg)
+    if out.exists() and not args.force:
+        LOG.error("%s exists. Point paths.splits_csv elsewhere, or pass --force to replace it.", out)
+        return 1
+    train_ids = read_id_csv(cfg.paths.train_csv)[STUDY_ID].dropna().astype(str).tolist()
+    validation_ids = read_id_csv(args.validation_csv)[STUDY_ID].dropna().astype(str).tolist()
+    make_fixed_split(
+        cfg,
+        train_ids,
+        validation_ids,
+        out_path=out,
+        sources={"train_csv": str(cfg.paths.train_csv), "validation_csv": str(Path(args.validation_csv).resolve())},
     )
     return 0
 
@@ -315,7 +336,8 @@ def cmd_label_audit(args: argparse.Namespace) -> int:
 
 
 def cmd_freeze_reference(args: argparse.Namespace) -> int:
-    from .labels import build_label_table
+    from .labels import build_from_wide_numeric, build_label_table
+    from .schema import read_id_csv
     from .splits import load_splits
     from .train import EvaluationReference
 
@@ -324,8 +346,21 @@ def cmd_freeze_reference(args: argparse.Namespace) -> int:
     if out.exists() and not args.force:
         LOG.error("%s exists. A frozen reference must not change between experiments; pass --force to replace it.", out)
         return 1
-    study_ids = sorted(set(load_splits(cfg)[STUDY_ID].astype(str)))
-    table = build_label_table(cfg, study_ids)
+    if args.from_csv:
+        # A hand-labelled wide CSV (e.g. the radiologist reference): its own studies, binary
+        # values only, empty cells unknown.
+        df = read_id_csv(args.from_csv)
+        missing = [t for t in TARGETS if t not in df.columns]
+        if missing:
+            raise ValueError(f"{args.from_csv} is missing target columns {missing}")
+        study_ids = sorted(set(df[STUDY_ID].dropna().astype(str)))
+        ref_cfg = cfg.copy()
+        ref_cfg.labels.allow_soft_targets = False
+        table = build_from_wide_numeric(df, study_ids, ref_cfg, source="reference")
+        table.policy["source_file"] = str(Path(args.from_csv).resolve())
+    else:
+        study_ids = sorted(set(load_splits(cfg)[STUDY_ID].astype(str)))
+        table = build_label_table(cfg, study_ids)
     reference = EvaluationReference.from_table(table, study_ids)
     reference.save(out)
     atomic_write_json(
@@ -375,6 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = _common(sub.add_parser("make-splits", help="Create the immutable splits.csv"))
     p.set_defaults(func=cmd_make_splits)
+
+    p = _common(sub.add_parser("make-fixed-split", help="One fixed split: train_csv trains (fold 1), --validation-csv validates (fold 0)"))
+    p.add_argument("--validation-csv", required=True, help="CSV whose StudyInstanceUIDs form the validation set")
+    p.add_argument("--force", action="store_true", help="Replace an existing file at paths.splits_csv")
+    p.set_defaults(func=cmd_make_fixed_split)
 
     p = _common(sub.add_parser("qc", help="Build the QC gallery"))
     p.add_argument("--n-studies", type=int, default=12)
@@ -468,6 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = _common(sub.add_parser("freeze-reference", help="Freeze the validation reference for all studies"))
     p.add_argument("--out", default=None, help="Default: <work_dir>/labels/frozen_reference.csv")
     p.add_argument("--force", action="store_true", help="Replace an existing frozen reference")
+    p.add_argument(
+        "--from-csv",
+        default=None,
+        help="Freeze this wide 0/1 CSV (e.g. the radiologist reference) instead of the label table over splits.csv",
+    )
     p.set_defaults(func=cmd_freeze_reference)
 
     return parser

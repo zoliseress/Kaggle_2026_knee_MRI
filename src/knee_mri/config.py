@@ -119,6 +119,7 @@ def resolve_paths(cfg: Config) -> Config:
         "train_series_csv": data_root / "train_series.csv",
         "cache_dir": work_dir / "cache",
         "output_dir": work_dir / "runs",
+        "splits_csv": work_dir / "splits" / "splits.csv",
     }
     optional = [
         "labels_details_csv",
