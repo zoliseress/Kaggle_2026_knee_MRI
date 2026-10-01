@@ -292,6 +292,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_output_dir(args: argparse.Namespace) -> int:
+    # The run scripts take the last stdout line: config warnings are logged to stdout too.
+    print(load_config(args.config, args.overrides).paths.output_dir)
+    return 0
+
+
 def cmd_diagnose(args: argparse.Namespace) -> int:
     from .diagnose import diagnose
 
@@ -469,12 +475,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--qc-dir", default=None)
     p.set_defaults(func=cmd_report)
 
+    p = _common(sub.add_parser("output-dir", help="Print the resolved run folder (<work_dir>/runs/<train_csv stem>)"))
+    p.set_defaults(func=cmd_output_dir)
+
     p = _common(sub.add_parser("diagnose", help="Per-class results and implementation checks of finished runs"))
     p.add_argument(
         "target",
         nargs="?",
         default=None,
-        help="A run directory, or a run-group prefix such as work/runs/cv3_20260920_002647",
+        help="A run directory, or a run-group prefix such as work/runs/train_v1/cv3_20260920_002647",
     )
     p.add_argument(
         "--runs",

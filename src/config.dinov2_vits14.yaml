@@ -32,7 +32,7 @@ paths:
 
   work_dir: "work"
   cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
-  output_dir: null                 # default: <work_dir>/runs
+  output_dir: null                 # default: <work_dir>/runs/<train_csv stem>, e.g. runs/train_v3
 
 manifest:
   # Probe-decode one file per candidate volume while building the manifest.

@@ -1,7 +1,7 @@
 """Read-only diagnostics of finished fold runs: per-class results plus implementation checks.
 
-    python -m knee_mri.cli diagnose work/runs/cv3_20260920_002647      # a run group (all folds)
-    python -m knee_mri.cli diagnose work/runs/fold0_A1 --deep          # one run, GPU checks too
+    python -m knee_mri.cli diagnose work/runs/train_v1/cv3_20260920_002647   # a run group (all folds)
+    python -m knee_mri.cli diagnose work/runs/train_v1/fold0_A1 --deep       # one run, GPU checks too
 
 Outputs (default `<first run>/../<group>_diagnose/`):
   * `diagnose_per_class.csv` - per run and for the merged OOF, per target: ROC-AUC on the

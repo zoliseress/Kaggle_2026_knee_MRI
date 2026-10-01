@@ -113,12 +113,15 @@ def resolve_paths(cfg: Config) -> Config:
     work_dir = _resolve(paths.get("work_dir"), REPO_ROOT / "work")
     assert data_root is not None and work_dir is not None
 
+    train_csv = _resolve(paths.get("train_csv"), data_root / "train.csv")
+    assert train_csv is not None
     defaults = {
         "dicom_root": data_root / "train_series",
-        "train_csv": data_root / "train.csv",
+        "train_csv": train_csv,
         "train_series_csv": data_root / "train_series.csv",
         "cache_dir": work_dir / "cache",
-        "output_dir": work_dir / "runs",
+        # One folder per training table: train_v3.csv -> <work_dir>/runs/train_v3/<run>.
+        "output_dir": work_dir / "runs" / train_csv.stem,
         "splits_csv": work_dir / "splits" / "splits.csv",
     }
     optional = [

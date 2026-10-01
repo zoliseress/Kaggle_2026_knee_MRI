@@ -8,7 +8,7 @@ RadImageNet:  KNEE_MRI_RADIMAGENET_WEIGHTS=<.../RadImageNet_pytorch/ResNet50.pt>
               linked from github.com/BMEII-AI/RadImageNet).
 DINOv2:       timm/vit_small_patch14_dinov2.lvd142m model.safetensors in the Hugging Face
               cache; set KNEE_MRI_ALLOW_DOWNLOAD=1 to let the test download it.
-Existing runs: every work/runs/*/best.pt is rebuilt offline and must give finite logits.
+Existing runs: every work/runs/<dataset>/*/best.pt is rebuilt offline and must give finite logits.
 """
 
 from __future__ import annotations
@@ -117,9 +117,9 @@ def test_existing_run_checkpoints_rebuild_offline():
     from knee_mri.config import Config
     from knee_mri.evaluate import load_checkpoint_for_inference
 
-    checkpoints = sorted((REPO / "work" / "runs").glob("*/best.pt"))
+    checkpoints = sorted((REPO / "work" / "runs").glob("*/*/best.pt"))
     if not checkpoints:
-        pytest.skip("no work/runs/*/best.pt on this machine")
+        pytest.skip("no work/runs/<dataset>/*/best.pt on this machine")
     for path in checkpoints[:8]:
         payload = torch.load(str(path), map_location="cpu", weights_only=False)
         cfg = Config(payload["config"])

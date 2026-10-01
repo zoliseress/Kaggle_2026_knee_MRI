@@ -44,7 +44,7 @@ The current export decodes with plain pydicom (Explicit VR Little Endian).
 | `labels_statuses.csv` *(optional)* | wide text statuses |
 | `labels_predictions.csv` *(optional)* | wide numeric export; empty cell = unresolved |
 | `labels_predictions_exclude_borderline.csv` *(optional)* | same, borderline also emptied |
-| `train_labeled_58_reference.csv` *(optional)* | radiologist reference set — audit only |
+| `train_labeled_158_reference.csv` *(optional)* | radiologist reference set (158 studies = the original 58 + 100) — audit only |
 
 Identifiers are read as strings, joins are key-based (never positional), and
 `validate-schema` checks unique study ids, unique (study, series) keys, many-to-one
@@ -107,7 +107,7 @@ Run these first. They require no DICOMs, no cache and no splits, so they tell yo
 works before you spend hours on the cache build.
 
 ```powershell
-python -m knee_mri.cli selftest                                   # 22 failure-mode checks
+python -m knee_mri.cli selftest                                   # synthetic failure-mode checks
 python -m knee_mri.cli train --mode synthetic --n-studies 16 --epochs 3
 ```
 
@@ -143,7 +143,7 @@ python -m knee_mri.cli train --mode overfit --n-studies 8
 
 # 5. Train fold 0, then build its report
 python -m knee_mri.cli train --mode fold --set split.fold=0
-python -m knee_mri.cli report work/runs/<run-name>
+python -m knee_mri.cli report work/runs/<dataset>/<run-name>
 ```
 
 ### Step 6 — after a fold has finished: pick what you need
@@ -154,20 +154,20 @@ matches your situation.
 *The run was interrupted and you want to continue it* (resumes at the next epoch boundary):
 
 ```powershell
-python -m knee_mri.cli train --mode fold --set train.resume=work/runs/<run>/last.pt
+python -m knee_mri.cli train --mode fold --set train.resume=work/runs/<dataset>/<run>/last.pt
 ```
 
 *Score a saved checkpoint on its held-out fold:*
 
 ```powershell
-python -m knee_mri.cli evaluate --checkpoint work/runs/<run>/best.pt
+python -m knee_mri.cli evaluate --checkpoint work/runs/<dataset>/<run>/best.pt
 ```
 
 *Run the diagnostic audit against the radiologist reference set* — a development signal only,
 never a gold benchmark and never a selection criterion:
 
 ```powershell
-python -m knee_mri.cli evaluate --checkpoint work/runs/<run>/best.pt --partition reference_holdout
+python -m knee_mri.cli evaluate --checkpoint work/runs/<dataset>/<run>/best.pt --partition reference_holdout
 ```
 
 *Train the remaining folds* (one command per fold, each writing its own run directory):
@@ -182,9 +182,9 @@ refuses anything less than complete, verified-disjoint coverage:
 
 ```powershell
 python -m knee_mri.cli merge-oof `
-  work/runs/<run-fold0>/validation_predictions.csv `
-  work/runs/<run-fold1>/validation_predictions.csv `
-  work/runs/<run-fold2>/validation_predictions.csv
+  work/runs/<dataset>/<run-fold0>/validation_predictions.csv `
+  work/runs/<dataset>/<run-fold1>/validation_predictions.csv `
+  work/runs/<dataset>/<run-fold2>/validation_predictions.csv
 ```
 
 ### Where this repository currently stands
@@ -331,11 +331,85 @@ an earlier run exactly.
   after every `model.train()`. Trainable statistics remain available as an option.
 * Pretrained weights are explicit: `IMAGENET1K_V1`, a local checkpoint path, or `none`.
   A download failure raises with instructions — it never falls back to random init silently.
+* The encoder is chosen with `model.backbone`; see *Encoder backbones* below.
 * `model.encoder_chunk_size` limits the size of one encoder call. **It does not guarantee
   lower training memory**: every chunk's autograd graph is retained until backward. To cut
   peak memory, reduce `train.microbatch_studies` or `data.centers_per_series`. Features are
   never detached (that would be a head-only diagnostic, not this model). Peak GPU memory is
   logged every epoch.
+
+### Encoder backbones
+
+The encoder is an adapter (`knee_mri/encoders.py`) that turns one slice triplet
+`[N, 3, H, W]` into one spatial map `[N, C, Hf, Wf]`. Pooling, side pooling, target attention
+and the head take their width from the adapter's `out_channels` — nothing is projected to a
+common width.
+
+| `model.backbone` | weights (`model.weights`) | map at 224 px | `last_n` units | example config |
+|---|---|---|---|---|
+| `efficientnet_b0` (default) | `IMAGENET1K_V1` \| file \| `none` | `[N, 1280, 7, 7]` | 9 feature stages | `config.yaml` |
+| `efficientnet_v2_s` | `IMAGENET1K_V1` \| file \| `none` | `[N, 1280, 7, 7]` | 8 feature stages | — |
+| `radimagenet_resnet50` | RadImageNet `ResNet50.pt` \| `none` | `[N, 2048, 7, 7]` | `layer1`…`layer4` | `config.radimagenet_resnet50.yaml` |
+| `dinov2_vits14` | `lvd142m` \| file \| `none` | `[N, 384, 16, 16]` | 12 transformer blocks | `config.dinov2_vits14.yaml` |
+
+```powershell
+python -m knee_mri.cli train --config src/config.dinov2_vits14.yaml --mode fold --set split.fold=0
+python -m knee_mri.cli train --config src/config.radimagenet_resnet50.yaml --mode fold --set split.fold=0
+```
+
+Switching the backbone is a new experiment. Train it from that backbone's pretrained weights;
+`train.init_weights` from a checkpoint of another backbone is refused, and a resume detects a
+changed backbone, freeze policy or adapter version.
+
+* **EfficientNet** keeps its exact state_dict keys (`features.<i>.…`), so every earlier
+  checkpoint loads strictly and predicts bit-identically (verified on six real runs, and by
+  `tests/test_backbones.py` against the pre-adapter `model.py` from git).
+* **DINOv2 ViT-S/14** — timm `vit_small_patch14_dinov2.lvd142m`. The adapter keeps the
+  final-LayerNorm patch tokens of `forward_features()`, drops the CLS token (and any register
+  tokens) and rearranges the row-major tokens into the `H/14 × W/14` grid. The model is built
+  for exactly `data.image_size`; timm resamples the pretrained 518 px position embeddings when
+  the weights load. There is no padding, cropping or resizing: the size must be a multiple of
+  14 — **224 (16×16) and 336 (24×24) work, 320 and 384 are refused**. Use
+  `data.encoder_normalization=imagenet` (its pretraining statistics). No CLS classifier branch.
+  `lvd142m` downloads `timm/vit_small_patch14_dinov2.lvd142m/model.safetensors` once into the
+  Hugging Face cache (`HF_HUB_OFFLINE=1` works afterwards), or point `model.weights` at a local
+  copy of that file.
+* **RadImageNet ResNet-50** — torchvision ResNet-50 up to `layer4` (no pooling, no fc) with the
+  official RadImageNet PyTorch weights: `RadImageNet_pytorch/ResNet50.pt` from
+  `RadImageNet_pytorch.zip` (Google Drive link in the README of
+  [BMEII-AI/RadImageNet](https://github.com/BMEII-AI/RadImageNet); sha256 of the verified file
+  `08629f7e…0734`). That file is the state_dict of the demo's `Backbone` wrapper,
+  `nn.Sequential(*list(resnet50().children())[:9])`, so its keys are `backbone.{0,1,4,5,6,7}.*`;
+  the loader renames them explicitly to `conv1/bn1/layer1…layer4` and refuses any missing, extra,
+  mis-shaped or non-finite tensor (all 318 parameters and BN buffers must load). There is no
+  download and no ImageNet substitute. Use `data.encoder_normalization=radimagenet_torch`: the demo
+  feeds `(uint8 − 127.5)·2/255`, i.e. `[0, 1] → [−1, 1]` (mean 0.5, std 0.5). Checked on 60 real
+  cached triplets: with that profile the batch statistics entering the 53 BatchNorm layers match
+  their running statistics (mean |Δμ|/σ 0.10), with `mri_scalar` or `imagenet` they do not (≈ 4).
+
+**Normalisation.** `data.encoder_normalization` (`mri_scalar` default | `imagenet` |
+`radimagenet_torch`) is applied exactly once, by `dataset.normalization_stats()` — in the
+worker or in `augment_batch` on the GPU, identically, and the same in training, validation and
+inference. The robust intensity scaling and the geometry are unchanged. The profile, its
+mean/std, the encoder id, adapter version and weight provenance (path + sha256) are stored in
+every checkpoint (`payload["encoder"]`, `model_description`).
+
+**Freezing** (`model.encoder_trainable`): `all` (default), `frozen` (head only) or `last_n`
+with `model.encoder_trainable_units` — the last N transformer blocks plus the final norm
+(DINOv2), the last N residual stages (ResNet), the last N feature stages (EfficientNet). The
+example configs start from DINOv2 `last_n=4` and RadImageNet `layer4` only: first experiments,
+not tuned optima. Frozen units get `requires_grad=False`, are left out of the optimizer
+groups and run in eval mode after every `model.train()` (their BatchNorm statistics never
+move); `model.freeze_bn_running_stats` separately decides the BN statistics of trainable units.
+
+**Memory.** `model.grad_checkpointing` is backbone-specific: per EfficientNet stage, per
+trainable ResNet stage, per DINOv2 block (non-reentrant, so trainable blocks after frozen ones
+still get gradients). Frozen units keep no autograd graph. `model.encoder_chunk_size` still
+works but bounds only the size of one encoder call, not the training memory.
+
+**Inference** rebuilds the architecture from the checkpoint's own config with
+`model.weights=none` — no network and no pretrained file — then loads the full project
+checkpoint strictly. A DINOv2 checkpoint must be run at its trained `data.image_size`.
 
 ## Loss
 
@@ -386,6 +460,32 @@ default (`split.holdout_reference`) and used as an **optional diagnostic audit**
 (`evaluate --partition reference_holdout`), never as the early-stopping criterion — prompt
 tuning happened on those reports, so they are not an independent gold benchmark.
 
+### Fixed hold-out instead of CV (`run_holdout.sh` / `run_holdout.bat`)
+
+One run, no folds: `train_v4.csv` (4249 studies) trains, and the 158 radiologist-labelled
+studies of `train_labeled_158_reference.csv` validate. `train_v4` is `train_v2` (QWen soft
+labels, cell for cell) minus exactly those 158 studies. The scripts pass everything with `--set`, so the configs, `run_cv.*` and
+the 3-fold `work/splits/splits.csv` stay as they were. On first use the scripts also create
+the two files they need:
+
+```bash
+# splits.csv schema: validation studies fold 0, training studies fold 1
+python -m knee_mri.cli make-fixed-split --set paths.train_csv=<data>/train_v4.csv \
+    --set paths.splits_csv=work/splits/holdout158/splits.csv \
+    --validation-csv <data>/train_labeled_158_reference.csv
+# 0/1 radiologist labels frozen as the validation reference; empty cells are invalid
+python -m knee_mri.cli freeze-reference --from-csv <data>/train_labeled_158_reference.csv \
+    --out work/labels/frozen_reference_ref158.csv
+```
+
+Training then runs with `split.fold=0`, `paths.splits_csv` and `paths.frozen_reference_csv`
+pointing at those files. `paths.splits_csv` defaults to `<work_dir>/splits/splits.csv`, so
+leaving it unset keeps the CV path. Here the 158 studies **are** the early-stopping and
+`best.pt` criterion, so the score measured on them is slightly optimistic. With 158 studies
+(e.g. 14 MCL positives) the macro AUC is also noisy. The "validation: NO supervision" warning
+in the label counts is expected: the 158 are not in `train_v4`, and the metric comes from the
+frozen reference.
+
 ## Metrics
 
 `model.eval()` + `torch.inference_mode()`, predictions accumulated over the whole fold
@@ -404,6 +504,13 @@ disjoint and complete — a single held-out fold is not OOF coverage. Patient-gr
 intervals are available (`evaluate.bootstrap_intervals`) and optional.
 
 ## Outputs per run
+
+Runs are grouped by training table: `paths.output_dir` defaults to
+`<work_dir>/runs/<train_csv stem>`, so a run on `train_v3.csv` lands in
+`work/runs/train_v3/<run>` (an explicit `paths.output_dir` replaces the whole default).
+`python -m knee_mri.cli output-dir [--config ...] [--set ...]` prints the resolved folder; the
+`run_cv.*` / `run_holdout.*` scripts use it to find the fold runs for the OOF merge.
+`src/tools/migrate_runs_by_dataset.py` sorted the earlier flat `work/runs/<run>` folders.
 
 `history.csv`, `metrics_per_class.csv`, `validation_predictions.csv`,
 `validation_reference.csv`, `run_summary.json`, `coverage.json`, `environment.json`,
@@ -430,7 +537,7 @@ boundaries only**; mid-epoch resume is not implemented and is not claimed.
 
 ## Verification status
 
-`python -m knee_mri.cli selftest` — 22/22 checks pass on this machine. They cover geometric
+`python -m knee_mri.cli selftest` — all checks pass on this machine. They cover geometric
 slice sorting, plane assignment, the in-plane transform being a pure reordering, true
 neighbour triplets and gap handling, short-stack padding, masked mean/max, padding
 invariance of the logits, missing-slot zeroing, masked-label gradients, NaN-target
@@ -439,6 +546,16 @@ accounting, sigmoid-not-softmax outputs, single-class AUC returning NA, key-base
 joins, patient-group separation, pseudonymous-PatientID detection, the dataset contract,
 checkpoint round-trip and a real forward/backward that reduces the loss. The same checks run
 under pytest (`tests/`).
+
+Encoder adapters (`tests/test_backbones.py`, random weights, no network): the documented
+map of every backbone, finite `[B, 12]` logits, padding and absent slots never encoded (NaN
+padding leaves the logits identical), pooling / side pooling / target attention on the new
+maps, the DINOv2 patch grid (CLS dropped, row-major order, equal to timm's own NCHW output,
+320/384 refused), gradients only in unfrozen units, complete non-duplicated optimizer groups,
+single normalisation identical on the worker and GPU paths, resume / init-weights guards,
+exact gradient checkpointing, the strict RadImageNet loader, a synthetic train → `best.pt` →
+offline reload with identical predictions, and old EfficientNet checkpoints. Real weights:
+`tests/test_pretrained_encoders.py` (skips when the weights are absent).
 
 Also executed here on the real export:
 
