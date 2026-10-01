@@ -8,13 +8,19 @@
 #     ./run_cv.sh
 #     ./run_cv.sh --set data.image_size=288 --set train.max_epochs=10
 #     ./run_cv.sh V2soft_img320 --set data.image_size=320
+#     ./run_cv.sh --gpu 1 V2soft_img320 --set data.image_size=320
 #  Minden ide irt extra argumentum MINDHAROM foldra ervenyes.
-#  Ha az elso argumentum nem "-"-vel kezdodik, az a run-group elotagja:
+#  Ha az elso (nem --gpu) argumentum nem "-"-vel kezdodik, az a run-group
+#  elotagja:
 #     V2soft_img320_cv3_<idobelyeg>_fold<N>, ..._oof
+#  A --gpu N (vagy --gpu=N) barhol allhat; CUDA_VISIBLE_DEVICES=N-t allit,
+#  igy a python oldalon a kivalasztott GPU lesz a cuda:0.
 #
 #  Kornyezeti valtozokkal felulirhato:
 #     CONFIG     (alap: src/config.linux.yaml)
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
+#     GPU        (alap: ures = nem nyul a CUDA_VISIBLE_DEVICES-hez;
+#                 a --gpu kapcsolo felulirja)
 #
 #  Elofeltetel: a work/splits/splits.csv mar letezik es ugyanazzal az
 #  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
@@ -27,12 +33,42 @@ NFOLDS=3
 CONDA_ENV="${CONDA_ENV-kaggle_2026}"
 CONFIG="${CONFIG:-$ROOT/src/config.linux.yaml}"
 
+GPU="${GPU-}"
+
+# --gpu N / --gpu=N kiszedese (barhol allhat), a tobbi argumentum marad
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu)
+            if [[ $# -lt 2 ]]; then
+                echo "[HIBA] A --gpu utan meg kell adni a GPU id-t."
+                exit 1
+            fi
+            GPU="$2"
+            shift 2
+            ;;
+        --gpu=*)
+            GPU="${1#--gpu=}"
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
 PREFIX=""
 if [[ $# -gt 0 && "$1" != -* ]]; then
     PREFIX="${1}_"
     shift
 fi
 EXTRA=("$@")
+
+if [[ -n "$GPU" ]]; then
+    export CUDA_VISIBLE_DEVICES="$GPU"
+fi
 
 cd "$ROOT" || exit 1
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -72,6 +108,7 @@ echo "======================================================================"
 echo " Run group  : $GROUP"
 echo " Foldok     : 0 .. $LAST"
 echo " Config     : $CONFIG"
+echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
 echo " Extra args : ${EXTRA[*]:-}"
 echo " Kimenet    : $ROOT/work/runs/${GROUP}_fold<N>"
 echo "======================================================================"
