@@ -21,8 +21,9 @@ paths:
   labels_statuses_csv: null                      # wide text-status export
   labels_predictions_csv: null                   # wide numeric export
   labels_predictions_exclude_borderline_csv: null
-  # Small radiologist reference set. Held out from training by default.
-  reference_csv: "notebooks/train_labeled_58_reference.csv"
+  # Radiologist reference set: 158 studies (the original 58 + 100). Audit only (diagnose, evaluate);
+  # held out from image training only with split.holdout_reference=true (default false).
+  reference_csv: "notebooks/train_labeled_158_reference.csv"
   # Validation reference frozen once by `freeze-reference` (from train_v1.csv). Every
   # training-label experiment is scored against this same file; null = derive it from
   # the current label table, which then moves with the label policy.

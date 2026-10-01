@@ -11,7 +11,8 @@ paths:
   data_root: "/ai-storage/Temp/SZ/kaggle_knee/data"
   dicom_root: null                 # default: <data_root>/train_series
   # train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
-  train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v2.csv"     # soft labels
+  # train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v2.csv"     # soft labels
+  train_csv: "/ai-storage/Temp/SZ/kaggle_knee/data/train_v3.csv"     # soft labels (qwen+gpt)
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -19,12 +20,14 @@ paths:
   labels_statuses_csv: null                      # wide text-status export
   labels_predictions_csv: null                   # wide numeric export
   labels_predictions_exclude_borderline_csv: null
-  # Small radiologist reference set. Held out from training by default.
-  reference_csv: "notebooks/train_labeled_58_reference.csv"
+  # Radiologist reference set: 158 studies (the original 58 + 100). Audit only (diagnose, evaluate);
+  # held out from image training only with split.holdout_reference=true (default false).
+  reference_csv: "notebooks/train_labeled_158_reference.csv"
   # Validation reference frozen once by `freeze-reference` (from train_v1.csv). Every
   # training-label experiment is scored against this same file; null = derive it from
   # the current label table, which then moves with the label policy.
-  frozen_reference_csv: "work/labels/frozen_reference.csv"
+  # frozen_reference_csv: "work/labels/frozen_reference.csv"
+  frozen_reference_csv: "work/labels/frozen_reference_v3.csv"
   laterality_csv: null             # default: <work_dir>/manifest/laterality.csv
 
   work_dir: "work"
