@@ -23,7 +23,10 @@ from .constants import (
     NORMALIZATION_PROFILES,
     PLANES,
     RECOMMENDED_NORMALIZATION,
+    SLOT_FILTERS,
     TARGETS,
+    slot_filter,
+    slot_plane,
 )
 
 SPATIAL_POOLS = ("avg", "avgmax", "attention")
@@ -132,6 +135,7 @@ def resolve_paths(cfg: Config) -> Config:
         "reference_csv",
         "frozen_reference_csv",
         "laterality_csv",
+        "series_selection_csv",
     ]
 
     paths["data_root"] = str(data_root)
@@ -163,11 +167,19 @@ def validate_config(cfg: Config) -> None:
     slots = list(data.series_slots)
     if not slots:
         raise ValueError("data.series_slots must not be empty")
-    unknown = [s for s in slots if s not in PLANES]
+    unknown = [s for s in slots if slot_plane(s) not in PLANES or slot_filter(s) not in (None, *SLOT_FILTERS)]
     if unknown:
-        raise ValueError(f"data.series_slots contains unknown planes {unknown}; known: {PLANES}")
+        raise ValueError(
+            f"data.series_slots contains unknown slots {unknown}; a slot is a plane {PLANES} "
+            f"or <plane>_<filter> with a filter from {list(SLOT_FILTERS)}"
+        )
     if len(set(slots)) != len(slots):
         raise ValueError(f"data.series_slots must be unique, got {slots}")
+    sagittal_filtered = [s for s in slots if slot_plane(s) == "sagittal" and slot_filter(s) is not None]
+    if sagittal_filtered:
+        # The canonical frame reverses sagittal stacks by the sagittal slot's slice normal
+        # (laterality.csv); a second sagittal volume may run the other way.
+        raise ValueError(f"filtered sagittal slots {sagittal_filtered} are not supported yet")
     if float(data.fov_mm) <= 0:
         raise ValueError("data.fov_mm must be positive")
     if data.crop_center not in ("foreground", "foreground_extent", "geometric"):

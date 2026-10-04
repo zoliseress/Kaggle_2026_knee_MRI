@@ -7,6 +7,7 @@ model and gradient path - nothing that is being checked is mocked away.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -14,7 +15,7 @@ import pandas as pd
 import torch
 
 from .config import Config, load_config, validate_config
-from .constants import EFFICIENTNET_B0_FEATURES, ENCODER_FEATURES, N_TARGETS, STUDY_ID, TARGETS
+from .constants import EFFICIENTNET_B0_FEATURES, ENCODER_FEATURES, N_TARGETS, SERIES_ID, STUDY_ID, TARGETS, slot_plane
 from .dataset import (
     AUGMENT_PARAM_COLUMNS,
     EpochSampler,
@@ -103,6 +104,7 @@ def _tiny_model(cfg: Config, seed: int = 0) -> EfficientNetB0MIL:
     return EfficientNetB0MIL(
         n_targets=N_TARGETS,
         n_slots=len(cfg.data.series_slots),
+        slot_names=list(cfg.data.series_slots),
         weights="none",
         head_hidden=int(cfg.model.head_hidden),
         head_dropout=0.0,
@@ -115,6 +117,7 @@ def _pool_model(cfg: Config, spatial_pool: str, seed: int = 0) -> EfficientNetB0
     return EfficientNetB0MIL(
         n_targets=N_TARGETS,
         n_slots=len(cfg.data.series_slots),
+        slot_names=list(cfg.data.series_slots),
         weights="none",
         head_hidden=int(cfg.model.head_hidden),
         head_dropout=0.0,
@@ -1404,6 +1407,7 @@ class _InMemoryStudyBagDataset(StudyBagDataset):
     """
 
     N_SLICES = 20
+    VERIFY_SELECTION = False  # synthetic volumes: no cache entries to check against a selection
 
     def _load_slot(self, study: str, slot: str) -> tuple[np.ndarray | None, dict]:
         seed = [int(study.removeprefix("study")), self.slots.index(slot)]
@@ -1811,6 +1815,7 @@ def check_grad_checkpointing_is_exact(cfg: Config) -> str:
         model = EfficientNetMIL(
             n_targets=N_TARGETS,
             n_slots=len(cfg.data.series_slots),
+            slot_names=list(cfg.data.series_slots),
             weights="none",
             head_hidden=int(cfg.model.head_hidden),
             head_dropout=0.0,
@@ -2049,6 +2054,165 @@ def check_laterality_derivation() -> str:
     assert table.loc["d", "side"] == "R" and table.loc["d", "sagittal_normal_x"] == 1.0, "normal_x of the SELECTED sagittal volume"
     assert table.loc["a", "sagittal_normal_x"] == -1.0 and np.isnan(table.loc["c", "sagittal_normal_x"])
     return "tag wins, geometry fills in, |x| < offset stays unresolved, sagittal normal from the selected volume"
+
+
+def check_filtered_slot_selection(cfg: Config, tmp_dir) -> str:
+    """coronal_t1 takes a non-FS T1 that the coronal slot did not take; plane slots are unchanged."""
+    from .manifest import select_series
+
+    def volume(study, vid, plane, tr, te, seq="SE", options="", fs=0):
+        return {STUDY_ID: study, SERIES_ID: f"{study}.{vid}", "volume_id": f"{study}.{vid}#g0", "volume_key": "g0",
+                "path": f"/{study}/{vid}", "plane": plane, "series_description": vid, "echo_time": te,
+                "repetition_time": tr, "scanning_sequence": seq, "scan_options": options, "n_slices": 24,
+                "row_spacing_mm": 0.4, "col_spacing_mm": 0.4, "plane_angle_deg": 1.0, "quality_flags": "",
+                "usable": True, "_fs": fs}
+
+    rows = [
+        # a: the coronal slot takes the PD FS; T1 FS (by ScanOptions), GRE and IR never qualify as T1
+        volume("a", "sag_pd", "sagittal", 3000, 35, fs=1), volume("a", "ax_pd", "axial", 3000, 35, fs=1),
+        volume("a", "cor_pdfs", "coronal", 3000, 35, fs=1), volume("a", "cor_t1", "coronal", 600, 10),
+        volume("a", "cor_t1fs", "coronal", 600, 10, options="['SP', 'FS']"),
+        volume("a", "cor_gre", "coronal", 500, 5, seq="GR"), volume("a", "cor_ir", "coronal", 600, 10, seq="['IR', 'SE']"),
+        # b: the only coronal volume is a T1 - the coronal slot takes it, coronal_t1 must not duplicate it
+        volume("b", "sag_pd", "sagittal", 3000, 35, fs=1), volume("b", "cor_t1", "coronal", 600, 10),
+        # c: no T1 at all
+        volume("c", "cor_pdfs", "coronal", 3000, 35, fs=1), volume("c", "cor_t2", "coronal", 4000, 80),
+        # e: header edge cases - none of them is a usable T1, whatever the score says
+        volume("e", "cor_pdfs", "coronal", 3000, 35, fs=1),
+        volume("e", "tr_zero", "coronal", 0, 10), volume("e", "tr_missing", "coronal", np.nan, 10),
+        volume("e", "te_missing", "coronal", 600, np.nan), volume("e", "te_long", "coronal", 900, 40),
+        volume("e", "seq_missing", "coronal", 600, 10, seq=None), volume("e", "gr_se", "coronal", 600, 10, seq="['GR', 'SE']"),
+        volume("e", "research", "coronal", 600, 10, seq="RM"),
+    ]
+    ti_set = volume("e", "ti_set", "coronal", 600, 10)
+    ti_set["inversion_time"] = 150.0  # an inversion pulse without the IR token
+    rows.append(ti_set)
+    manifest = pd.DataFrame(rows)
+    meta = pd.DataFrame({SERIES_ID: manifest[SERIES_ID], "Fluid_Sensitive": manifest["_fs"], "Fat_Suppression": manifest["_fs"]})
+    manifest = manifest.drop(columns="_fs")
+
+    four = cfg.copy()
+    four.data.series_slots = ["sagittal", "coronal_t1", "coronal", "axial"]  # filtered slot listed first on purpose
+    validate_config(four)
+    selection = select_series(four, manifest, meta, out_path=Path(tmp_dir) / "selection_four.csv")
+    chosen = {(r[STUDY_ID], r["slot"]): (r["volume_id"] if r["selected"] else None) for _, r in selection.iterrows()}
+    assert chosen[("a", "coronal")] == "a.cor_pdfs#g0" and chosen[("a", "coronal_t1")] == "a.cor_t1#g0", chosen
+    assert chosen[("b", "coronal")] == "b.cor_t1#g0" and chosen[("b", "coronal_t1")] is None, "duplicated the coronal volume"
+    assert chosen[("c", "coronal_t1")] is None, "a T2 passed the T1 filter"
+    assert chosen[("e", "coronal_t1")] is None, f"a header edge case passed the T1 filter: {chosen[('e', 'coronal_t1')]}"
+    assert list(selection[selection[STUDY_ID] == "a"]["slot"]) == list(four.data.series_slots), "rows must follow the slot order"
+
+    three = cfg.copy()
+    three.data.series_slots = ["sagittal", "coronal", "axial"]
+    base = select_series(three, manifest, meta, out_path=Path(tmp_dir) / "selection_three.csv")
+    same = selection[selection["slot"].isin(three.data.series_slots)].reset_index(drop=True)
+    assert same[["slot", "volume_id", "selected"]].equals(base[["slot", "volume_id", "selected"]]), "plane slots changed"
+
+    for bad in (["sagittal", "sagittal_t1"], ["coronal", "coronal_t2"], ["coronal", "coronal"]):
+        broken = cfg.copy()
+        broken.data.series_slots = bad
+        try:
+            validate_config(broken)
+        except ValueError:
+            continue
+        raise AssertionError(f"series_slots {bad} was accepted")
+    return "coronal_t1 = best non-FS spin-echo T1 besides the coronal volume; missing/odd headers refused; plane slots unchanged"
+
+
+def check_unselected_cache_removed(cfg: Config, tmp_dir) -> str:
+    """A (study, slot) the selection leaves empty loses its old cache entry; selected ones are kept."""
+    from .preprocess import cache_path, remove_unselected_entries
+
+    local = cfg.copy()
+    local.paths.cache_dir = str(Path(tmp_dir) / "cache_prune")
+    selection = pd.DataFrame(
+        {
+            STUDY_ID: ["a", "a", "b"],
+            "slot": ["coronal", "coronal_t1", "coronal_t1"],
+            "selected": [True, False, False],
+        }
+    )
+    for study, slot in (("a", "coronal"), ("a", "coronal_t1")):  # b/coronal_t1 never existed
+        path = cache_path(local, study, slot)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"old")
+    removed = remove_unselected_entries(local, selection[~selection["selected"]])
+    assert removed == 1, f"removed {removed}, expected 1"
+    assert not cache_path(local, "a", "coronal_t1").exists(), "a stale entry of an unselected slot survived"
+    assert cache_path(local, "a", "coronal").exists(), "a selected entry was removed"
+    return "an unselected (study, slot) loses its old cache file, selected entries stay"
+
+
+def check_dataset_rejects_stale_cache(cfg: Config, tmp_dir) -> str:
+    """The dataset refuses a cache entry whose volume differs from the selection, or whose slot is empty."""
+    from .dataset import StudyBagDataset
+    from .preprocess import PreprocessedSeries, cache_path, preprocess_hash, write_cache_entry
+
+    local = cfg.copy()
+    local.paths.cache_dir = str(Path(tmp_dir) / "cache_stale")
+    local.paths.series_selection_csv = str(Path(tmp_dir) / "selection_stale.csv")
+    local.data.series_slots = ["sagittal", "coronal", "axial", "coronal_t1"]
+    local.data.laterality_canonical = False
+    pd.DataFrame(
+        {
+            STUDY_ID: ["s1"] * 4,
+            "slot": local.data.series_slots,
+            "volume_id": ["sag#g0", "cor#g0", pd.NA, "t1#g0"],
+            "selected": [True, True, False, True],
+        }
+    ).to_csv(local.paths.series_selection_csv, index=False)
+
+    def write(slot: str, volume_id: str) -> None:
+        image = np.random.default_rng(0).random((6, local.data.image_size, local.data.image_size)).astype(np.float32)
+        series = PreprocessedSeries(image, {"volume_id": volume_id, "prep_hash": preprocess_hash(local)})
+        write_cache_entry(cache_path(local, "s1", slot), series, str(local.data.cache_dtype))
+
+    for slot, volume in (("sagittal", "sag#g0"), ("coronal", "cor#g0"), ("coronal_t1", "t1#g0")):
+        write(slot, volume)
+    item = StudyBagDataset(local, ["s1"], None, train=False)[0]
+    assert item["series_present_mask"].tolist() == [True, True, False, True], item["series_present_mask"]
+
+    for slot, volume, what in (("coronal_t1", "other#g0", "another volume"), ("axial", "ax#g0", "an empty slot")):
+        write(slot, volume)
+        try:
+            StudyBagDataset(local, ["s1"], None, train=False)[0]
+        except ValueError as error:
+            assert "Stale cache entry" in str(error), error
+        else:
+            raise AssertionError(f"a cache entry holding {what} was read")
+        cache_path(local, "s1", slot).unlink()
+        if slot == "coronal_t1":
+            write(slot, "t1#g0")
+
+    def expect_refusal(ids: list[str], needle: str, what: str) -> None:
+        try:
+            StudyBagDataset(local, ids, None, train=False)
+        except ValueError as error:
+            assert needle in str(error), error
+        else:
+            raise AssertionError(f"{what} was accepted")
+
+    # A 3-slot selection under the 4-slot config: coronal_t1 must not silently become "missing".
+    three_slot = pd.read_csv(local.paths.series_selection_csv)
+    three_slot[three_slot["slot"] != "coronal_t1"].to_csv(local.paths.series_selection_csv, index=False)
+    cache_path(local, "s1", "coronal_t1").unlink()
+    expect_refusal(["s1"], "has no row", "a selection without the coronal_t1 slot")
+    three_slot.to_csv(local.paths.series_selection_csv, index=False)
+
+    # One selected series without a cache entry (a failed decode) is tolerated and counts as missing ...
+    item = StudyBagDataset(local, ["s1"], None, train=False)[0]
+    assert item["series_present_mask"].tolist() == [True, True, False, False], item["series_present_mask"]
+    # ... a cache never built for the selection is not.
+    more = pd.concat([three_slot.assign(**{STUDY_ID: f"s{i}"}) for i in (1, 2, 3)], ignore_index=True)
+    more.to_csv(local.paths.series_selection_csv, index=False)
+    expect_refusal(["s1", "s2", "s3"], "have no cache entry", "a selection whose cache was never built")
+    # Inference builds the cache itself just before and reports failures: it only warns.
+    item = StudyBagDataset(local, ["s1", "s2", "s3"], None, train=False, allow_unbuilt_cache=True)[1]
+    assert not item["series_present_mask"].any(), "an unbuilt study must read as all-missing"
+    return (
+        "another volume or a file for an empty slot stops the run; so does a selection without the run's slots "
+        "or an unbuilt cache; a single failed series counts as missing"
+    )
 
 
 class _SideAwareExpectedDataset(_InMemoryStudyBagDataset):
@@ -2707,7 +2871,9 @@ def check_new_backbone_pooling_options(cfg: Config) -> str:
 
         model = _backbone_model(cfg, backbone, seed=5, side_pooling=True, target_attention=True)
         n_zones = int(model.n_depth_zones)
-        assert model.head_in == (n_zones + 2 + 2) * 2 * channels + 3, f"{backbone}: head_in {model.head_in}"
+        slots = list(cfg.data.series_slots)  # sagittal slots split into depth zones, the others into 2 halves
+        parts = sum(n_zones if slot_plane(slot) == "sagittal" else 2 for slot in slots)
+        assert model.head_in == parts * 2 * channels + len(slots), f"{backbone}: head_in {model.head_in}"
         with torch.no_grad():
             triplets = batch["images"][0, 0, :2]
             global_avg, halves = model.encode_with_halves(triplets)
@@ -3237,6 +3403,9 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("laterality_rules", check_laterality_rules),
             ("laterality_derivation", check_laterality_derivation),
             ("laterality_dataset", lambda: check_laterality_dataset(small, tmp_dir)),
+            ("filtered_slot_selection", lambda: check_filtered_slot_selection(small, tmp_dir)),
+            ("unselected_cache_removed", lambda: check_unselected_cache_removed(small, tmp_dir)),
+            ("dataset_rejects_stale_cache", lambda: check_dataset_rejects_stale_cache(small, tmp_dir)),
             ("depth_zones", check_depth_zones),
             ("target_attention_masking", lambda: check_target_attention_masking(small)),
             ("ema_skipped_step", check_ema_skipped_step),

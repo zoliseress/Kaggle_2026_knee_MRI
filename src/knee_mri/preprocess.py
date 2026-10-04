@@ -352,22 +352,41 @@ def build_cache_entry(args: tuple[dict, dict]) -> dict:
     return result
 
 
+def remove_unselected_entries(cfg: Config, unselected: pd.DataFrame) -> int:
+    """Delete the cache files of (study, slot) rows with selected=False; returns how many existed."""
+    removed = 0
+    for study, slot in zip(unselected[STUDY_ID].astype(str), unselected["slot"].astype(str)):
+        path = cache_path(cfg, study, slot)
+        if path.exists():
+            path.unlink()
+            removed += 1
+    return removed
+
+
 def build_cache(
     cfg: Config,
     selection: pd.DataFrame,
     study_ids: Iterable[str] | None = None,
     workers: int | None = None,
 ) -> pd.DataFrame:
-    """Preprocess and cache every selected (study, slot) series."""
-    rows = selection[selection["selected"].fillna(False).astype(bool)].copy()
+    """Preprocess and cache every selected (study, slot) series.
+
+    A (study, slot) the selection leaves empty must not keep an entry from an earlier
+    selection: the dataset reads whatever file exists, so such an entry is deleted.
+    """
+    in_scope = selection
     if study_ids is not None:
-        wanted = set(study_ids)
-        rows = rows[rows[STUDY_ID].isin(wanted)]
+        in_scope = selection[selection[STUDY_ID].isin(set(study_ids))]
+    selected = in_scope["selected"].fillna(False).astype(bool)
+    rows = in_scope[selected].copy()
     if not len(rows):
         raise ValueError("Nothing to cache: the selection table has no selected series.")
 
     root = cache_root(cfg)
     root.mkdir(parents=True, exist_ok=True)
+    removed = remove_unselected_entries(cfg, in_scope[~selected])
+    if removed:
+        LOG.warning("Removed %d cache entries of (study, slot) pairs the selection now leaves empty", removed)
     atomic_write_json(root / "cache_meta.json", preprocess_signature(cfg))
     LOG.info("Building cache at %s for %d selected series", root, len(rows))
 

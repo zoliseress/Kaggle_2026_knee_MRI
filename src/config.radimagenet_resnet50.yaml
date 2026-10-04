@@ -31,6 +31,7 @@ paths:
   # frozen_reference_csv: "work/labels/frozen_reference.csv"
   frozen_reference_csv: "work/labels/frozen_reference_v3.csv"
   laterality_csv: null             # default: <work_dir>/manifest/laterality.csv
+  series_selection_csv: null       # default: <work_dir>/manifest/series_selection.csv; the dataset checks every cache entry against it
 
   work_dir: "work"
   cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
@@ -64,7 +65,7 @@ selection:
 data:
   image_size: 224
   fov_mm: 150.0
-  series_slots: ["sagittal", "coronal", "axial"]
+  series_slots: ["sagittal", "coronal", "axial"]  # optional extra slot: "coronal_t1" (non-FS T1, constants.SLOT_FILTERS)
   centers_per_series: 24
   adjacent_slices: 3
   crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)

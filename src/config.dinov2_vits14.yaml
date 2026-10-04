@@ -29,6 +29,7 @@ paths:
   # the current label table, which then moves with the label policy.
   frozen_reference_csv: "work/labels/frozen_reference.csv"
   laterality_csv: null             # default: <work_dir>/manifest/laterality.csv
+  series_selection_csv: null       # default: <work_dir>/manifest/series_selection.csv; the dataset checks every cache entry against it
 
   work_dir: "work"
   cache_dir: "I:/Kaggle/data/cache"  # null = <work_dir>/cache (moved from H: for disk space)
@@ -62,7 +63,7 @@ selection:
 data:
   image_size: 224                  # DINOv2: a multiple of 14 (224 -> 16x16 patches, 336 -> 24x24); 320/384 are refused
   fov_mm: 150.0
-  series_slots: ["sagittal", "coronal", "axial"]
+  series_slots: ["sagittal", "coronal", "axial"]  # optional extra slot: "coronal_t1" (non-FS T1, constants.SLOT_FILTERS)
   centers_per_series: 24
   adjacent_slices: 3
   crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)

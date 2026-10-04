@@ -33,6 +33,7 @@ different seed would - not a better or worse one.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -41,9 +42,10 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from .config import Config
-from .constants import N_TARGETS, NORMALIZATION_PROFILES
+from .constants import N_TARGETS, NORMALIZATION_PROFILES, STUDY_ID, slot_plane
 from .labels import LabelTable
 from .laterality import apply_canonical, canonical_ops, laterality_path, load_laterality
+from .manifest import load_selection, selection_path
 from .preprocess import cache_path, preprocess_hash, read_cache_entry
 from .utils import LOG
 
@@ -358,8 +360,22 @@ def resolve_item_key(key: int | tuple[int, int], default_epoch: int) -> tuple[in
     return int(key), int(default_epoch)
 
 
+# Selected series allowed to lack a cache entry (failed decodes, e.g. truncated DICOMs) before the
+# dataset refuses to start: more than this looks like a cache built for another selection.
+MAX_UNBUILT_ENTRIES = 2
+MAX_UNBUILT_FRACTION = 0.01
+
+
 class StudyBagDataset(Dataset):
-    """Study-level bags read from the deterministic preprocessing cache."""
+    """Study-level bags read from the deterministic preprocessing cache.
+
+    Every cache entry read is checked against the series selection (paths.series_selection_csv):
+    the file must hold the volume the selection names for that (study, slot), and a slot the
+    selection leaves empty must have no file. A stale cache fails loudly instead of feeding
+    another series than the selection says.
+    """
+
+    VERIFY_SELECTION = True  # the synthetic selftest datasets have no cache and no selection
 
     def __init__(
         self,
@@ -369,8 +385,12 @@ class StudyBagDataset(Dataset):
         train: bool,
         epoch: int = 0,
         strict_cache: bool = True,
+        allow_unbuilt_cache: bool = False,
     ) -> None:
+        """`allow_unbuilt_cache`: selected series without a cache entry only warn, however many -
+        for a caller that has just built the cache and reports its failures itself (inference)."""
         self.cfg = cfg
+        self.allow_unbuilt_cache = bool(allow_unbuilt_cache)
         self.study_ids = [str(s) for s in study_ids]
         self.slots = list(cfg.data.series_slots)
         self.n_centers = int(cfg.data.centers_per_series)
@@ -393,6 +413,10 @@ class StudyBagDataset(Dataset):
         self.mean = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
         self.std = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
         self.failures: dict[str, str] = {}
+        # (study, slot) -> the selected volume_id, None for a slot the selection leaves empty.
+        self.expected_volumes: dict[tuple[str, str], str | None] | None = None
+        if self.VERIFY_SELECTION and bool(cfg.data.get("verify_cache_selection", True)):
+            self.expected_volumes = self._expected_volumes(cfg)
         # data.laterality_canonical: mirror / reorder every study into one medial-lateral frame
         # (see laterality.py). Studies without a resolved side are used as they are.
         self.laterality: dict[str, tuple[str, float]] | None = None
@@ -430,6 +454,66 @@ class StudyBagDataset(Dataset):
     def _rng(self, index: int, slot_index: int, epoch: int) -> np.random.Generator:
         return np.random.default_rng([int(self.cfg.seed), epoch, index, slot_index])
 
+    def _expected_volumes(self, cfg: Config) -> dict[tuple[str, str], str | None]:
+        """(study, slot) -> selected volume_id (None: empty slot), after checking the table covers the run."""
+        path = selection_path(cfg)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Series selection not found: {path}. The cache is checked against it; copy the "
+                "series_selection.csv that the cache was built from, point paths.series_selection_csv "
+                "at it, or set data.verify_cache_selection=false to skip the check."
+            )
+        selection = load_selection(cfg, path)
+        selection = selection[selection[STUDY_ID].isin(set(self.study_ids)) & selection["slot"].isin(self.slots)]
+        selected = selection["selected"].astype(str).str.lower().isin(["true", "1"])
+        expected = {
+            (str(study), str(slot)): (str(volume) if is_selected else None)
+            for study, slot, volume, is_selected in zip(
+                selection[STUDY_ID], selection["slot"], selection["volume_id"], selected
+            )
+        }
+
+        # Every (study, slot) of this run needs a row: a selection made for other slots (e.g. a
+        # 3-slot table under a 4-slot config) would otherwise turn a whole slot into "missing".
+        uncovered = [(study, slot) for study in self.study_ids for slot in self.slots if (study, slot) not in expected]
+        if uncovered:
+            by_slot = dict(Counter(slot for _, slot in uncovered))
+            raise ValueError(
+                f"The series selection {path} has no row for {len(uncovered)} (study, slot) pairs of this run "
+                f"(per slot: {by_slot}; slots {self.slots}). It was made for other slots or studies: run "
+                "select-series and build-cache with this data.series_slots."
+            )
+
+        # A selected entry without a cache file is a failed series (a few truncated DICOMs) -
+        # or a cache that was never built for this selection, which must not pass as "missing".
+        selected_keys = [key for key, volume in expected.items() if volume is not None]
+        unbuilt = [key for key in selected_keys if not cache_path(cfg, *key).exists()]
+        too_many = len(unbuilt) > max(MAX_UNBUILT_ENTRIES, MAX_UNBUILT_FRACTION * len(selected_keys))
+        if too_many and not self.allow_unbuilt_cache:
+            by_slot = dict(Counter(slot for _, slot in unbuilt))
+            raise ValueError(
+                f"{len(unbuilt)} of {len(selected_keys)} selected series have no cache entry (per slot: {by_slot}). "
+                "Run build-cache for this selection."
+            )
+        if unbuilt:
+            LOG.warning("%d selected series have no cache entry and count as missing: %s", len(unbuilt), unbuilt[:5])
+        return expected
+
+    def _check_selected_volume(self, study: str, slot: str, meta: dict) -> None:
+        if self.expected_volumes is None:
+            return
+        expected, found = self.expected_volumes[(study, slot)], meta.get("volume_id")
+        if expected is None:
+            raise ValueError(
+                f"Stale cache entry {study}/{slot}: the series selection leaves this slot empty, but the "
+                f"cache holds {found}. Run build-cache, which removes such entries."
+            )
+        if found != expected:
+            raise ValueError(
+                f"Stale cache entry {study}/{slot}: holds volume {found}, the series selection names "
+                f"{expected}. Run build-cache to rebuild it."
+            )
+
     def _load_slot(self, study: str, slot: str) -> tuple[np.ndarray | None, dict]:
         path = cache_path(self.cfg, study, slot)
         if not path.exists():
@@ -440,6 +524,7 @@ class StudyBagDataset(Dataset):
             self.failures[f"{study}/{slot}"] = str(exc)
             LOG.warning("Cache read failed for %s/%s: %s", study, slot, exc)
             return None, {}
+        self._check_selected_volume(study, slot, meta)
         return image, meta
 
     def __getitem__(self, key: int | tuple[int, int]) -> dict[str, Any]:
@@ -469,7 +554,7 @@ class StudyBagDataset(Dataset):
             gap_ok = np.asarray(meta.get("gap_ok", []), dtype=bool) if meta.get("gap_ok") is not None else None
             if self.laterality is not None:
                 side, sagittal_normal_x = self.laterality[study]
-                reverse, flip = canonical_ops(side, slot, sagittal_normal_x)
+                reverse, flip = canonical_ops(side, slot_plane(slot), sagittal_normal_x)
                 image, gap_ok = apply_canonical(image, gap_ok, reverse, flip)
             rng = self._rng(index, p, epoch)
             centers, valid = bin_centers(image.shape[0], self.n_centers, rng if self.train else None)

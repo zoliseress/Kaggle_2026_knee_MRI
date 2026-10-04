@@ -23,6 +23,26 @@ N_TARGETS = len(TARGETS)
 # Canonical plane names used for the fixed-order series slots.
 PLANES = ["sagittal", "coronal", "axial"]
 
+# A slot is a plane ("coronal") or a plane plus a sequence filter ("coronal_t1"). A plain
+# plane slot takes the best-scoring volume of that plane; a filtered slot takes the best
+# volume of that plane that passes the filter and is not already used by the plane's own
+# slot (manifest.select_series). Filters:
+#   t1 - non fat-suppressed spin-echo T1: 0 < TR < 1000 ms, 0 < TE < 30 ms, no GR/IR in
+#        ScanningSequence, no inversion time; missing headers never pass.
+SLOT_FILTERS = ("t1",)
+
+
+def slot_plane(slot: str) -> str:
+    """The anatomical plane of a slot name: 'coronal_t1' -> 'coronal'."""
+    return str(slot).split("_", 1)[0]
+
+
+def slot_filter(slot: str) -> str | None:
+    """The sequence filter of a slot name: 'coronal_t1' -> 't1', 'coronal' -> None."""
+    parts = str(slot).split("_", 1)
+    return parts[1] if len(parts) == 2 else None
+
+
 STUDY_ID = "StudyInstanceUID"
 SERIES_ID = "SeriesInstanceUID"
 

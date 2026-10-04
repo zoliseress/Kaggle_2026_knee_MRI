@@ -9,6 +9,7 @@ transparent score and a stable tie-break.
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
-from .constants import MANIFEST_VERSION, SERIES_ID, STUDY_ID
+from .constants import MANIFEST_VERSION, SERIES_ID, STUDY_ID, slot_filter, slot_plane
 from .dicom_io import VolumeCandidate, build_volume_candidates, probe_decode
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
@@ -314,6 +315,43 @@ def _resolution_score(row_spacing: float, col_spacing: float) -> float:
     return float(np.clip((1.2 - spacing) / 0.9, 0.0, 1.0))
 
 
+# T1 weighting: short TR and short TE (spin echo). On the training data the coronal T1s have
+# TR 270-911 ms and TE 5.6-29.2 ms; PD/T2 have TR >= 1000 ms.
+T1_MAX_TR_MS = 1000.0
+T1_MAX_TE_MS = 30.0
+
+
+def _header_tokens(value) -> set[str]:
+    """Multi-valued DICOM strings as stored in the manifest ('SE', "['SE', 'IR']") -> {'SE', 'IR'}."""
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return set()
+    return set(re.findall(r"[A-Z0-9_]+", str(value).upper()))
+
+
+def passes_slot_filter(df: pd.DataFrame, slot_filter_name: str) -> pd.Series:
+    """Which scored candidates a filtered slot (constants.SLOT_FILTERS) may take.
+
+    Every condition must be positively established from the headers: a missing value
+    (TR, TE, ScanningSequence) never passes, so an unreadable header cannot sneak in.
+    """
+    def column(name: str) -> pd.Series:
+        return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
+
+    if slot_filter_name == "t1":
+        sequence = column("scanning_sequence").map(_header_tokens)
+        options = column("scan_options").map(_header_tokens)
+        tr = pd.to_numeric(column("repetition_time"), errors="coerce")
+        te = pd.to_numeric(column("echo_time"), errors="coerce")
+        ti = pd.to_numeric(column("inversion_time"), errors="coerce")
+        # Spin echo only: GR (also GR+SE hybrids), IR and research/unknown sequences are out.
+        spin_echo = sequence.map(lambda s: "SE" in s and not s & {"GR", "IR"})
+        short_tr_te = tr.between(0, T1_MAX_TR_MS, inclusive="neither") & te.between(0, T1_MAX_TE_MS, inclusive="neither")
+        inversion = ti > 0  # an inversion pulse without the IR token (STIR, FLAIR-like)
+        fat_suppressed = (df["fat_suppression"] > 0) | options.map(lambda s: "FS" in s)
+        return spin_echo & short_tr_te & ~inversion & ~fat_suppressed
+    raise ValueError(f"unknown slot filter {slot_filter_name!r}")
+
+
 NON_BLOCKING_PENALTY_FLAGS = {
     "irregular_spacing",
     "duplicate_positions",
@@ -388,70 +426,86 @@ def select_series(
     series_meta: pd.DataFrame | None = None,
     out_path: str | Path | None = None,
 ) -> pd.DataFrame:
-    """Choose at most one volume per (study, slot). Rules are frozen across train and val."""
+    """Choose at most one volume per (study, slot). Rules are frozen across train and val.
+
+    A plane slot ("coronal") takes the best-scoring volume of its plane. A filtered slot
+    ("coronal_t1") takes the best-scoring volume of its plane that passes the filter and is
+    not the volume already chosen for the plane slot, so the two slots never duplicate.
+    """
     slots = list(cfg.data.series_slots)
     scored = score_candidates(manifest, series_meta, cfg)
     usable = scored[scored["usable"].fillna(False).astype(bool) & ~scored["is_localizer"]]
+    filter_masks = {f: passes_slot_filter(usable, f) for f in {slot_filter(s) for s in slots} - {None}}
+    # Plane slots first: a filtered slot must know what its plane slot took.
+    resolution_order = sorted(slots, key=lambda s: slot_filter(s) is not None)
 
     rows: list[dict] = []
     all_studies = sorted(set(manifest[STUDY_ID].dropna().astype(str)))
     for study in all_studies:
         study_rows = usable[usable[STUDY_ID] == study]
-        for slot in slots:
-            candidates = study_rows[study_rows["plane"] == slot]
+        by_slot: dict[str, dict] = {}
+        for slot in resolution_order:
+            plane, filter_name = slot_plane(slot), slot_filter(slot)
+            candidates = study_rows[study_rows["plane"] == plane]
+            if filter_name is not None:
+                candidates = candidates[filter_masks[filter_name].loc[candidates.index]]
+                taken = by_slot.get(plane, {}).get("volume_id")
+                if taken is not None and not pd.isna(taken):
+                    candidates = candidates[candidates["volume_id"].astype(str) != str(taken)]
             n_candidates = int(len(candidates))
             if not n_candidates:
-                n_localizers = int(
-                    ((scored[STUDY_ID] == study) & (scored["plane"] == slot) & scored["is_localizer"]).sum()
-                )
-                n_unusable = int(
-                    ((scored[STUDY_ID] == study) & (scored["plane"] == slot) & ~scored["usable"].fillna(False)).sum()
-                )
-                rows.append(
-                    {
-                        STUDY_ID: study,
-                        "slot": slot,
-                        SERIES_ID: pd.NA,
-                        "volume_id": pd.NA,
-                        "selected": False,
-                        "score": np.nan,
-                        "n_candidates": 0,
-                        "reason": f"no usable candidate (localizers={n_localizers}, unusable={n_unusable})",
-                        "quality_flags": "",
-                        "n_slices": 0,
-                    }
-                )
+                if filter_name is not None:
+                    reason = f"no usable {filter_name} candidate besides the {plane} slot's volume"
+                else:
+                    n_localizers = int(
+                        ((scored[STUDY_ID] == study) & (scored["plane"] == plane) & scored["is_localizer"]).sum()
+                    )
+                    n_unusable = int(
+                        ((scored[STUDY_ID] == study) & (scored["plane"] == plane) & ~scored["usable"].fillna(False)).sum()
+                    )
+                    reason = f"no usable candidate (localizers={n_localizers}, unusable={n_unusable})"
+                by_slot[slot] = {
+                    STUDY_ID: study,
+                    "slot": slot,
+                    SERIES_ID: pd.NA,
+                    "volume_id": pd.NA,
+                    "selected": False,
+                    "score": np.nan,
+                    "n_candidates": 0,
+                    "reason": reason,
+                    "quality_flags": "",
+                    "n_slices": 0,
+                }
                 continue
             # Stable deterministic ranking: score desc, then lexicographic ids.
             ranked = candidates.sort_values(
                 ["score", SERIES_ID, "volume_key"], ascending=[False, True, True], kind="stable"
             )
             best = ranked.iloc[0]
-            rows.append(
-                {
-                    STUDY_ID: study,
-                    "slot": slot,
-                    SERIES_ID: str(best[SERIES_ID]),
-                    "volume_id": str(best["volume_id"]),
-                    "volume_key": str(best["volume_key"]),
-                    "selected": True,
-                    "score": float(best["score"]),
-                    "runner_up_score": float(ranked.iloc[1]["score"]) if len(ranked) > 1 else np.nan,
-                    "n_candidates": n_candidates,
-                    "reason": (
-                        f"fluid_sensitive={best['fluid_sensitive']:.0f} te={best['echo_time']} "
-                        f"slices={best['n_slices']} res={best['row_spacing_mm']:.2f}x{best['col_spacing_mm']:.2f}mm "
-                        f"plane_angle={best['plane_angle_deg']:.1f}deg penalties={best['n_penalty_flags']}"
-                    ),
-                    "series_description": best["series_description"],
-                    "quality_flags": best["quality_flags"],
-                    "n_slices": int(best["n_slices"]),
-                    "path": best["path"],
-                }
-            )
+            by_slot[slot] = {
+                STUDY_ID: study,
+                "slot": slot,
+                SERIES_ID: str(best[SERIES_ID]),
+                "volume_id": str(best["volume_id"]),
+                "volume_key": str(best["volume_key"]),
+                "selected": True,
+                "score": float(best["score"]),
+                "runner_up_score": float(ranked.iloc[1]["score"]) if len(ranked) > 1 else np.nan,
+                "n_candidates": n_candidates,
+                "reason": (
+                    f"fluid_sensitive={best['fluid_sensitive']:.0f} te={best['echo_time']} "
+                    f"slices={best['n_slices']} res={best['row_spacing_mm']:.2f}x{best['col_spacing_mm']:.2f}mm "
+                    f"plane_angle={best['plane_angle_deg']:.1f}deg penalties={best['n_penalty_flags']}"
+                ),
+                "series_description": best["series_description"],
+                "quality_flags": best["quality_flags"],
+                "n_slices": int(best["n_slices"]),
+                "path": best["path"],
+            }
+        rows.extend(by_slot[slot] for slot in slots)
 
     selection = pd.DataFrame(rows)
-    out_path = Path(out_path) if out_path else Path(cfg.paths.work_dir) / "manifest" / "series_selection.csv"
+    out_path = Path(out_path) if out_path else selection_path(cfg)
     atomic_write_dataframe(selection, out_path)
 
     present = selection[selection["selected"]]
@@ -467,8 +521,13 @@ def select_series(
     return selection
 
 
+def selection_path(cfg: Config) -> Path:
+    configured = cfg.paths.get("series_selection_csv")
+    return Path(configured) if configured else Path(cfg.paths.work_dir) / "manifest" / "series_selection.csv"
+
+
 def load_selection(cfg: Config, path: str | Path | None = None) -> pd.DataFrame:
-    path = Path(path) if path else Path(cfg.paths.work_dir) / "manifest" / "series_selection.csv"
+    path = Path(path) if path else selection_path(cfg)
     if not path.exists():
         raise FileNotFoundError(f"Series selection not found: {path}. Run `build-manifest` first.")
     return pd.read_csv(path, dtype={STUDY_ID: "string", SERIES_ID: "string", "volume_id": "string"})
