@@ -16,11 +16,24 @@
 #  A --gpu N (vagy --gpu=N) barhol allhat; CUDA_VISIBLE_DEVICES=N-t allit,
 #  igy a python oldalon a kivalasztott GPU lesz a cuda:0.
 #
+#  Folytatas: --resume <run-group> (vagy --resume=<run-group>, barhol allhat)
+#     ./run_cv.sh --gpu 3 --resume V2S_E3_img320_train_v3_cv3_20261001_111938 --set ...
+#  Egy megszakadt run-groupot visz tovabb ugyanazzal a nevvel. Foldonkent:
+#     run_summary.json van  -> kesz, kihagyja
+#     csak last.pt van      -> onnan folytatja (train.resume, epochhatarrol)
+#     egyik sincs           -> elolrol inditja
+#  majd ujra osszefesuli az OOF-ot. Run-group elotag mellette nem adhato meg.
+#  Az extra argumentumok ugyanazok legyenek, mint az eredeti inditasnal: a
+#  folytatott foldnal ezt a resume-ellenorzes ki is kenyszeriti, egy elolrol
+#  indulo foldnal nem.
+#
 #  Kornyezeti valtozokkal felulirhato:
 #     CONFIG     (alap: src/config.linux.yaml)
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
 #     GPU        (alap: ures = nem nyul a CUDA_VISIBLE_DEVICES-hez;
 #                 a --gpu kapcsolo felulirja)
+#
+#  Kimenet: work/runs/<train_csv stem>/ (pl. work/runs/train_v3/).
 #
 #  Elofeltetel: a work/splits/splits.csv mar letezik es ugyanazzal az
 #  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
@@ -34,11 +47,25 @@ CONDA_ENV="${CONDA_ENV-kaggle_2026}"
 CONFIG="${CONFIG:-$ROOT/src/config.linux.yaml}"
 
 GPU="${GPU-}"
+RESUME=""
 
-# --gpu N / --gpu=N kiszedese (barhol allhat), a tobbi argumentum marad
+# --gpu N / --gpu=N es --resume G / --resume=G kiszedese (barhol allhat),
+# a tobbi argumentum marad
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --resume)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "[HIBA] A --resume utan meg kell adni a run-group nevet."
+                exit 1
+            fi
+            RESUME="$2"
+            shift 2
+            ;;
+        --resume=*)
+            RESUME="${1#--resume=}"
+            shift
+            ;;
         --gpu)
             if [[ $# -lt 2 ]]; then
                 echo "[HIBA] A --gpu utan meg kell adni a GPU id-t."
@@ -61,6 +88,10 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 PREFIX=""
 if [[ $# -gt 0 && "$1" != -* ]]; then
+    if [[ -n "$RESUME" ]]; then
+        echo "[HIBA] --resume mellett nem adhato run-group elotag ($1); a nev a --resume-bol jon."
+        exit 1
+    fi
     PREFIX="${1}_"
     shift
 fi
@@ -92,8 +123,25 @@ if [[ ! -f "$CONFIG" ]]; then
     exit 1
 fi
 
+# A runok a tanito CSV szerinti almappaba kerulnek: work/runs/<train_csv stem>/
+if ! OUT="$(python -m knee_mri.cli output-dir --config "$CONFIG" "${EXTRA[@]}")"; then
+    echo "$OUT"
+    echo "[HIBA] Nem sikerult meghatarozni a kimeneti mappat (output-dir)."
+    exit 1
+fi
+RUNS_DIR="$(printf '%s\n' "$OUT" | tail -n 1)"
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
-GROUP="${PREFIX}cv${NFOLDS}_${STAMP}"
+if [[ -n "$RESUME" ]]; then
+    GROUP="$RESUME"
+    if [[ ! -d "$RUNS_DIR/${GROUP}_fold0" ]]; then
+        echo "[HIBA] --resume: nincs ilyen run-group: $RUNS_DIR/${GROUP}_fold0"
+        echo "       Ellenorizd a nevet, es hogy a CONFIG / train_csv ugyanaz-e, mint az eredeti inditasnal."
+        exit 1
+    fi
+else
+    GROUP="${PREFIX}cv${NFOLDS}_${STAMP}"
+fi
 LAST=$((NFOLDS - 1))
 
 fail() {
@@ -106,25 +154,41 @@ fail() {
 
 echo "======================================================================"
 echo " Run group  : $GROUP"
+if [[ -n "$RESUME" ]]; then
+    echo " Mod        : folytatas (kesz fold kihagyva, last.pt-bol folytatva)"
+fi
 echo " Foldok     : 0 .. $LAST"
 echo " Config     : $CONFIG"
 echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
 echo " Extra args : ${EXTRA[*]:-}"
-echo " Kimenet    : $ROOT/work/runs/${GROUP}_fold<N>"
+echo " Kimenet    : $RUNS_DIR/${GROUP}_fold<N>"
 echo "======================================================================"
 
 # --- foldok egymas utan ---------------------------------------------
 for ((F = 0; F <= LAST; F++)); do
     NAME="${GROUP}_fold${F}"
+    RUN="$RUNS_DIR/$NAME"
+    START=()
     echo
     echo "----------------------------------------------------------------"
     echo " FOLD $F / $LAST   ($NAME)   start: $(date '+%F %T')"
     echo "----------------------------------------------------------------"
+    if [[ -n "$RESUME" ]]; then
+        if [[ -f "$RUN/run_summary.json" ]]; then
+            echo " FOLD $F mar kesz (run_summary.json), kihagyom."
+            continue
+        fi
+        if [[ -f "$RUN/last.pt" ]]; then
+            echo " Folytatas: $RUN/last.pt"
+            START=(--set "train.resume=$RUN/last.pt")
+        fi
+    fi
     if ! python "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
-            --set "split.fold=$F" --name "$NAME" "${EXTRA[@]}"; then
+            --set "split.fold=$F" --name "$NAME" "${EXTRA[@]}" "${START[@]+"${START[@]}"}"; then
         echo
         echo "[HIBA] A $F. fold hibaval leallt. A script nem folytatja."
-        echo "       Log: $ROOT/work/runs/$NAME/run.log"
+        echo "       Log: $RUN/run.log"
+        echo "       Folytatas: ./run_cv.sh --resume $GROUP <ugyanazok az extra argumentumok>"
         fail
     fi
     echo " FOLD $F kesz.  vege: $(date '+%F %T')"
@@ -137,11 +201,11 @@ echo " OOF merge"
 echo "----------------------------------------------------------------"
 # A merge-oof a --out melle FIX neven irja az oof_metrics_per_class.csv-t
 # es az oof_summary.json-t, ezert minden run-group sajat alkonyvtarba kerul.
-OOFDIR="$ROOT/work/runs/${GROUP}_oof"
+OOFDIR="$RUNS_DIR/${GROUP}_oof"
 mkdir -p "$OOFDIR"
 PREDS=()
 for ((F = 0; F <= LAST; F++)); do
-    PREDS+=("$ROOT/work/runs/${GROUP}_fold${F}/validation_predictions.csv")
+    PREDS+=("$RUNS_DIR/${GROUP}_fold${F}/validation_predictions.csv")
 done
 if ! python -m knee_mri.cli merge-oof --config "$CONFIG" "${PREDS[@]}" \
         --out "$OOFDIR/oof_predictions.csv"; then

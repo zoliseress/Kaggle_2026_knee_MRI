@@ -8,9 +8,19 @@ REM  Hasznalat:
 REM     run_cv.bat
 REM     run_cv.bat --set data.image_size=288 --set train.max_epochs=10
 REM     run_cv.bat V2soft_img320 --set data.image_size=320
+REM     run_cv.bat --resume V2soft_img320_cv3_20260924_232150 --set data.image_size=320
 REM  Minden ide irt extra argumentum MINDHAROM foldra ervenyes.
 REM  Ha az elso argumentum nem "-"-vel kezdodik, az a run-group elotagja:
 REM     V2soft_img320_cv3_<idobelyeg>_fold<N>, ..._oof
+REM
+REM  Folytatas (--resume <run-group>, csak elso argumentumkent): egy megszakadt
+REM  run-groupot visz tovabb ugyanazzal a nevvel. Foldonkent:
+REM     run_summary.json van  -> kesz, kihagyja
+REM     csak last.pt van      -> onnan folytatja (train.resume, epochhatarrol)
+REM     egyik sincs           -> elolrol inditja
+REM  majd ujra osszefesuli az OOF-ot. Az extra argumentumok (a --config is)
+REM  ugyanazok legyenek, mint az eredeti inditasnal: a folytatott foldnal ezt
+REM  a resume-ellenorzes ki is kenyszeriti, egy elolrol indulo foldnal nem.
 REM
 REM  Elofeltetel: a work\splits\splits.csv mar letezik es ugyanazzal az
 REM  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
@@ -23,11 +33,25 @@ set "CONDA_ROOT=%LOCALAPPDATA%\miniconda3"
 
 set "EXTRA=%*"
 set "PREFIX="
+set "RESUME="
 set "FIRST=%~1"
+REM A %1, %2 ... a "="-nel is darabol, ezert az EXTRA a %*-bol, levagassal keszul.
+if /i "%~1"=="--resume" goto :parse_resume
 if defined FIRST if not "!FIRST:~0,1!"=="-" (
     set "PREFIX=!FIRST!_"
     set "EXTRA=!EXTRA:*%1=!"
 )
+goto :parsed
+
+:parse_resume
+if "%~2"=="" (
+    echo [HIBA] A --resume utan meg kell adni a run-group nevet, pl. R50_E3_cv3_20261001_110141
+    exit /b 1
+)
+set "RESUME=%~2"
+set "EXTRA=!EXTRA:*%~2=!"
+
+:parsed
 cd /d "%ROOT%"
 set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
 
@@ -44,31 +68,68 @@ if exist "%CONDA_ROOT%\Scripts\activate.bat" (
 )
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%i"
-set "GROUP=%PREFIX%cv%NFOLDS%_%STAMP%"
+if defined RESUME (
+    set "GROUP=%RESUME%"
+) else (
+    set "GROUP=%PREFIX%cv%NFOLDS%_%STAMP%"
+)
 set /a LAST=%NFOLDS%-1
+
+REM --- kimeneti mappa: work\runs\<train_csv stem>\ ---------------------
+REM Az utolso kiirt sor az utvonal (a config figyelmeztetesei is stdout-ra mennek).
+set "RUNS_DIR_FILE=%TEMP%\knee_mri_runs_dir_%STAMP%.txt"
+python -m knee_mri.cli output-dir %EXTRA% > "%RUNS_DIR_FILE%"
+if errorlevel 1 (
+    type "%RUNS_DIR_FILE%"
+    del "%RUNS_DIR_FILE%" >nul 2>&1
+    echo [HIBA] Nem sikerult meghatarozni a kimeneti mappat ^(output-dir^).
+    goto :fail
+)
+for /f "usebackq delims=" %%i in ("%RUNS_DIR_FILE%") do set "RUNS_DIR=%%i"
+del "%RUNS_DIR_FILE%" >nul 2>&1
+
+if defined RESUME if not exist "%RUNS_DIR%\%GROUP%_fold0" (
+    echo [HIBA] --resume: nincs ilyen run-group: %RUNS_DIR%\%GROUP%_fold0
+    echo        Ellenorizd a nevet, es hogy a --config / train_csv ugyanaz-e, mint az eredeti inditasnal.
+    goto :fail
+)
 
 echo ======================================================================
 echo  Run group  : %GROUP%
+if defined RESUME echo  Mod        : folytatas ^(kesz fold kihagyva, last.pt-bol folytatva^)
 echo  Foldok     : 0 .. %LAST%
 echo  Extra args : %EXTRA%
-echo  Kimenet    : %ROOT%work\runs\%GROUP%_fold^<N^>
+echo  Kimenet    : %RUNS_DIR%\%GROUP%_fold^<N^>
 echo ======================================================================
 
 REM --- foldok egymas utan ---------------------------------------------
 for /l %%F in (0,1,%LAST%) do (
     set "NAME=%GROUP%_fold%%F"
+    set "RUN=%RUNS_DIR%\%GROUP%_fold%%F"
+    set "SKIP="
+    set "START="
+    if defined RESUME (
+        if exist "!RUN!\run_summary.json" set "SKIP=1"
+        if not defined SKIP if exist "!RUN!\last.pt" set "START=--set "train.resume=!RUN!\last.pt""
+    )
     echo.
     echo ----------------------------------------------------------------
     echo  FOLD %%F / %LAST%   ^(!NAME!^)   start: !DATE! !TIME!
     echo ----------------------------------------------------------------
-    python "%ROOT%src\train.py" --mode fold --set split.fold=%%F --name "!NAME!" %EXTRA%
-    if errorlevel 1 (
-        echo.
-        echo [HIBA] A %%F. fold hibaval leallt. A script nem folytatja.
-        echo        Log: %ROOT%work\runs\!NAME!\run.log
-        goto :fail
+    if defined SKIP (
+        echo  FOLD %%F mar kesz ^(run_summary.json^), kihagyom.
+    ) else (
+        if defined START echo  Folytatas: !RUN!\last.pt
+        python "%ROOT%src\train.py" --mode fold --set split.fold=%%F --name "!NAME!" %EXTRA% !START!
+        if errorlevel 1 (
+            echo.
+            echo [HIBA] A %%F. fold hibaval leallt. A script nem folytatja.
+            echo        Log: %RUNS_DIR%\!NAME!\run.log
+            echo        Folytatas: run_cv.bat --resume %GROUP% ^<ugyanazok az extra argumentumok^>
+            goto :fail
+        )
+        echo  FOLD %%F kesz.  vege: !DATE! !TIME!
     )
-    echo  FOLD %%F kesz.  vege: !DATE! !TIME!
 )
 
 REM --- OOF merge -------------------------------------------------------
@@ -78,10 +139,10 @@ echo  OOF merge
 echo ----------------------------------------------------------------
 REM A merge-oof a --out melle FIX neven irja az oof_metrics_per_class.csv-t
 REM es az oof_summary.json-t, ezert minden run-group sajat alkonyvtarba kerul.
-set "OOFDIR=%ROOT%work\runs\%GROUP%_oof"
+set "OOFDIR=%RUNS_DIR%\%GROUP%_oof"
 if not exist "%OOFDIR%" mkdir "%OOFDIR%"
 set PREDS=
-for /l %%F in (0,1,%LAST%) do set PREDS=!PREDS! "%ROOT%work\runs\%GROUP%_fold%%F\validation_predictions.csv"
+for /l %%F in (0,1,%LAST%) do set PREDS=!PREDS! "%RUNS_DIR%\%GROUP%_fold%%F\validation_predictions.csv"
 python -m knee_mri.cli merge-oof %PREDS% --out "%OOFDIR%\oof_predictions.csv"
 if errorlevel 1 (
     echo [FIGYELEM] Az OOF merge nem sikerult, de mindharom fold lefutott.
@@ -91,7 +152,7 @@ if errorlevel 1 (
 echo.
 echo ======================================================================
 echo  KESZ. Mind a %NFOLDS% fold lefutott: %GROUP%
-echo  OOF        : %ROOT%work\runs\%GROUP%_oof
+echo  OOF        : %RUNS_DIR%\%GROUP%_oof
 echo ======================================================================
 call :maybe_pause
 endlocal

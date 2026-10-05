@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -40,6 +41,8 @@ BACKBONE_WEIGHT_NAMES = {
     "dinov2_vits14": ("lvd142m",),
 }
 _LOG = logging.getLogger("knee_mri")
+
+_OVERRIDE_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "src" / "config.yaml"
@@ -327,7 +330,14 @@ def load_config(
         if "=" not in item:
             raise ValueError(f"Override must look like key.subkey=value, got: {item!r}")
         key, raw = item.split("=", 1)
-        cfg.set_dotted(key.strip(), _parse_scalar(raw.strip()))
+        key = key.strip()
+        # A malformed key would silently create an unused entry and leave the real setting alone -
+        # e.g. 'data.series_slots=[...]' typed in cmd.exe, which passes the single quotes through.
+        if not _OVERRIDE_KEY.fullmatch(key):
+            raise ValueError(f"Override key {key!r} is not a dotted identifier (stray quotes?): {item!r}")
+        if key.split(".", 1)[0] not in cfg:
+            raise ValueError(f"Override key {key!r}: unknown section {key.split('.', 1)[0]!r}; known: {sorted(cfg)}")
+        cfg.set_dotted(key, _parse_scalar(raw.strip()))
 
     cfg["_config_path"] = str(config_path)
     if resolve:

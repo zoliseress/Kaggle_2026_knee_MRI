@@ -2056,6 +2056,19 @@ def check_laterality_derivation() -> str:
     return "tag wins, geometry fills in, |x| < offset stays unresolved, sagittal normal from the selected volume"
 
 
+def check_override_keys() -> str:
+    """A malformed --set key (stray quotes, typo in the section) is refused, not silently added."""
+    for bad in ("'data.series_slots=[sagittal,coronal]'", "dat.image_size=320", "data..image_size=320"):
+        try:
+            load_config(overrides=[bad], resolve=False)
+        except ValueError:
+            continue
+        raise AssertionError(f"override {bad!r} was accepted")
+    cfg = load_config(overrides=["data.series_slots=[sagittal,coronal,axial,coronal_t1]"], resolve=False)
+    assert list(cfg.data.series_slots) == ["sagittal", "coronal", "axial", "coronal_t1"]
+    return "stray quotes and unknown sections are refused; a valid list override applies"
+
+
 def check_filtered_slot_selection(cfg: Config, tmp_dir) -> str:
     """coronal_t1 takes a non-FS T1 that the coronal slot did not take; plane slots are unchanged."""
     from .manifest import select_series
@@ -3403,6 +3416,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("laterality_rules", check_laterality_rules),
             ("laterality_derivation", check_laterality_derivation),
             ("laterality_dataset", lambda: check_laterality_dataset(small, tmp_dir)),
+            ("override_keys", check_override_keys),
             ("filtered_slot_selection", lambda: check_filtered_slot_selection(small, tmp_dir)),
             ("unselected_cache_removed", lambda: check_unselected_cache_removed(small, tmp_dir)),
             ("dataset_rejects_stale_cache", lambda: check_dataset_rejects_stale_cache(small, tmp_dir)),

@@ -123,6 +123,14 @@ if [[ ! -f "$FROZEN_REF" ]]; then
     fi
 fi
 
+# A run a tanito CSV szerinti almappaba kerul: work/runs/<train_csv stem>/
+if ! OUT="$(python -m knee_mri.cli output-dir --config "$CONFIG" "${PATHS[@]}" "${EXTRA[@]}")"; then
+    echo "$OUT"
+    echo "[HIBA] Nem sikerult meghatarozni a kimeneti mappat (output-dir)."
+    exit 1
+fi
+RUNS_DIR="$(printf '%s\n' "$OUT" | tail -n 1)"
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
 NAME="${PREFIX}holdout158_${STAMP}"
 
@@ -133,13 +141,13 @@ echo " Validacio  : $VAL_CSV"
 echo " Config     : $CONFIG"
 echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
 echo " Extra args : ${EXTRA[*]:-}"
-echo " Kimenet    : $ROOT/work/runs/$NAME"
+echo " Kimenet    : $RUNS_DIR/$NAME"
 echo "======================================================================"
 
 if ! python "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
         --set "split.fold=0" "${PATHS[@]}" --name "$NAME" "${EXTRA[@]}"; then
     echo
-    echo "[HIBA] A tanitas hibaval leallt. Log: $ROOT/work/runs/$NAME/run.log"
+    echo "[HIBA] A tanitas hibaval leallt. Log: $RUNS_DIR/$NAME/run.log"
     exit 1
 fi
 

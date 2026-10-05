@@ -84,18 +84,31 @@ if not exist "%FROZEN_REF%" (
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%i"
 set "NAME=%PREFIX%holdout158_%STAMP%"
 
+REM --- kimeneti mappa: work\runs\<train_csv stem>\ ---------------------
+REM Az utolso kiirt sor az utvonal (a config figyelmeztetesei is stdout-ra mennek).
+set "RUNS_DIR_FILE=%TEMP%\knee_mri_runs_dir_%STAMP%.txt"
+python -m knee_mri.cli output-dir %PATHS% %EXTRA% > "%RUNS_DIR_FILE%"
+if errorlevel 1 (
+    type "%RUNS_DIR_FILE%"
+    del "%RUNS_DIR_FILE%" >nul 2>&1
+    echo [HIBA] Nem sikerult meghatarozni a kimeneti mappat ^(output-dir^).
+    goto :fail
+)
+for /f "usebackq delims=" %%i in ("%RUNS_DIR_FILE%") do set "RUNS_DIR=%%i"
+del "%RUNS_DIR_FILE%" >nul 2>&1
+
 echo ======================================================================
 echo  Run        : %NAME%
 echo  Tanitas    : %TRAIN_CSV%
 echo  Validacio  : %VAL_CSV%
 echo  Extra args : %EXTRA%
-echo  Kimenet    : %ROOT%work\runs\%NAME%
+echo  Kimenet    : %RUNS_DIR%\%NAME%
 echo ======================================================================
 
 python "%ROOT%src\train.py" --mode fold --set split.fold=0 %PATHS% --name "%NAME%" %EXTRA%
 if errorlevel 1 (
     echo.
-    echo [HIBA] A tanitas hibaval leallt. Log: %ROOT%work\runs\%NAME%\run.log
+    echo [HIBA] A tanitas hibaval leallt. Log: %RUNS_DIR%\%NAME%\run.log
     goto :fail
 )
 
