@@ -22,12 +22,24 @@ REM  majd ujra osszefesuli az OOF-ot. Az extra argumentumok (a --config is)
 REM  ugyanazok legyenek, mint az eredeti inditasnal: a folytatott foldnal ezt
 REM  a resume-ellenorzes ki is kenyszeriti, egy elolrol indulo foldnal nem.
 REM
-REM  Elofeltetel: a work\splits\splits.csv mar letezik es ugyanazzal az
-REM  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
+REM  Kornyezeti valtozokkal felulirhato:
+REM     NFOLDS     (alap: 3)
+REM     TRAIN_CSV  (alap: a config paths.train_csv-je)
+REM     SPLITS     (alap: work\splits\cv<NFOLDS>_<train_csv stem>\splits.csv)
+REM  Ha a SPLITS meg nincs meg, a script legyartja (make-splits a TRAIN_CSV
+REM  studyjaibol, NFOLDS folddal), majd minden inditasnal ellenorzi
+REM  (check-splits): a fold-szam, a TRAIN_CSV es a kizarasi lista
+REM  (paths.exclude_from_training_csv, alap: a ref208) egyezzen.
+REM  Teacher CV (3 fold = alap, ref208 nelkul, a train_v8.csv-bol):
+REM     run_cv.bat B0_teacher --set data.image_size=320
+REM  Regi, 4407 studys work\splits\splits.csv-vel indult run-group folytatasa
+REM  (a ref208 abban tanitott, ezert a kizarast is ki kell kapcsolni):
+REM     set SPLITS=%~dp0work\splits\splits.csv
+REM     run_cv.bat --resume ... --set paths.exclude_from_training_csv=
 REM ======================================================================
 
 set "ROOT=%~dp0"
-set "NFOLDS=3"
+if not defined NFOLDS set "NFOLDS=3"
 set "CONDA_ENV=kaggle_2026"
 set "CONDA_ROOT=%LOCALAPPDATA%\miniconda3"
 
@@ -52,6 +64,8 @@ set "RESUME=%~2"
 set "EXTRA=!EXTRA:*%~2=!"
 
 :parsed
+REM A TRAIN_CSV a tobbi argumentum ele kerul, igy egy kezzel irt --set paths.train_csv felulirja.
+if defined TRAIN_CSV set EXTRA=--set "paths.train_csv=%TRAIN_CSV%" !EXTRA!
 cd /d "%ROOT%"
 set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
 
@@ -86,7 +100,39 @@ if errorlevel 1 (
     goto :fail
 )
 for /f "usebackq delims=" %%i in ("%RUNS_DIR_FILE%") do set "RUNS_DIR=%%i"
+python -m knee_mri.cli output-dir --train-csv %EXTRA% > "%RUNS_DIR_FILE%"
+if errorlevel 1 (
+    type "%RUNS_DIR_FILE%"
+    del "%RUNS_DIR_FILE%" >nul 2>&1
+    echo [HIBA] Nem sikerult meghatarozni a tanito CSV-t ^(output-dir --train-csv^).
+    goto :fail
+)
+for /f "usebackq delims=" %%i in ("%RUNS_DIR_FILE%") do set "TRAIN_CSV_RESOLVED=%%i"
 del "%RUNS_DIR_FILE%" >nul 2>&1
+for %%i in ("%TRAIN_CSV_RESOLVED%") do set "TRAIN_STEM=%%~ni"
+
+REM --- CV split: legyartas (ha nincs) es ellenorzes --------------------
+if not defined SPLITS set "SPLITS=%ROOT%work\splits\cv%NFOLDS%_%TRAIN_STEM%\splits.csv"
+set EXTRA=--set "paths.splits_csv=%SPLITS%" !EXTRA!
+if not exist "%SPLITS%" (
+    if defined RESUME (
+        echo [HIBA] --resume, de nincs meg a split: %SPLITS%
+        echo        A folytatashoz ugyanaz a split kell, mint az eredeti inditasnal ^(SPLITS^).
+        goto :fail
+    )
+    echo [INFO] CV split keszitese: %SPLITS%  ^(%NFOLDS% fold, %TRAIN_CSV_RESOLVED%^)
+    python -m knee_mri.cli make-splits %EXTRA% --set split.n_folds=%NFOLDS%
+    if errorlevel 1 (
+        echo [HIBA] A make-splits nem sikerult.
+        goto :fail
+    )
+)
+python -m knee_mri.cli check-splits %EXTRA% --n-folds %NFOLDS%
+if errorlevel 1 (
+    echo [HIBA] A split nem illik a futashoz: %SPLITS%
+    echo        Ellenorizd az NFOLDS, TRAIN_CSV, SPLITS kornyezeti valtozokat.
+    goto :fail
+)
 
 if defined RESUME if not exist "%RUNS_DIR%\%GROUP%_fold0" (
     echo [HIBA] --resume: nincs ilyen run-group: %RUNS_DIR%\%GROUP%_fold0
@@ -98,6 +144,8 @@ echo ======================================================================
 echo  Run group  : %GROUP%
 if defined RESUME echo  Mod        : folytatas ^(kesz fold kihagyva, last.pt-bol folytatva^)
 echo  Foldok     : 0 .. %LAST%
+echo  Train CSV  : %TRAIN_CSV_RESOLVED%
+echo  Split      : %SPLITS%
 echo  Extra args : %EXTRA%
 echo  Kimenet    : %RUNS_DIR%\%GROUP%_fold^<N^>
 echo ======================================================================
@@ -143,7 +191,7 @@ set "OOFDIR=%RUNS_DIR%\%GROUP%_oof"
 if not exist "%OOFDIR%" mkdir "%OOFDIR%"
 set PREDS=
 for /l %%F in (0,1,%LAST%) do set PREDS=!PREDS! "%RUNS_DIR%\%GROUP%_fold%%F\validation_predictions.csv"
-python -m knee_mri.cli merge-oof %PREDS% --out "%OOFDIR%\oof_predictions.csv"
+python -m knee_mri.cli merge-oof %PREDS% --out "%OOFDIR%\oof_predictions.csv" %EXTRA%
 if errorlevel 1 (
     echo [FIGYELEM] Az OOF merge nem sikerult, de mindharom fold lefutott.
     echo            A per-fold eredmenyek megvannak a run mappakban.

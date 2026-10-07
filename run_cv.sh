@@ -32,17 +32,27 @@
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
 #     GPU        (alap: ures = nem nyul a CUDA_VISIBLE_DEVICES-hez;
 #                 a --gpu kapcsolo felulirja)
+#     NFOLDS     (alap: 3)
+#     TRAIN_CSV  (alap: a config paths.train_csv-je)
+#     SPLITS     (alap: work/splits/cv<NFOLDS>_<train_csv stem>/splits.csv)
 #
 #  Kimenet: work/runs/<train_csv stem>/ (pl. work/runs/train_v3/).
 #
-#  Elofeltetel: a work/splits/splits.csv mar letezik es ugyanazzal az
-#  n_folds ertekkel keszult (make-splits), mint amennyit itt futtatunk.
+#  Ha a SPLITS meg nincs meg, a script legyartja (make-splits a TRAIN_CSV
+#  studyjaibol, NFOLDS folddal), majd minden inditasnal ellenorzi
+#  (check-splits): a fold-szam, a TRAIN_CSV es a kizarasi lista
+#  (paths.exclude_from_training_csv, alap: a ref208) egyezzen.
+#  Teacher CV (3 fold = alap, ref208 nelkul, a train_v8.csv-bol):
+#     ./run_cv.sh --gpu 0 B0_teacher --set data.image_size=320
+#  Regi, 4407 studys work/splits/splits.csv-vel indult run-group folytatasa
+#  (a ref208 abban tanitott, ezert a kizarast is ki kell kapcsolni):
+#     SPLITS=work/splits/splits.csv ./run_cv.sh --resume ... --set paths.exclude_from_training_csv=
 # ======================================================================
 
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NFOLDS=3
+NFOLDS="${NFOLDS:-3}"
 CONDA_ENV="${CONDA_ENV-kaggle_2026}"
 CONFIG="${CONFIG:-$ROOT/src/config.linux.yaml}"
 
@@ -96,6 +106,10 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
     shift
 fi
 EXTRA=("$@")
+# A TRAIN_CSV a tobbi argumentum ele kerul, igy egy kezzel irt --set paths.train_csv felulirja.
+if [[ -n "${TRAIN_CSV:-}" ]]; then
+    EXTRA=(--set "paths.train_csv=$TRAIN_CSV" "${EXTRA[@]+"${EXTRA[@]}"}")
+fi
 
 if [[ -n "$GPU" ]]; then
     export CUDA_VISIBLE_DEVICES="$GPU"
@@ -124,12 +138,41 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 # A runok a tanito CSV szerinti almappaba kerulnek: work/runs/<train_csv stem>/
-if ! OUT="$(python -m knee_mri.cli output-dir --config "$CONFIG" "${EXTRA[@]}")"; then
+if ! OUT="$(python -m knee_mri.cli output-dir --config "$CONFIG" "${EXTRA[@]+"${EXTRA[@]}"}")"; then
     echo "$OUT"
     echo "[HIBA] Nem sikerult meghatarozni a kimeneti mappat (output-dir)."
     exit 1
 fi
 RUNS_DIR="$(printf '%s\n' "$OUT" | tail -n 1)"
+if ! OUT="$(python -m knee_mri.cli output-dir --train-csv --config "$CONFIG" "${EXTRA[@]+"${EXTRA[@]}"}")"; then
+    echo "$OUT"
+    echo "[HIBA] Nem sikerult meghatarozni a tanito CSV-t (output-dir --train-csv)."
+    exit 1
+fi
+TRAIN_CSV_RESOLVED="$(printf '%s\n' "$OUT" | tail -n 1)"
+TRAIN_STEM="$(basename "$TRAIN_CSV_RESOLVED")"
+TRAIN_STEM="${TRAIN_STEM%.*}"
+
+# --- CV split: legyartas (ha nincs) es ellenorzes --------------------
+SPLITS="${SPLITS:-$ROOT/work/splits/cv${NFOLDS}_${TRAIN_STEM}/splits.csv}"
+EXTRA=(--set "paths.splits_csv=$SPLITS" "${EXTRA[@]+"${EXTRA[@]}"}")
+if [[ ! -f "$SPLITS" ]]; then
+    if [[ -n "$RESUME" ]]; then
+        echo "[HIBA] --resume, de nincs meg a split: $SPLITS"
+        echo "       A folytatashoz ugyanaz a split kell, mint az eredeti inditasnal (SPLITS)."
+        exit 1
+    fi
+    echo "[INFO] CV split keszitese: $SPLITS  ($NFOLDS fold, $TRAIN_CSV_RESOLVED)"
+    if ! python -m knee_mri.cli make-splits --config "$CONFIG" "${EXTRA[@]}" --set "split.n_folds=$NFOLDS"; then
+        echo "[HIBA] A make-splits nem sikerult."
+        exit 1
+    fi
+fi
+if ! python -m knee_mri.cli check-splits --config "$CONFIG" "${EXTRA[@]}" --n-folds "$NFOLDS"; then
+    echo "[HIBA] A split nem illik a futashoz: $SPLITS"
+    echo "       Ellenorizd az NFOLDS, TRAIN_CSV, SPLITS kornyezeti valtozokat."
+    exit 1
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 if [[ -n "$RESUME" ]]; then
@@ -159,6 +202,8 @@ if [[ -n "$RESUME" ]]; then
 fi
 echo " Foldok     : 0 .. $LAST"
 echo " Config     : $CONFIG"
+echo " Train CSV  : $TRAIN_CSV_RESOLVED"
+echo " Split      : $SPLITS"
 echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
 echo " Extra args : ${EXTRA[*]:-}"
 echo " Kimenet    : $RUNS_DIR/${GROUP}_fold<N>"
@@ -207,7 +252,7 @@ PREDS=()
 for ((F = 0; F <= LAST; F++)); do
     PREDS+=("$RUNS_DIR/${GROUP}_fold${F}/validation_predictions.csv")
 done
-if ! python -m knee_mri.cli merge-oof --config "$CONFIG" "${PREDS[@]}" \
+if ! python -m knee_mri.cli merge-oof --config "$CONFIG" "${EXTRA[@]}" "${PREDS[@]}" \
         --out "$OOFDIR/oof_predictions.csv"; then
     echo "[FIGYELEM] Az OOF merge nem sikerult, de mindharom fold lefutott."
     echo "           A per-fold eredmenyek megvannak a run mappakban."
