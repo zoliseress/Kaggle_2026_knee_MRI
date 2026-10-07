@@ -148,6 +148,11 @@ def cmd_make_splits(args: argparse.Namespace) -> int:
     if patient_audit is None:
         LOG.warning("No patient_audit.csv (run build-manifest first); falling back to study-level grouping.")
 
+    reference_csv = cfg.paths.get("reference_csv")
+    if bool(cfg.split.holdout_reference) and (not reference_csv or not Path(reference_csv).exists()):
+        # load_reference_table returns None for a missing file, which would hold out nothing.
+        LOG.error("split.holdout_reference=true needs paths.reference_csv, but it is %r (missing file).", reference_csv)
+        return 1
     reference_ids = None
     reference_table = load_reference_table(cfg, study_ids)
     if reference_table is not None:
@@ -210,6 +215,36 @@ def cmd_check_fixed_split(args: argparse.Namespace) -> int:
     if errors:
         return 1
     LOG.info("Fixed split %s matches %s and %s", out, cfg.paths.train_csv, args.validation_csv)
+    return 0
+
+
+def cmd_check_splits(args: argparse.Namespace) -> int:
+    from .schema import read_id_csv
+    from .splits import ROLE_TRAIN_POOL, assert_not_training, load_excluded_training_ids, splits_path, verify_cv_split
+
+    cfg = _load(args)
+    out = splits_path(cfg)
+    meta_path = out.with_name("splits_meta.json")
+    if not out.exists() or not meta_path.exists():
+        LOG.error("%s or its splits_meta.json is missing; run make-splits first.", out)
+        return 1
+    splits = read_id_csv(out, [STUDY_ID])
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    train_ids = read_id_csv(cfg.paths.train_csv)[STUDY_ID].dropna().astype(str).tolist()
+    errors, warnings = verify_cv_split(splits, meta, args.n_folds, train_ids, train_csv=cfg.paths.train_csv)
+    pool = splits.loc[splits["role"] == ROLE_TRAIN_POOL, STUDY_ID].astype(str).tolist()
+    try:
+        # Every pool study trains in some fold, so the whole pool must be free of excluded studies.
+        assert_not_training(pool, load_excluded_training_ids(cfg), f"({cfg.paths.exclude_from_training_csv})")
+    except (AssertionError, FileNotFoundError, ValueError) as error:
+        errors.append(str(error))
+    for message in warnings:
+        LOG.warning("CV split %s: %s", out, message)
+    for message in errors:
+        LOG.error("CV split %s: %s", out, message)
+    if errors:
+        return 1
+    LOG.info("CV split %s matches %s with %d folds", out, cfg.paths.train_csv, args.n_folds)
     return 0
 
 
@@ -319,7 +354,8 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_output_dir(args: argparse.Namespace) -> int:
     # The run scripts take the last stdout line: config warnings are logged to stdout too.
-    print(load_config(args.config, args.overrides).paths.output_dir)
+    paths = load_config(args.config, args.overrides).paths
+    print(paths.train_csv if args.train_csv else paths.output_dir)
     return 0
 
 
@@ -451,7 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--validation-csv", required=True, help="CSV whose StudyInstanceUIDs the split must validate")
     p.set_defaults(func=cmd_check_fixed_split)
 
-    p = _common(sub.add_parser("qc", help="Build the QC gallery"))
+    p = _common(sub.add_parser("check-splits", help="Refuse a CV split that does not match train_csv / --n-folds / the exclusion list"))
+    p.add_argument("--n-folds", type=int, required=True, help="Number of folds the run loops over")
+    p.set_defaults(func=cmd_check_splits)
+
+    p = _common(sub.add_parser("qc",help="Build the QC gallery"))
     p.add_argument("--n-studies", type=int, default=12)
     p.add_argument("--studies", default=None, help="File with one StudyInstanceUID per line (replaces the automatic pick)")
     p.add_argument("--out-dir", default=None, help="Default: <work_dir>/qc")
@@ -505,6 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_report)
 
     p = _common(sub.add_parser("output-dir", help="Print the resolved run folder (<work_dir>/runs/<train_csv stem>)"))
+    p.add_argument("--train-csv", action="store_true", help="Print the resolved paths.train_csv instead")
     p.set_defaults(func=cmd_output_dir)
 
     p = _common(sub.add_parser("diagnose", help="Per-class results and implementation checks of finished runs"))

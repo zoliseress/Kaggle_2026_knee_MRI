@@ -455,8 +455,8 @@ is not proof of the same patient). `splits.csv` carries `report_hash` and
   patients into a single fold, so the default (audit and report, never merge) is the right
   call here. Revisit only if a cluster with a *specific, unusual* report appears.
 
-The radiologist reference studies and their whole groups are held out of training by
-default (`split.holdout_reference`) and used as an **optional diagnostic audit**
+With `split.holdout_reference=true` the radiologist reference studies (`paths.reference_csv`)
+and their whole groups are held out of the CV folds (role `reference_holdout`, fold -1) and used as an **optional diagnostic audit**
 (`evaluate --partition reference_holdout`), never as the early-stopping criterion — prompt
 tuning happened on those reports, so they are not an independent gold benchmark.
 
@@ -485,6 +485,31 @@ leaving it unset keeps the CV path. Here the 158 studies **are** the early-stopp
 (e.g. 14 MCL positives) the macro AUC is also noisy. The "validation: NO supervision" warning
 in the label counts is expected: the 158 are not in `train_v4`, and the metric comes from the
 frozen reference.
+
+### Keeping the reference out of every training run (teachers included)
+
+The 208-study reference (`train_labeled_208_reference.csv`) is the evaluation set. A teacher
+that trained on part of it would carry it into the pseudo-labels of its students, so no
+training run may see it, CV teachers included. Three checks enforce this:
+
+* **`paths.exclude_from_training_csv`** (default in every config:
+  `notebooks/train_labeled_208_reference.csv`). `train.py` stops before the first epoch when a
+  training study of the fold is on that list, whatever `splits.csv` is in use. A configured but
+  missing or empty file is an error. An empty value turns the check off, e.g. to resume a legacy
+  run. `run_holdout.*` sets it to `VAL_CSV`.
+* **`make-splits` with `split.holdout_reference=true`** refuses to write a split with an empty
+  hold-out (missing `reference_csv`, or none of its studies in `train_csv`). With `train_v8.csv`
+  the flag is not needed: the CSV has no reference rows to begin with.
+* **`run_cv.*`** no longer uses the legacy `work/splits/splits.csv` (4407 studies, the reference
+  inside the folds). Its default split is `work/splits/cv<NFOLDS>_<train_csv stem>/splits.csv`.
+  The script creates it with `make-splits` when it is missing and checks it on every start with
+  `check-splits --n-folds N` (fold count, training CSV, exclusion list). The fold count comes
+  from `NFOLDS` (default 3), the training CSV from `TRAIN_CSV` or the config, and `SPLITS`
+  overrides the path. `merge-oof` gets the same split.
+
+```powershell
+.\run_cv.bat B0_teacher --set data.image_size=320   # teacher OOF: 3 folds (default), split work/splits/cv3_train_v8, ref208 never trains
+```
 
 ## Metrics
 

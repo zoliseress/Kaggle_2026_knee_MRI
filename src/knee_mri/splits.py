@@ -215,7 +215,16 @@ def make_splits(
         LOG.warning("%s", message)
 
     holdout: set[str] = set()
-    if bool(cfg.split.holdout_reference) and reference_study_ids:
+    if bool(cfg.split.holdout_reference) and not reference_study_ids:
+        # An empty hold-out would silently train on the reference the flag was meant to protect.
+        raise ValueError(
+            "split.holdout_reference=true, but no reference study is among the split's studies "
+            f"(paths.reference_csv={cfg.paths.get('reference_csv')!r}, {len(study_ids)} studies from "
+            f"{cfg.paths.get('train_csv')!r}). Point reference_csv at the reference CSV and make the split "
+            "from a CSV that contains those studies, or set split.holdout_reference=false when the "
+            "training CSV already leaves them out."
+        )
+    if bool(cfg.split.holdout_reference):
         # Keep the reference studies and their whole groups out of image training.
         ref_groups = {decision.groups[s] for s in reference_study_ids if s in decision.groups}
         holdout = {s for s in study_ids if decision.groups[s] in ref_groups}
@@ -270,6 +279,7 @@ def make_splits(
             "version": SPLITS_VERSION,
             "seed": int(cfg.seed),
             "n_folds": int(cfg.split.n_folds),
+            "sources": {"train_csv": str(cfg.paths.get("train_csv") or "")},
             "group_source": decision.source,
             "grouping_warnings": decision.warnings,
             "patient_id_audit": decision.audit,
@@ -386,6 +396,75 @@ def verify_fixed_split(
     if train_csv and source and Path(source).resolve() != Path(train_csv).resolve():
         warnings.append(f"the split was made from {source}, this run trains on {train_csv}")
     return errors, warnings
+
+
+def verify_cv_split(
+    splits: pd.DataFrame,
+    meta: dict[str, Any],
+    n_folds: int,
+    train_ids: list[str],
+    train_csv: str | Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Check that an existing CV split fits the fold loop and the training CSV of a run.
+
+    Returns (errors, warnings), like verify_fixed_split.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    if meta.get("mode") == "fixed_holdout":
+        errors.append("the split is a fixed hold-out, not a CV split")
+        return errors, warnings
+    pool = splits[splits["role"] == ROLE_TRAIN_POOL]
+    folds = sorted(int(f) for f in pool["fold"].unique())
+    if int(meta.get("n_folds", -1)) != int(n_folds) or folds != list(range(int(n_folds))):
+        errors.append(f"the split has folds {folds} (n_folds={meta.get('n_folds')}), the run loops over {n_folds}")
+    missing = set(pool[STUDY_ID].astype(str)) - set(str(s) for s in train_ids)
+    if missing:
+        errors.append(f"{len(missing)} training-pool studies of the split have no row in the training CSV, e.g. {sorted(missing)[:2]}")
+
+    source = meta.get("sources", {}).get("train_csv")
+    if not source:
+        warnings.append("the split does not record its training CSV (made before splits_meta kept it)")
+    elif train_csv and Path(source).resolve() != Path(train_csv).resolve():
+        warnings.append(f"the split was made from {source}, this run trains on {train_csv}")
+    return errors, warnings
+
+
+def load_excluded_training_ids(cfg: Config) -> set[str] | None:
+    """StudyInstanceUIDs of paths.exclude_from_training_csv, or None when the key is unset.
+
+    The list exists so an evaluation set (the radiologist reference) can never reach image
+    training - also not through a stale splits.csv. A configured but missing or empty file is
+    an error, never a silently disabled check.
+    """
+    from .schema import read_id_csv
+
+    raw = cfg.paths.get("exclude_from_training_csv")
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"paths.exclude_from_training_csv={raw} does not exist. Copy the file there, or set the key "
+            "to an empty value to train without the check."
+        )
+    ids = set(read_id_csv(path)[STUDY_ID].dropna().astype(str))
+    if not ids:
+        raise ValueError(f"paths.exclude_from_training_csv={raw} lists no StudyInstanceUID")
+    return ids
+
+
+def assert_not_training(train_ids: list[str], excluded: set[str] | None, source: str = "") -> None:
+    """Hard check: no excluded study may be a training study."""
+    if not excluded:
+        return
+    leaked = sorted(set(str(s) for s in train_ids) & excluded)
+    if leaked:
+        raise AssertionError(
+            f"{len(leaked)} training studies are listed in paths.exclude_from_training_csv {source}, "
+            f"e.g. {leaked[:3]}. The splits.csv in use was made with those studies in the training pool: "
+            "make a split from a training CSV without them (or with split.holdout_reference=true)."
+        )
 
 
 def _duplicate_reports_across_folds(splits: pd.DataFrame) -> int:

@@ -106,6 +106,10 @@ def test_patient_group_separation(tmp_path):
     selftest.check_group_separation(tmp_path)
 
 
+def test_training_exclusion(tmp_path):
+    selftest.check_training_exclusion(tmp_path)
+
+
 def test_dataset_contract(cfg):
     selftest.check_dataset_contract(cfg)
 

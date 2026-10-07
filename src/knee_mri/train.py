@@ -54,7 +54,14 @@ from .encoders import ADAPTER_VERSIONS
 from .metrics import evaluate_predictions, selection_metric, soft_target_warning
 from .model import build_model
 from .preprocess import preprocess_hash
-from .splits import assert_group_disjoint, fold_study_ids, load_splits, splits_path
+from .splits import (
+    assert_group_disjoint,
+    assert_not_training,
+    fold_study_ids,
+    load_excluded_training_ids,
+    load_splits,
+    splits_path,
+)
 from .utils import (
     LOG,
     add_file_logging,
@@ -1077,6 +1084,13 @@ def _prepare_real_run(
     fold = int(cfg.split.fold)
     assert_group_disjoint(splits, fold)
     train_ids, val_ids = fold_study_ids(splits, fold)
+    excluded = load_excluded_training_ids(cfg)
+    assert_not_training(train_ids, excluded, f"({cfg.paths.exclude_from_training_csv}, splits {splits_path(cfg)})")
+    if excluded:
+        LOG.info(
+            "Training excludes the %d studies of %s: none of the %d training studies is among them.",
+            len(excluded), cfg.paths.exclude_from_training_csv, len(train_ids),
+        )
 
     all_ids = sorted(set(splits[STUDY_ID].astype(str)))
     label_table = build_label_table(cfg, all_ids)

@@ -46,7 +46,16 @@ from .loss import (
 )
 from .metrics import evaluate_predictions, soft_roc_auc
 from .model import EfficientNetB0MIL, masked_max, masked_mean
-from .splits import assert_group_disjoint, fold_study_ids, make_fixed_split, make_splits, verify_fixed_split
+from .splits import (
+    assert_group_disjoint,
+    assert_not_training,
+    fold_study_ids,
+    load_excluded_training_ids,
+    make_fixed_split,
+    make_splits,
+    verify_cv_split,
+    verify_fixed_split,
+)
 from .train import window_sizes
 from .utils import LOG, remove_file_logging
 
@@ -1315,6 +1324,68 @@ def check_fixed_split(tmp_dir) -> str:
     else:
         raise AssertionError("a study in both sets must be an error")
     return "fold 0 = validation set, fold 1 = training set, overlap refused"
+
+
+def check_training_exclusion(tmp_dir) -> str:
+    """The reference never trains: empty hold-out refused, CV split checked, stale split caught."""
+    import json
+    from pathlib import Path
+
+    cfg = load_config()
+    cfg = cfg.copy()
+    cfg.paths.work_dir = str(tmp_dir)
+    cfg.split.n_folds = 3
+    studies = [f"s{i:03d}" for i in range(30)]
+    reference = studies[:6]
+
+    cfg.split.holdout_reference = True
+    try:
+        make_splits(cfg, study_ids=studies, reference_study_ids=[], out_path=Path(tmp_dir) / "excl" / "empty.csv")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("holdout_reference=true without a reference study must be an error")
+
+    splits = make_splits(cfg, study_ids=studies, reference_study_ids=reference, out_path=Path(tmp_dir) / "excl" / "held.csv")
+    held = splits.set_index(STUDY_ID).loc[reference]
+    assert (held["fold"] == -1).all() and (held["role"] == "reference_holdout").all(), held
+    pool = studies[6:]
+    meta = json.loads((Path(tmp_dir) / "excl" / "splits_meta.json").read_text(encoding="utf-8"))
+    errors, _ = verify_cv_split(splits, meta, 3, pool)
+    assert not errors, errors
+    errors, _ = verify_cv_split(splits, meta, 5, pool)
+    assert any("folds" in e for e in errors), errors
+    errors, _ = verify_cv_split(splits, meta, 3, pool[1:])
+    assert any("no row in the training CSV" in e for e in errors), errors
+    for fold in range(3):
+        train_ids, _ = fold_study_ids(splits, fold)
+        assert_not_training(train_ids, set(reference))
+
+    # A stale split that trains on the reference is caught at training time.
+    cfg.split.holdout_reference = False
+    stale = make_splits(cfg, study_ids=studies, out_path=Path(tmp_dir) / "excl" / "stale.csv")
+    exclude_csv = Path(tmp_dir) / "excl" / "reference.csv"
+    pd.DataFrame({STUDY_ID: reference}).to_csv(exclude_csv, index=False)
+    cfg.paths.exclude_from_training_csv = str(exclude_csv)
+    excluded = load_excluded_training_ids(cfg)
+    assert excluded == set(reference), excluded
+    try:
+        assert_not_training(fold_study_ids(stale, 0)[0], excluded)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a split with reference studies in the training pool must be refused")
+
+    cfg.paths.exclude_from_training_csv = str(Path(tmp_dir) / "excl" / "missing.csv")
+    try:
+        load_excluded_training_ids(cfg)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a configured but missing exclusion file must be an error")
+    cfg.paths.exclude_from_training_csv = None
+    assert load_excluded_training_ids(cfg) is None
+    return "empty hold-out refused, reference held out, stale split and missing list caught"
 
 
 def check_verify_fixed_split(tmp_dir) -> str:
@@ -3599,6 +3670,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("pseudonymous_patient_id", lambda: check_pseudonymous_patient_id(tmp_dir)),
             ("fixed_split", lambda: check_fixed_split(tmp_dir)),
             ("verify_fixed_split", lambda: check_verify_fixed_split(tmp_dir)),
+            ("training_exclusion", lambda: check_training_exclusion(tmp_dir)),
             ("dataset_contract", lambda: check_dataset_contract(small)),
             ("augment_device_resolution", lambda: check_augment_device_resolution(small)),
             ("augment_device_equivalence", lambda: check_augment_device_equivalence(small)),

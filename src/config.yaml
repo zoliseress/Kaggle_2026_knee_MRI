@@ -25,6 +25,11 @@ paths:
   # Radiologist reference set: 158 studies (the original 58 + 100). Audit only (diagnose, evaluate);
   # held out from image training only with split.holdout_reference=true (default false).
   reference_csv: "notebooks/train_labeled_158_reference.csv"
+  # Studies that must never be training studies (train.py stops when the splits.csv in use puts
+  # one of them in the training pool). The 208 radiologist reference is the evaluation set, also
+  # for students trained on teacher pseudo-labels, so every teacher must leave it out too.
+  # Empty value = no check, e.g. to resume a legacy run trained on the 4407-study CV split.
+  exclude_from_training_csv: "notebooks/train_labeled_208_reference.csv"
   # Validation reference frozen once by `freeze-reference` (from train_v1.csv). Every
   # training-label experiment is scored against this same file; null = derive it from
   # the current label table, which then moves with the label policy.
