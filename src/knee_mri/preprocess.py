@@ -250,6 +250,9 @@ def preprocess_volume(volume: VolumeCandidate, cfg: Config) -> PreprocessedSerie
         "series_uid": volume.series_uid,
         "plane": volume.plane.plane,
         "plane_angle_deg": round(volume.plane.angle_deg, 2),
+        # Slice-normal x (LPS) of this volume: the canonical frame orders each sagittal slot's
+        # stack by its own normal (dataset), so a second sagittal slot cannot run backwards.
+        "normal_x": round(float(volume.normal[0]), 5),
         "n_slices": int(image.shape[0]),
         "image_size": int(cfg.data.image_size),
         "row_spacing_mm": round(float(row_spacing), 5),

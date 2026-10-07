@@ -295,14 +295,23 @@ def _is_localizer(description: str, patterns: list[str]) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
-def _te_score(echo_time: float | None) -> float:
-    """Fluid-sensitive PD/T2-like acquisitions have a longer TE. Heuristic, not a sequence oracle."""
+TE_PREFERENCES = ("t2", "pd")
+
+
+def _te_score(echo_time: float | None, preference: str = "t2") -> float:
+    """Fluid-sensitive PD/T2-like acquisitions have a longer TE. Heuristic, not a sequence oracle.
+
+    preference (selection.fluid_te_preference): "t2" ranks T2-like TE >= 60 ms above PD-like
+    25-60 ms (original); "pd" swaps the two (the radiologists prefer PDFS over T2FS).
+    """
+    if preference not in TE_PREFERENCES:
+        raise ValueError(f"selection.fluid_te_preference must be one of {TE_PREFERENCES}, got {preference!r}")
     if echo_time is None or not np.isfinite(echo_time):
         return 0.3  # unknown: neither rewarded nor punished
     if echo_time >= 60:
-        return 1.0
+        return 1.0 if preference == "t2" else 0.85
     if echo_time >= 25:
-        return 0.85
+        return 0.85 if preference == "t2" else 1.0
     if echo_time >= 15:
         return 0.4
     return 0.0
@@ -334,22 +343,61 @@ def passes_slot_filter(df: pd.DataFrame, slot_filter_name: str) -> pd.Series:
     Every condition must be positively established from the headers: a missing value
     (TR, TE, ScanningSequence) never passes, so an unreadable header cannot sneak in.
     """
+    h = _sequence_headers(df)
+    if slot_filter_name == "t1":
+        short_tr_te = h["tr"].between(0, T1_MAX_TR_MS, inclusive="neither") & h["te"].between(
+            0, T1_MAX_TE_MS, inclusive="neither"
+        )
+        return h["spin_echo"] & short_tr_te & ~h["inversion"] & ~h["fat_suppressed"]
+    if slot_filter_name == "nonfs":
+        # Strict: the series csv must say "no" to both; unknown (no row, no csv) never passes.
+        # Only a recognised contrast (PD, T1, T2) is admitted; an intermediate weighting such as
+        # TR 890 / TE 30 is none of them and stays out.
+        known = (h["tr"] > 0) & (h["te"] > 0)
+        base = h["spin_echo"] & known & ~h["inversion"] & ~h["fat_suppressed"] & h["meta_not_fs_not_fluid"]
+        return base & (slot_filter_priority(df, "nonfs") >= 0)
+    raise ValueError(f"unknown slot filter {slot_filter_name!r}")
+
+
+def slot_filter_priority(df: pd.DataFrame, slot_filter_name: str) -> pd.Series:
+    """Rank class of a filtered slot's candidates, compared before the score (higher first).
+
+    nonfs: PD 2 > T1 1 > T2 0 (the radiologists' meniscus/cartilage preference for non-FS PD,
+    T1 next for fracture lines and marrow); -1 = none of them, which the nonfs filter refuses.
+    Other filters: 0.
+    """
+    if slot_filter_name != "nonfs":
+        return pd.Series(0, index=df.index, dtype=int)
+    h = _sequence_headers(df)
+    long_tr = h["tr"] >= T1_MAX_TR_MS
+    priority = pd.Series(-1, index=df.index, dtype=int)
+    priority[long_tr & (h["te"] >= 60)] = 0
+    priority[passes_slot_filter(df, "t1")] = 1
+    # PD has a long TR and any TE below the T2 range: many sagittal PD TSEs run at TE 9-10 ms.
+    priority[long_tr & (h["te"] > 0) & (h["te"] < 60)] = 2
+    return priority
+
+
+def _sequence_headers(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Sequence-type evidence of scored candidates; a missing header is never positive evidence."""
     def column(name: str) -> pd.Series:
         return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
 
-    if slot_filter_name == "t1":
-        sequence = column("scanning_sequence").map(_header_tokens)
-        options = column("scan_options").map(_header_tokens)
-        tr = pd.to_numeric(column("repetition_time"), errors="coerce")
-        te = pd.to_numeric(column("echo_time"), errors="coerce")
-        ti = pd.to_numeric(column("inversion_time"), errors="coerce")
+    sequence = column("scanning_sequence").map(_header_tokens)
+    options = column("scan_options").map(_header_tokens)
+    ti = pd.to_numeric(column("inversion_time"), errors="coerce")
+    return {
+        "tr": pd.to_numeric(column("repetition_time"), errors="coerce"),
+        "te": pd.to_numeric(column("echo_time"), errors="coerce"),
         # Spin echo only: GR (also GR+SE hybrids), IR and research/unknown sequences are out.
-        spin_echo = sequence.map(lambda s: "SE" in s and not s & {"GR", "IR"})
-        short_tr_te = tr.between(0, T1_MAX_TR_MS, inclusive="neither") & te.between(0, T1_MAX_TE_MS, inclusive="neither")
-        inversion = ti > 0  # an inversion pulse without the IR token (STIR, FLAIR-like)
-        fat_suppressed = (df["fat_suppression"] > 0) | options.map(lambda s: "FS" in s)
-        return spin_echo & short_tr_te & ~inversion & ~fat_suppressed
-    raise ValueError(f"unknown slot filter {slot_filter_name!r}")
+        "spin_echo": sequence.map(lambda s: "SE" in s and not s & {"GR", "IR"}).astype(bool),
+        "inversion": ti > 0,  # an inversion pulse without the IR token (STIR, FLAIR-like)
+        "fat_suppressed": (pd.to_numeric(column("fat_suppression"), errors="coerce").fillna(0) > 0)
+        | options.map(lambda s: "FS" in s).astype(bool),
+        # Raw csv flags (score_candidates' meta_*): only a known 0 counts as "no".
+        "meta_not_fs_not_fluid": (pd.to_numeric(column("meta_fat_suppression"), errors="coerce") == 0)
+        & (pd.to_numeric(column("meta_fluid_sensitive"), errors="coerce") == 0),
+    }
 
 
 NON_BLOCKING_PENALTY_FLAGS = {
@@ -371,26 +419,26 @@ def score_candidates(manifest: pd.DataFrame, series_meta: pd.DataFrame | None, c
     df = manifest.copy()
 
     df["is_localizer"] = df["series_description"].fillna("").map(lambda d: _is_localizer(d, patterns))
+    # meta_* keep the series csv as given (NaN = unknown) for the slot filters; the score
+    # columns read unknown as 0 and may be switched off without touching the filters.
+    df["meta_fluid_sensitive"] = np.nan
+    df["meta_fat_suppression"] = np.nan
+    df["csv_plane"] = pd.NA
     if series_meta is not None and SERIES_ID in series_meta.columns:
         meta = series_meta.drop_duplicates(subset=[SERIES_ID]).set_index(SERIES_ID)
-        for column, out in (("Fluid_Sensitive", "fluid_sensitive"), ("Fat_Suppression", "fat_suppression")):
+        for column, out in (("Fluid_Sensitive", "meta_fluid_sensitive"), ("Fat_Suppression", "meta_fat_suppression")):
             if column in meta.columns:
-                df[out] = pd.to_numeric(df[SERIES_ID].map(meta[column]), errors="coerce").fillna(0.0)
-            else:
-                df[out] = 0.0
+                df[out] = pd.to_numeric(df[SERIES_ID].map(meta[column]), errors="coerce")
         if "Anatomical_Plane" in meta.columns:
             df["csv_plane"] = df[SERIES_ID].map(meta["Anatomical_Plane"]).astype("string").str.lower()
-        else:
-            df["csv_plane"] = pd.NA
-    else:
-        df["fluid_sensitive"] = 0.0
-        df["fat_suppression"] = 0.0
-        df["csv_plane"] = pd.NA
+    df["fluid_sensitive"] = df["meta_fluid_sensitive"].fillna(0.0)
+    df["fat_suppression"] = df["meta_fat_suppression"].fillna(0.0)
 
     if not bool(cfg.selection.prefer_fluid_sensitive):
         df["fluid_sensitive"] = 0.0
 
-    df["score_te"] = df["echo_time"].map(lambda v: _te_score(float(v) if pd.notna(v) else None))
+    te_preference = str(cfg.selection.get("fluid_te_preference", "t2"))
+    df["score_te"] = df["echo_time"].map(lambda v: _te_score(float(v) if pd.notna(v) else None, te_preference))
     df["score_slices"] = np.clip(
         pd.to_numeric(df["n_slices"], errors="coerce").fillna(0) / float(cfg.data.centers_per_series), 0.0, 1.0
     )
@@ -435,7 +483,9 @@ def select_series(
     slots = list(cfg.data.series_slots)
     scored = score_candidates(manifest, series_meta, cfg)
     usable = scored[scored["usable"].fillna(False).astype(bool) & ~scored["is_localizer"]]
-    filter_masks = {f: passes_slot_filter(usable, f) for f in {slot_filter(s) for s in slots} - {None}}
+    filter_names = {slot_filter(s) for s in slots} - {None}
+    filter_masks = {f: passes_slot_filter(usable, f) for f in filter_names}
+    priority_by_filter = {f: slot_filter_priority(usable, f) for f in filter_names}
     # Plane slots first: a filtered slot must know what its plane slot took.
     resolution_order = sorted(slots, key=lambda s: slot_filter(s) is not None)
 
@@ -477,9 +527,16 @@ def select_series(
                     "n_slices": 0,
                 }
                 continue
-            # Stable deterministic ranking: score desc, then lexicographic ids.
+            # Stable deterministic ranking: filter priority desc (constant for plane slots and
+            # t1), score desc, then lexicographic ids.
+            if filter_name is not None:
+                candidates = candidates.assign(filter_priority=priority_by_filter[filter_name].loc[candidates.index])
+            else:
+                candidates = candidates.assign(filter_priority=0)
             ranked = candidates.sort_values(
-                ["score", SERIES_ID, "volume_key"], ascending=[False, True, True], kind="stable"
+                ["filter_priority", "score", SERIES_ID, "volume_key"],
+                ascending=[False, False, True, True],
+                kind="stable",
             )
             best = ranked.iloc[0]
             by_slot[slot] = {
@@ -498,6 +555,8 @@ def select_series(
                     f"plane_angle={best['plane_angle_deg']:.1f}deg penalties={best['n_penalty_flags']}"
                 ),
                 "series_description": best["series_description"],
+                "filter_priority": int(best["filter_priority"]),
+                "normal_x": float(best["normal_x"]) if "normal_x" in best and pd.notna(best["normal_x"]) else np.nan,
                 "quality_flags": best["quality_flags"],
                 "n_slices": int(best["n_slices"]),
                 "path": best["path"],

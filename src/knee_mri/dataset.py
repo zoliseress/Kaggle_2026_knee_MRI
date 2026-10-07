@@ -554,7 +554,12 @@ class StudyBagDataset(Dataset):
             gap_ok = np.asarray(meta.get("gap_ok", []), dtype=bool) if meta.get("gap_ok") is not None else None
             if self.laterality is not None:
                 side, sagittal_normal_x = self.laterality[study]
-                reverse, flip = canonical_ops(side, slot_plane(slot), sagittal_normal_x)
+                # Each volume's own slice normal (cache meta) orders its stack; entries cached
+                # before the meta carried it fall back to the sagittal slot's normal.
+                own_normal = meta.get("normal_x")
+                own_normal = float(own_normal) if isinstance(own_normal, (int, float)) else float("nan")
+                normal_x = own_normal if np.isfinite(own_normal) else sagittal_normal_x
+                reverse, flip = canonical_ops(side, slot_plane(slot), normal_x)
                 image, gap_ok = apply_canonical(image, gap_ok, reverse, flip)
             rng = self._rng(index, p, epoch)
             centers, valid = bin_centers(image.shape[0], self.n_centers, rng if self.train else None)

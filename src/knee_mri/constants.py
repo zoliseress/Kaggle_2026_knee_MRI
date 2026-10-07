@@ -27,9 +27,13 @@ PLANES = ["sagittal", "coronal", "axial"]
 # plane slot takes the best-scoring volume of that plane; a filtered slot takes the best
 # volume of that plane that passes the filter and is not already used by the plane's own
 # slot (manifest.select_series). Filters:
-#   t1 - non fat-suppressed spin-echo T1: 0 < TR < 1000 ms, 0 < TE < 30 ms, no GR/IR in
-#        ScanningSequence, no inversion time; missing headers never pass.
-SLOT_FILTERS = ("t1",)
+#   t1    - non fat-suppressed spin-echo T1: 0 < TR < 1000 ms, 0 < TE < 30 ms, no GR/IR in
+#           ScanningSequence, no inversion time; missing headers never pass.
+#   nonfs - a non fat-suppressed, non fluid-sensitive spin-echo PD, T1 or T2 (no GR/IR, no
+#           inversion time; FS and fluid-sensitive flags known to be 0), ranked PD (TR >= 1000,
+#           TE < 60) > T1 (as t1) > T2 (TR >= 1000, TE >= 60) before the score
+#           (manifest.slot_filter_priority); any other weighting is refused.
+SLOT_FILTERS = ("t1", "nonfs")
 
 
 def slot_plane(slot: str) -> str:

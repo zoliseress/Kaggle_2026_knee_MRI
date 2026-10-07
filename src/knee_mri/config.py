@@ -178,11 +178,6 @@ def validate_config(cfg: Config) -> None:
         )
     if len(set(slots)) != len(slots):
         raise ValueError(f"data.series_slots must be unique, got {slots}")
-    sagittal_filtered = [s for s in slots if slot_plane(s) == "sagittal" and slot_filter(s) is not None]
-    if sagittal_filtered:
-        # The canonical frame reverses sagittal stacks by the sagittal slot's slice normal
-        # (laterality.csv); a second sagittal volume may run the other way.
-        raise ValueError(f"filtered sagittal slots {sagittal_filtered} are not supported yet")
     if float(data.fov_mm) <= 0:
         raise ValueError("data.fov_mm must be positive")
     if data.crop_center not in ("foreground", "foreground_extent", "geometric"):
@@ -248,6 +243,8 @@ def validate_config(cfg: Config) -> None:
 
     if str(cfg.eval.get("selection_metric", "macro_soft_auc")) not in ("macro_soft_auc", "macro_roc_auc"):
         raise ValueError("eval.selection_metric must be 'macro_soft_auc' or 'macro_roc_auc'")
+    if str(cfg.selection.get("fluid_te_preference", "t2")) not in ("t2", "pd"):
+        raise ValueError("selection.fluid_te_preference must be 't2' or 'pd'")
 
     if int(cfg.split.n_folds) < 2:
         raise ValueError("split.n_folds must be >= 2")

@@ -46,7 +46,7 @@ from .loss import (
 )
 from .metrics import evaluate_predictions, soft_roc_auc
 from .model import EfficientNetB0MIL, masked_max, masked_mean
-from .splits import assert_group_disjoint, fold_study_ids, make_fixed_split, make_splits
+from .splits import assert_group_disjoint, fold_study_ids, make_fixed_split, make_splits, verify_fixed_split
 from .train import window_sizes
 from .utils import LOG, remove_file_logging
 
@@ -1317,6 +1317,36 @@ def check_fixed_split(tmp_dir) -> str:
     return "fold 0 = validation set, fold 1 = training set, overlap refused"
 
 
+def check_verify_fixed_split(tmp_dir) -> str:
+    """check-fixed-split: a training/validation CSV that no longer matches the split is refused."""
+    import json
+    from pathlib import Path
+
+    cfg = load_config(resolve=False)
+    train = [f"t{i:02d}" for i in range(10)]
+    val = [f"v{i:02d}" for i in range(4)]
+    out = Path(tmp_dir) / "fixed_verify" / "splits.csv"
+    splits = make_fixed_split(cfg, train, val, out_path=out, sources={"train_csv": "a/train_new.csv"})
+    meta = json.loads(out.with_name("splits_meta.json").read_text(encoding="utf-8"))
+
+    errors, warnings = verify_fixed_split(splits, meta, train, val, train_csv="a/train_new.csv")
+    assert not errors and not warnings, (errors, warnings)
+    # the old, larger training CSV still lists the validation studies: label leak
+    errors, _ = verify_fixed_split(splits, meta, train + val[:2], val, train_csv="a/train_old.csv")
+    assert any("also have a row in the training CSV" in e for e in errors), errors
+    # a validation CSV the split was not made from
+    errors, _ = verify_fixed_split(splits, meta, train, val + ["v99"], train_csv="a/train_new.csv")
+    assert any("validates 4 studies" in e for e in errors), errors
+    # training studies without labels are an error, extra unused rows only a warning
+    errors, _ = verify_fixed_split(splits, meta, train[:-1], val, train_csv="a/train_new.csv")
+    assert any("have no row in the training CSV" in e for e in errors), errors
+    errors, warnings = verify_fixed_split(splits, meta, train + ["x01"], val, train_csv="a/other.csv")
+    assert not errors and len(warnings) == 2, (errors, warnings)
+    errors, _ = verify_fixed_split(splits, {"mode": "cv"}, train, val)
+    assert errors, "a CV split is not a fixed hold-out"
+    return "leaking / mismatched CSVs refused, unused rows and a different source path only warned"
+
+
 def check_freeze_reference_from_csv(tmp_dir) -> str:
     """freeze-reference --from-csv: empty cells are invalid, non-binary values are refused."""
     from pathlib import Path
@@ -2121,7 +2151,7 @@ def check_filtered_slot_selection(cfg: Config, tmp_dir) -> str:
     same = selection[selection["slot"].isin(three.data.series_slots)].reset_index(drop=True)
     assert same[["slot", "volume_id", "selected"]].equals(base[["slot", "volume_id", "selected"]]), "plane slots changed"
 
-    for bad in (["sagittal", "sagittal_t1"], ["coronal", "coronal_t2"], ["coronal", "coronal"]):
+    for bad in (["sagittal", "sagittal_t2"], ["coronal", "coronal_t2"], ["coronal", "coronal"]):
         broken = cfg.copy()
         broken.data.series_slots = bad
         try:
@@ -2130,6 +2160,102 @@ def check_filtered_slot_selection(cfg: Config, tmp_dir) -> str:
             continue
         raise AssertionError(f"series_slots {bad} was accepted")
     return "coronal_t1 = best non-FS spin-echo T1 besides the coronal volume; missing/odd headers refused; plane slots unchanged"
+
+
+def check_nonfs_slot_selection(cfg: Config, tmp_dir) -> str:
+    """sagittal_nonfs takes a non-FS spin echo, PD > T1 > T2 before the score; fluid_te_preference=pd picks PDFS."""
+    from .manifest import select_series
+
+    def volume(study, vid, plane, tr, te, seq="SE", options="", fluid=0, fat=0, normal_x=-1.0):
+        return {STUDY_ID: study, SERIES_ID: f"{study}.{vid}", "volume_id": f"{study}.{vid}#g0", "volume_key": "g0",
+                "path": f"/{study}/{vid}", "plane": plane, "series_description": vid, "echo_time": te,
+                "repetition_time": tr, "scanning_sequence": seq, "scan_options": options, "n_slices": 24,
+                "row_spacing_mm": 0.4, "col_spacing_mm": 0.4, "plane_angle_deg": 1.0, "quality_flags": "",
+                "usable": True, "normal_x": normal_x, "_fluid": fluid, "_fat": fat}
+
+    def pdfs(study, plane="sagittal", te=35):
+        return volume(study, f"{plane[:3]}_fs{te}", plane, 3000, te, fluid=1, fat=1)
+
+    rows = [
+        # a: PD beats a higher-scoring T2 (longer TE) and a T1; its own normal is recorded
+        pdfs("a"), volume("a", "sag_t2", "sagittal", 4000, 80), volume("a", "sag_t1", "sagittal", 600, 10),
+        volume("a", "sag_pd", "sagittal", 3000, 30, normal_x=0.99),
+        # b: no PD - T1 beats T2;  c: only a T2 is left
+        pdfs("b"), volume("b", "sag_t2", "sagittal", 4000, 80), volume("b", "sag_t1", "sagittal", 600, 10),
+        pdfs("c"), volume("c", "sag_t2", "sagittal", 4000, 80),
+        # d: nothing qualifies - GRE, IR, an inversion time, FS by ScanOptions or by the series csv,
+        # fluid-sensitive without the FS flag, missing headers
+        pdfs("d"), volume("d", "gre", "sagittal", 500, 5, seq="GR"), volume("d", "stir", "sagittal", 4000, 40, seq="['IR', 'SE']"),
+        volume("d", "pd_fsopt", "sagittal", 3000, 30, options="['FS']"), volume("d", "pd_fatcsv", "sagittal", 3000, 30, fat=1),
+        volume("d", "pd_fluid", "sagittal", 3000, 30, fluid=1), volume("d", "seq_missing", "sagittal", 3000, 30, seq=None),
+        volume("d", "te_missing", "sagittal", 3000, np.nan), volume("d", "tr_missing", "sagittal", np.nan, 30),
+        volume("d", "pd_nometa", "sagittal", 3000, 30),  # no series csv row: FS status unknown
+        volume("d", "intermediate", "sagittal", 600, 40),  # short TR, TE above T1: neither PD, T1 nor T2
+        # g: a short-TE PD TSE (TE 9 ms, long TR) is still PD and beats a T1
+        pdfs("g"), volume("g", "sag_t1", "sagittal", 600, 10), volume("g", "sag_pd9", "sagittal", 3000, 9),
+        # e: the only sagittal volume is a non-FS PD - the sagittal slot takes it, no duplicate
+        volume("e", "sag_pd", "sagittal", 3000, 30),
+        # f: PDFS and T2FS in one plane - fluid_te_preference decides
+        pdfs("f", "coronal", 35), pdfs("f", "coronal", 80), pdfs("f"),
+    ]
+    ti_set = volume("d", "ti_set", "sagittal", 3000, 30)
+    ti_set["inversion_time"] = 150.0
+    rows.append(ti_set)
+    manifest = pd.DataFrame(rows)
+    meta = pd.DataFrame({SERIES_ID: manifest[SERIES_ID], "Fluid_Sensitive": manifest["_fluid"], "Fat_Suppression": manifest["_fat"]})
+    meta = meta[meta[SERIES_ID] != "d.pd_nometa"]
+    manifest = manifest.drop(columns=["_fluid", "_fat"])
+
+    five = cfg.copy()
+    five.data.series_slots = ["sagittal_nonfs", "sagittal", "coronal", "axial", "coronal_t1"]
+    validate_config(five)
+    selection = select_series(five, manifest, meta, out_path=Path(tmp_dir) / "selection_nonfs.csv")
+    chosen = {(r[STUDY_ID], r["slot"]): (r["volume_id"] if r["selected"] else None) for _, r in selection.iterrows()}
+    assert chosen[("a", "sagittal")] == "a.sag_fs35#g0", chosen
+    assert chosen[("a", "sagittal_nonfs")] == "a.sag_pd#g0", f"PD did not win: {chosen[('a', 'sagittal_nonfs')]}"
+    row_a = selection[(selection[STUDY_ID] == "a") & (selection["slot"] == "sagittal_nonfs")].iloc[0]
+    assert row_a["filter_priority"] == 2 and row_a["normal_x"] == 0.99, row_a
+    assert chosen[("b", "sagittal_nonfs")] == "b.sag_t1#g0", f"T1 did not beat T2: {chosen[('b', 'sagittal_nonfs')]}"
+    assert chosen[("c", "sagittal_nonfs")] == "c.sag_t2#g0", chosen[("c", "sagittal_nonfs")]
+    assert chosen[("g", "sagittal_nonfs")] == "g.sag_pd9#g0", f"a short-TE PD lost: {chosen[('g', 'sagittal_nonfs')]}"
+    assert chosen[("d", "sagittal_nonfs")] is None, f"an excluded volume passed nonfs: {chosen[('d', 'sagittal_nonfs')]}"
+    assert chosen[("e", "sagittal")] == "e.sag_pd#g0" and chosen[("e", "sagittal_nonfs")] is None, "duplicated the sagittal volume"
+    assert chosen[("f", "coronal")] == "f.cor_fs80#g0", "fluid_te_preference=t2 (default) must keep the T2FS choice"
+
+    four = cfg.copy()
+    four.data.series_slots = ["sagittal", "coronal", "axial", "coronal_t1"]
+    base = select_series(four, manifest, meta, out_path=Path(tmp_dir) / "selection_nonfs_base.csv")
+    same = selection[selection["slot"].isin(four.data.series_slots)].reset_index(drop=True)
+    base = base.set_index([STUDY_ID, "slot"]).loc[list(zip(same[STUDY_ID], same["slot"]))].reset_index()
+    assert same[["slot", "volume_id", "selected"]].equals(base[["slot", "volume_id", "selected"]]), "other slots changed"
+
+    # Switching off the fluid-sensitive score bonus must not let fluid-sensitive / unknown series in.
+    no_bonus = five.copy()
+    no_bonus.selection.prefer_fluid_sensitive = False
+    loose = select_series(no_bonus, manifest, meta, out_path=Path(tmp_dir) / "selection_nobonus.csv")
+    loose = loose.set_index([STUDY_ID, "slot"])
+    assert not bool(loose.loc[("d", "sagittal_nonfs"), "selected"]), (
+        f"prefer_fluid_sensitive=false opened the nonfs filter: {loose.loc[('d', 'sagittal_nonfs'), 'volume_id']}"
+    )
+    # Without any series csv nothing is known to be non-FS, so nonfs stays empty everywhere.
+    blind = select_series(five, manifest, None, out_path=Path(tmp_dir) / "selection_nometa.csv")
+    assert not blind[blind["slot"] == "sagittal_nonfs"]["selected"].any(), "nonfs passed without FS metadata"
+
+    pd_pref = five.copy()
+    pd_pref.selection.fluid_te_preference = "pd"
+    validate_config(pd_pref)
+    picked = select_series(pd_pref, manifest, meta, out_path=Path(tmp_dir) / "selection_pdpref.csv")
+    picked = picked.set_index([STUDY_ID, "slot"])["volume_id"]
+    assert picked[("f", "coronal")] == "f.cor_fs35#g0", "fluid_te_preference=pd did not pick the PDFS"
+    bad = five.copy()
+    bad.selection.fluid_te_preference = "t1"
+    try:
+        validate_config(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("fluid_te_preference=t1 was accepted")
+    return "sagittal_nonfs = non-FS spin echo, PD > T1 > T2, FS/fluid/GRE/IR/missing headers or csv refused (also without the fluid bonus), no duplicate; te preference pd -> PDFS"
 
 
 def check_unselected_cache_removed(cfg: Config, tmp_dir) -> str:
@@ -2241,6 +2367,46 @@ class _SideAwareExpectedDataset(_InMemoryStudyBagDataset):
         if slot == "sagittal" and reverse_sagittal:
             image = np.flip(image, axis=0).copy()
         return image, meta
+
+
+class _OwnNormalDataset(_InMemoryStudyBagDataset):
+    """Synthetic volumes whose cache meta carries a slice normal per slot (None: no normal_x key)."""
+
+    NORMALS: dict = {}
+
+    def _load_slot(self, study: str, slot: str) -> tuple[np.ndarray | None, dict]:
+        image, meta = super()._load_slot(study, slot)
+        normal = self.NORMALS.get(slot)
+        return image, ({**meta, "normal_x": normal} if normal is not None else meta)
+
+
+def check_sagittal_own_normal(cfg: Config, tmp_dir) -> str:
+    """Each sagittal slot is ordered by its own cached normal; entries without one use the table's."""
+    from pathlib import Path
+
+    path = Path(tmp_dir) / "laterality_own_normal.csv"
+    pd.DataFrame(
+        {STUDY_ID: ["study0"], "side": ["L"], "side_source": ["tag"], "tag_side": ["L"], "geometry_side": ["L"],
+         "center_x_mm": [70.0], "sagittal_normal_x": [-1.0]}
+    ).to_csv(path, index=False)
+    on = cfg.copy()
+    on.data.series_slots = ["sagittal", "coronal", "axial", "sagittal_nonfs"]
+    on.data.laterality_canonical = True
+    on.paths.laterality_csv = str(path)
+    off = on.copy()
+    off.data.laterality_canonical = False
+    plain = _InMemoryStudyBagDataset(off, ["study0"], None, train=False)[0]["images"]
+
+    def reversed_slots(normals: dict) -> list[bool]:
+        _OwnNormalDataset.NORMALS = normals
+        images = _OwnNormalDataset(on, ["study0"], None, train=False)[0]["images"]
+        return [not torch.equal(images[p], plain[p]) for p in (0, 3)]
+
+    # L knee: lateral is +x. The table's normal (-1) reverses; an own normal of +1 keeps the order.
+    assert reversed_slots({"sagittal": -1.0, "sagittal_nonfs": 1.0}) == [True, False], "own normal ignored"
+    assert reversed_slots({}) == [True, True], "the table fallback was not applied"
+    assert reversed_slots({"sagittal": float("nan"), "sagittal_nonfs": -1.0}) == [True, True], "a NaN normal was trusted"
+    return "a second sagittal slot follows its own slice normal; old entries fall back to laterality.csv"
 
 
 def check_laterality_dataset(cfg: Config, tmp_dir) -> str:
@@ -3418,6 +3584,8 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("laterality_dataset", lambda: check_laterality_dataset(small, tmp_dir)),
             ("override_keys", check_override_keys),
             ("filtered_slot_selection", lambda: check_filtered_slot_selection(small, tmp_dir)),
+            ("nonfs_slot_selection", lambda: check_nonfs_slot_selection(small, tmp_dir)),
+            ("sagittal_own_normal", lambda: check_sagittal_own_normal(small, tmp_dir)),
             ("unselected_cache_removed", lambda: check_unselected_cache_removed(small, tmp_dir)),
             ("dataset_rejects_stale_cache", lambda: check_dataset_rejects_stale_cache(small, tmp_dir)),
             ("depth_zones", check_depth_zones),
@@ -3430,6 +3598,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("patient_group_separation", lambda: check_group_separation(tmp_dir)),
             ("pseudonymous_patient_id", lambda: check_pseudonymous_patient_id(tmp_dir)),
             ("fixed_split", lambda: check_fixed_split(tmp_dir)),
+            ("verify_fixed_split", lambda: check_verify_fixed_split(tmp_dir)),
             ("dataset_contract", lambda: check_dataset_contract(small)),
             ("augment_device_resolution", lambda: check_augment_device_resolution(small)),
             ("augment_device_equivalence", lambda: check_augment_device_equivalence(small)),

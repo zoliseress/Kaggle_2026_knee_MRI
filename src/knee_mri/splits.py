@@ -340,6 +340,54 @@ def make_fixed_split(
     return splits
 
 
+def verify_fixed_split(
+    splits: pd.DataFrame,
+    meta: dict[str, Any],
+    train_ids: list[str],
+    validation_ids: list[str],
+    train_csv: str | Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Check that an existing fixed split still matches the CSVs a run is started with.
+
+    make-fixed-split runs once, so a later run with a different training or validation
+    CSV would otherwise reuse the old split silently. Returns (errors, warnings).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    if meta.get("mode") != "fixed_holdout":
+        errors.append(f"the split is not a fixed hold-out (mode={meta.get('mode')!r})")
+        return errors, warnings
+
+    train_set = set(str(s) for s in train_ids)
+    val_set = set(str(s) for s in validation_ids)
+    fold = splits["fold"].astype(int)
+    split_val = set(splits.loc[fold == FIXED_VALIDATION_FOLD, STUDY_ID].astype(str))
+    split_train = set(splits.loc[fold == FIXED_TRAIN_FOLD, STUDY_ID].astype(str))
+
+    overlap = train_set & val_set
+    if overlap:
+        errors.append(
+            f"{len(overlap)} validation studies also have a row in the training CSV, e.g. {sorted(overlap)[:2]} "
+            "(wrong training CSV for this hold-out?)"
+        )
+    if split_val != val_set:
+        errors.append(
+            f"the split validates {len(split_val)} studies, the validation CSV lists {len(val_set)} "
+            f"({len(split_val - val_set)} only in the split, {len(val_set - split_val)} only in the CSV)"
+        )
+    missing = split_train - train_set
+    if missing:
+        errors.append(f"{len(missing)} training studies of the split have no row in the training CSV, e.g. {sorted(missing)[:2]}")
+    unused = train_set - split_train - val_set
+    if unused:
+        warnings.append(f"{len(unused)} studies of the training CSV are not in the split and will not train")
+
+    source = meta.get("sources", {}).get("train_csv")
+    if train_csv and source and Path(source).resolve() != Path(train_csv).resolve():
+        warnings.append(f"the split was made from {source}, this run trains on {train_csv}")
+    return errors, warnings
+
+
 def _duplicate_reports_across_folds(splits: pd.DataFrame) -> int:
     if "report_hash" not in splits.columns:
         return 0

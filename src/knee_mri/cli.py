@@ -188,6 +188,31 @@ def cmd_make_fixed_split(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_fixed_split(args: argparse.Namespace) -> int:
+    from .schema import read_id_csv
+    from .splits import splits_path, verify_fixed_split
+
+    cfg = _load(args)
+    out = splits_path(cfg)
+    meta_path = out.with_name("splits_meta.json")
+    if not out.exists() or not meta_path.exists():
+        LOG.error("%s or its splits_meta.json is missing; run make-fixed-split first.", out)
+        return 1
+    splits = read_id_csv(out, [STUDY_ID])
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    train_ids = read_id_csv(cfg.paths.train_csv)[STUDY_ID].dropna().astype(str).tolist()
+    validation_ids = read_id_csv(args.validation_csv)[STUDY_ID].dropna().astype(str).tolist()
+    errors, warnings = verify_fixed_split(splits, meta, train_ids, validation_ids, train_csv=cfg.paths.train_csv)
+    for message in warnings:
+        LOG.warning("Fixed split %s: %s", out, message)
+    for message in errors:
+        LOG.error("Fixed split %s: %s", out, message)
+    if errors:
+        return 1
+    LOG.info("Fixed split %s matches %s and %s", out, cfg.paths.train_csv, args.validation_csv)
+    return 0
+
+
 def cmd_qc(args: argparse.Namespace) -> int:
     from .manifest import load_manifest, load_selection
     from .qc import build_qc_gallery
@@ -421,6 +446,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--validation-csv", required=True, help="CSV whose StudyInstanceUIDs form the validation set")
     p.add_argument("--force", action="store_true", help="Replace an existing file at paths.splits_csv")
     p.set_defaults(func=cmd_make_fixed_split)
+
+    p = _common(sub.add_parser("check-fixed-split", help="Refuse a fixed split that does not match train_csv / --validation-csv"))
+    p.add_argument("--validation-csv", required=True, help="CSV whose StudyInstanceUIDs the split must validate")
+    p.set_defaults(func=cmd_check_fixed_split)
 
     p = _common(sub.add_parser("qc", help="Build the QC gallery"))
     p.add_argument("--n-studies", type=int, default=12)

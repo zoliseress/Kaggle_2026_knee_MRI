@@ -13,7 +13,9 @@ paths:
   data_root: "F:/Kaggle/data"
   dicom_root: null                 # default: <data_root>/train_series
   # train_csv: "F:/Kaggle/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
-  train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
+  # train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
+  # train_csv: "F:/Kaggle/data/train_v7.csv"     # soft labels (train_v6 Lixin blend without the 208 reference studies)
+  train_csv: "F:/Kaggle/data/train_v8.csv"     # soft labels (train_v7 with not-mentioned findings 0.25 -> 0.07, Synovitis kept)
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -50,6 +52,9 @@ manifest:
 selection:
   # Ranking heuristic for "one usable series per slot". Image-side information only.
   prefer_fluid_sensitive: true
+  # Among fluid-sensitive candidates: "t2" ranks T2-like TE >= 60 ms above PD-like 25-60 ms
+  # (original); "pd" prefers PDFS (radiologists). A new selection: use its own selection csv + cache_dir.
+  fluid_te_preference: "t2"
   localizer_patterns: ["localiz", "localis", "scout", "survey", "loc_", "3-pl", "3pl", "plan"]
   weights:
     fluid_sensitive: 3.0
@@ -63,7 +68,8 @@ selection:
 data:
   image_size: 224                  # DINOv2: a multiple of 14 (224 -> 16x16 patches, 336 -> 24x24); 320/384 are refused
   fov_mm: 150.0
-  series_slots: ["sagittal", "coronal", "axial"]  # optional extra slot: "coronal_t1" (non-FS T1, constants.SLOT_FILTERS)
+  # optional extra slots (constants.SLOT_FILTERS): "coronal_t1" (non-FS T1), "sagittal_nonfs" (non-FS PD > T1 > T2)
+  series_slots: ["sagittal", "coronal", "axial"]
   centers_per_series: 24
   adjacent_slices: 3
   crop_center: "foreground"        # foreground|foreground_extent|geometric (extent: midpoint between the skin lines)
