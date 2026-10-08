@@ -39,3 +39,35 @@ python -m pytest tests2 -q
 The first five images use synthetic MRI-like stacks only and neither read DICOM files
 nor depend on the local cache. The sixth image is optional and reads only the DICOM
 series passed through `--dicom-series-dir`.
+
+## 150 mm crop of the flagged wide-FOV series
+
+`flagged_wide_fov_crops.py` runs the production crop-centre policy and 150 mm physical
+crop (settings from `src/config.yaml`) on the six wide-field series in which a strip of
+the other leg is visible at the image edge, and for comparison the `geometric` centre
+(`--crop-centers` selects other extra policies). For each series and policy it writes the cropped volume
+as a 3D NRRD (canonical in-plane orientation, voxel spacing set, padding written as 0)
+and a PNG with the source middle slice, the crop box and the cropped middle slice. It
+reads the DICOM files under the config's DICOM root and needs `pynrrd`:
+
+```powershell
+python tests2\flagged_wide_fov_crops.py
+```
+
+Output: `tests2/artifacts/flagged_wide_fov_crops/`; the config's policy writes
+`<nn>_<study>_<series>.nrrd/.png`, the others add a `_<policy>` suffix.
+
+## Crop-centre policy comparison
+
+`crop_center_policy_comparison.py` runs every selected series of a seeded random study
+sample (by default the same 500 studies as `cli qc-edges`) through the production path
+with each crop-centre policy (`foreground`, `foreground_extent`, `geometric`) and scores
+the result with the `qc-edges` crop-edge metric (edge band tissue fraction > 0.3 = cut)
+and the crop padding fraction. It decodes DICOM, so it takes a while:
+
+```powershell
+python tests2\crop_center_policy_comparison.py --workers 12
+```
+
+Output: `tests2/artifacts/crop_center_comparison/` (`per_series.csv`, `summary.csv`,
+`paired.csv`, `divergent_<slot>.png`).
