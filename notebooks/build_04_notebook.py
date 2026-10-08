@@ -1,6 +1,9 @@
 """Generate the Kaggle inference notebook and a flat, locally runnable copy.
 
-Usage:  python notebooks/build_04_notebook.py <out.ipynb> <out_flat.py>
+Usage:  python notebooks/build_04_notebook.py [--ensemble NAME] [<out_flat.py>]
+
+--ensemble picks the checkpoint set from ENSEMBLES (default: main12); both notebooks
+are rewritten with it.
 
 The notebook cells live here as strings so that the .py used for local verification
 and the .ipynb shipped to Kaggle are generated from exactly the same source. Edit the
@@ -28,8 +31,9 @@ def code(text: str) -> None:
 md(r"""
 # RSNA Knee Abnormality Detection — teszt inferencia
 
-EfficientNet-B0 2.5D MIL baseline (`knee_mri` csomag) futtatása a verseny **teszt**
-adathalmazán, `submission.csv` előállításával.
+2.5D MIL ensemble (`knee_mri` csomag) futtatása a verseny **teszt** adathalmazán,
+`submission.csv` előállításával. {{ENSEMBLE_DESC}} A normalizálás futásonként eltér
+(`mri_scalar`, ill. az R50-nél `radimagenet_torch`); a notebook mindegyiknek a sajátját adja.
 
 A notebook **nem** duplikálja a pipeline-t: a repóban levő, tanításkor is használt
 függvényeket hívja (`build_manifest` → `select_series` → `build_cache` → modell),
@@ -123,9 +127,18 @@ for label, path in (("COMPETITION_DIR", COMP_DIR / "test.csv"),
     if not path.exists():
         raise FileNotFoundError("{} is wrong: {} does not exist".format(label, path))
 
-CHECKPOINTS = sorted(Path(p) for p in glob.glob(CHECKPOINT_GLOB))
+# One pattern, several joined by ";", or a list of them (e.g. several runs in one ensemble).
+_PATTERNS = (
+    [part.strip() for part in CHECKPOINT_GLOB.split(";") if part.strip()]
+    if isinstance(CHECKPOINT_GLOB, str)
+    else list(CHECKPOINT_GLOB)
+)
+CHECKPOINTS = sorted({Path(p) for pattern in _PATTERNS for p in glob.glob(pattern)})
 if not CHECKPOINTS:
-    raise FileNotFoundError("CHECKPOINT_GLOB matches nothing: " + CHECKPOINT_GLOB)
+    raise FileNotFoundError("CHECKPOINT_GLOB matches nothing: {}".format(_PATTERNS))
+empty = [pattern for pattern in _PATTERNS if not glob.glob(pattern)]
+if empty:
+    raise FileNotFoundError("CHECKPOINT_GLOB pattern(s) match nothing: {}".format(empty))
 
 sys.path.insert(0, str(CODE_DIR))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,6 +178,7 @@ from knee_mri.config import load_config, resolve_paths, validate_config
 from knee_mri.constants import SERIES_ID, STUDY_ID, TARGETS
 from knee_mri.dataset import StudyBagDataset, collate_studies
 from knee_mri.evaluate import load_checkpoint_for_inference
+from knee_mri.laterality import build_laterality
 from knee_mri.manifest import build_manifest, select_series
 from knee_mri.preprocess import build_cache, cache_root, preprocess_hash, preprocess_signature
 from knee_mri.utils import LOG, autocast_ctx, environment_report, seed_everything, select_device
@@ -250,8 +264,23 @@ print(device_spec.describe())
 
 models = []
 ckpt_rows = []
+# data.laterality_canonical, data.encoder_normalization and data.series_slots are per run:
+# canonical models read mirrored/reordered bags, each encoder gets its own input normalisation
+# (e.g. B0 mri_scalar, RadImageNet R50 radimagenet_torch), and a model may read an extra slot
+# (e.g. coronal_t1, sagittal_nonfs). All three are applied when a bag is read, not in the cache, so every group
+# reads the same cache through its own dataset; the ensemble mean runs over all models.
+# Selection and caching cover the union of the slots.
+MODEL_GROUPS = {}
 for path in CHECKPOINTS:
-    model, payload = load_checkpoint_for_inference(cfg, path)
+    run_cfg = load_config(path.parent / "config.yaml", resolve=False)
+    canonical = bool(run_cfg.get_dotted("data.laterality_canonical", False))
+    normalization = str(run_cfg.get_dotted("data.encoder_normalization", cfg.data.encoder_normalization))
+    slots = tuple(run_cfg.get_dotted("data.series_slots", cfg.data.series_slots))
+    model_cfg = cfg.copy()
+    model_cfg.set_dotted("data.laterality_canonical", canonical)
+    model_cfg.set_dotted("data.encoder_normalization", normalization)
+    model_cfg.set_dotted("data.series_slots", list(slots))
+    model, payload = load_checkpoint_for_inference(model_cfg, path)
     stored_prep = str(payload.get("versions", {}).get("prep_hash", ""))
     if stored_prep and stored_prep != PREP_HASH:
         message = (
@@ -263,9 +292,13 @@ for path in CHECKPOINTS:
         LOG.warning(message)
     model = model.to(device_spec.device).eval()
     models.append(model)
+    MODEL_GROUPS.setdefault((canonical, normalization, slots), []).append(model)
     ckpt_rows.append(
         {
             "checkpoint": str(path),
+            "laterality_canonical": canonical,
+            "encoder_normalization": normalization,
+            "series_slots": ",".join(slots),
             "epoch": payload.get("epoch"),
             "best_epoch": payload.get("best_epoch"),
             "best_score": payload.get("best_score"),
@@ -277,8 +310,19 @@ for path in CHECKPOINTS:
 
 print("\n{} checkpoint(s) loaded on {}; probabilities are averaged over them.".format(
     len(models), device_spec.device))
-print(pd.DataFrame(ckpt_rows)[["checkpoint", "best_epoch", "best_score", "prep_hash"]]
+print(pd.DataFrame(ckpt_rows)[["checkpoint", "best_epoch", "best_score", "prep_hash", "laterality_canonical",
+                               "encoder_normalization", "series_slots"]]
       .to_string(index=False))
+print("input groups (laterality_canonical, encoder_normalization, series_slots):",
+      {key: len(group) for key, group in MODEL_GROUPS.items()})
+NEEDS_LATERALITY = any(canonical for canonical, _, _ in MODEL_GROUPS)
+# Select and cache every slot any model reads, in first-seen order.
+ALL_SLOTS = []
+for _, _, slots in MODEL_GROUPS:
+    ALL_SLOTS += [slot for slot in slots if slot not in ALL_SLOTS]
+cfg.set_dotted("data.series_slots", ALL_SLOTS)
+validate_config(cfg)
+print("slots selected and cached:", ALL_SLOTS)
 """)
 
 # ======================================================================================
@@ -345,46 +389,62 @@ md(r"""
 
 `predict_studies_ensemble` a `knee_mri.evaluate.predict_studies` mintáját követi
 (`model.eval()`, `torch.inference_mode()`, augmentáció és TTA nélkül), annyi
-eltéréssel, hogy egy cache-olvasásból mind a három modellt kiszolgálja.
+eltéréssel, hogy egy cache-ből az összes modellt kiszolgálja. A modellek
+(`laterality_canonical`, `encoder_normalization`) szerint csoportosulnak: a kanonikus
+keretű modellek a tükrözött/átrendezett bageket kapják, a többiek a simákat, és minden
+csoport a saját encoderének normalizálásával olvas.
 """)
 
 code(r"""
 @torch.inference_mode()
-def predict_studies_ensemble(cfg, models, study_ids, device_spec):
-    '''Deterministic inference over one chunk; mean of the per-checkpoint sigmoids.'''
+def predict_studies_ensemble(cfg, model_groups, study_ids, device_spec):
+    '''Deterministic inference over one chunk; mean of the per-checkpoint sigmoids.
+
+    `model_groups` maps (data.laterality_canonical, data.encoder_normalization, data.series_slots)
+    -> models: each group reads its own bags (plain or in the canonical medial/lateral frame, with
+    its encoder's normalisation and its slots), the mean runs over every model.
+    '''
     from torch.utils.data import DataLoader
 
-    dataset = StudyBagDataset(cfg, list(study_ids), label_table=None, train=False)
-    loader = DataLoader(
-        dataset,
-        batch_size=max(1, int(cfg.train.eval_batch_studies)),
-        shuffle=False,
-        num_workers=int(cfg.train.num_workers),
-        collate_fn=collate_studies,
-        pin_memory=device_spec.device.type == "cuda",
-    )
-    ids: list[str] = []
-    scores: list[np.ndarray] = []
-    slots_present: list[int] = []
-    for batch in loader:
-        images = batch["images"].to(device_spec.device, non_blocking=True)
-        slice_valid = batch["slice_valid_mask"].to(device_spec.device, non_blocking=True)
-        present = batch["series_present_mask"].to(device_spec.device, non_blocking=True)
-        total = None
-        for model in models:
-            with autocast_ctx(device_spec):
-                logits = model(images, slice_valid, present)
-            probs = torch.sigmoid(logits.float())
-            total = probs if total is None else total + probs
-        scores.append((total / len(models)).cpu().numpy())
-        ids.extend(batch["study_ids"])
-        slots_present.extend(int(m["n_present_slots"]) for m in batch["meta"])
+    order = [str(s) for s in study_ids]
+    totals = {}
+    slots_present = {}
+    n_models = sum(len(group) for group in model_groups.values())
+    for (canonical, normalization, slots), group in model_groups.items():
+        group_cfg = cfg.copy()
+        group_cfg.set_dotted("data.laterality_canonical", bool(canonical))
+        group_cfg.set_dotted("data.encoder_normalization", str(normalization))
+        group_cfg.set_dotted("data.series_slots", list(slots))
+        # The cache stage just ran and reports its own failures: a failed series counts as missing.
+        dataset = StudyBagDataset(group_cfg, order, label_table=None, train=False, allow_unbuilt_cache=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=max(1, int(cfg.train.eval_batch_studies)),
+            shuffle=False,
+            num_workers=int(cfg.train.num_workers),
+            collate_fn=collate_studies,
+            pin_memory=device_spec.device.type == "cuda",
+        )
+        for batch in loader:
+            images = batch["images"].to(device_spec.device, non_blocking=True)
+            slice_valid = batch["slice_valid_mask"].to(device_spec.device, non_blocking=True)
+            present = batch["series_present_mask"].to(device_spec.device, non_blocking=True)
+            total = None
+            for model in group:
+                with autocast_ctx(device_spec):
+                    logits = model(images, slice_valid, present)
+                probs = torch.sigmoid(logits.float())
+                total = probs if total is None else total + probs
+            for study, row, meta in zip(batch["study_ids"], total.cpu().numpy(), batch["meta"]):
+                totals[study] = totals.get(study, 0.0) + row
+                slots_present[study] = int(meta["n_present_slots"])
+    ids = [s for s in order if s in totals]
     stacked = (
-        np.concatenate(scores, axis=0)
-        if scores
+        np.stack([totals[s] / n_models for s in ids]).astype(np.float32)
+        if ids
         else np.zeros((0, len(TARGETS)), dtype=np.float32)
     )
-    return ids, stacked, slots_present
+    return ids, stacked, [slots_present[s] for s in ids]
 
 
 def stage(prefix, name, detail, seconds):
@@ -392,9 +452,10 @@ def stage(prefix, name, detail, seconds):
     print("{}   {:<9} {:<44} {:6.1f} s".format(prefix, name, detail, seconds), flush=True)
 
 
-def process_chunk(cfg, models, chunk_ids, series_meta, device_spec, chunk_dir, prefix=""):
+def process_chunk(cfg, model_groups, chunk_ids, series_meta, device_spec, chunk_dir, prefix=""):
     '''Manifest -> selection -> cache -> prediction for one chunk of studies.'''
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    models = [model for group in model_groups.values() for model in group]
     n_slots = len(cfg.data.series_slots)
 
     started = time.time()
@@ -408,6 +469,9 @@ def process_chunk(cfg, models, chunk_ids, series_meta, device_spec, chunk_dir, p
     selection = select_series(
         cfg, manifest, series_meta=series_meta, out_path=chunk_dir / "series_selection.csv"
     )
+    # The dataset checks every cache entry against this chunk's selection.
+    cfg = cfg.copy()
+    cfg.set_dotted("paths.series_selection_csv", str(chunk_dir / "series_selection.csv"))
     selected = selection["selected"].fillna(False).astype(bool)
     per_study = selection[selected].groupby(STUDY_ID).size() if int(selected.sum()) else []
     stage(prefix, "selection",
@@ -427,8 +491,17 @@ def process_chunk(cfg, models, chunk_ids, series_meta, device_spec, chunk_dir, p
           ", ".join("{} {}".format(v, k) for k, v in counts.items()) or "nothing to cache",
           time.time() - started)
 
+    if NEEDS_LATERALITY:
+        # Right/left knee per study (DICOM tag, else geometry) for the canonical-frame models.
+        started = time.time()
+        cfg.set_dotted("paths.laterality_csv", str(chunk_dir / "laterality.csv"))
+        sides = build_laterality(cfg, manifest, selection, workers=CACHE_WORKERS)
+        stage(prefix, "laterality",
+              ", ".join("{} {}".format(v, k or "unresolved") for k, v in sides["side"].value_counts().items()),
+              time.time() - started)
+
     started = time.time()
-    ids, scores, slots_present = predict_studies_ensemble(cfg, models, chunk_ids, device_spec)
+    ids, scores, slots_present = predict_studies_ensemble(cfg, model_groups, chunk_ids, device_spec)
     stage(prefix, "predict",
           "{} {} x {} model(s)".format(
               len(ids), "study" if len(ids) == 1 else "studies", len(models)),
@@ -502,7 +575,7 @@ for index, chunk_ids in enumerate(CHUNKS, 1):
         prefix, first, first + len(chunk_ids) - 1, len(study_ids)), flush=True)
     try:
         ids, scores, slots_present, coverage = process_chunk(
-            cfg, models, chunk_ids, series_meta, device_spec,
+            cfg, MODEL_GROUPS, chunk_ids, series_meta, device_spec,
             WORK_DIR / "chunks" / "{:05d}".format(index), prefix,
         )
         pred_ids.extend(ids)
@@ -647,8 +720,9 @@ md(r"""
 GPU. A futás közben kiírt `studies/min` az első chunk után már reális — ebből látszik, hogy
 belefér-e az időkeretbe. Ha nem: `CHUNK_STUDIES` növelése nem segít, viszont a
 `data.centers_per_series` csökkentése (pl. 24 → 16) közel arányosan gyorsít a GPU oldalon,
-egyetlen foldra szűkített `CHECKPOINT_GLOB` pedig harmadolja a forward időt.
-Mindkettő ront a pontosságon.
+a `CHECKPOINT_GLOB` szűkítése (pl. csak az egyik család 3 foldja) pedig arányosan
+csökkenti a forward időt; a V2S forwardja kb. 3×, az R50-é szintén jóval drágább a B0-énál.
+{{FALLBACK}}
 
 **`submission.csv` mindenképpen készül.** Hibás chunk vagy időtúllépés esetén az érintett
 study-k a már kiszámolt predikciók célváltozónkénti átlagát kapják; a `run_meta.json`
@@ -668,7 +742,7 @@ Ha a rejtett teszt tömörített, a manifest hangosan elhasal — ilyenkor a `py
 (vagy `gdcm`) wheel-eket dataset-ként kell csatolni, mert internet nincs.
 
 **GPU memória.** Alapértelmezetten `EVAL_BATCH_STUDIES=2`, ami studynként
-3 × 24 = 72 tripletet jelent, 224 × 224-en. Kevesebb memóriához vedd 1-re.
+3 × 24 = 72 tripletet jelent, 320 × 320-on. Kevesebb memóriához vedd 1-re.
 """)
 
 
@@ -677,49 +751,199 @@ Ha a rejtett teszt tömörített, a manifest hangosan elhasal — ilyenkor a `py
 # ======================================================================================
 
 REPO = Path(__file__).resolve().parents[1]
+LOCAL_RUNS = "h:/Work/ai_development_sandbox/kaggle_2026/work/runs"
+KAGGLE_DATASETS = "/kaggle/input/datasets/zoltanseress"
 
-VARIANTS = {
-    "local": {
-        "notebook": REPO / "notebooks" / "04_kaggle_test_local.ipynb",
-        "package": "knee_mri",
-        "paths": '''COMPETITION_DIR    = "f:/Kaggle/data"
-CODE_DIR           = "h:/Work/ai_development_sandbox/kaggle_2026/src"   # contains knee_mri/
-CHECKPOINT_GLOB    = "h:/Work/ai_development_sandbox/kaggle_2026/work/runs/cv3_20260920_*/best.pt"
-WORK_DIR           = "h:/Work/ai_development_sandbox/kaggle_2026/work/knee_infer"
-SUBMISSION_PATH    = "h:/Work/ai_development_sandbox/kaggle_2026/work/submission.csv"''',
-        "intro_paths": '''## Ez a **lokális** változat
+# Checkpoint sets. A member is (run directory under work/runs without the _foldN suffix,
+# Kaggle dataset name without the -foldN suffix); every member contributes folds 0-2.
+# A member with a third element SINGLE is one run directory / one dataset, taken as named
+# (e.g. a holdout158 run), and contributes one checkpoint.
+SINGLE = "single"
+ENSEMBLES = {
+    "main12": {
+        "members": [
+            ("train_v2/E3_sidepool_s42_cv3_20260928_072217", "knee-e3"),
+            ("train_v2/R50_All_E3_img320", "knee-r50"),
+            ("train_v3/E3_img320_trainv3", "knee-e3v3"),
+            ("train_v2/V2S_E3_img320_cv3", "knee-v2se3"),
+        ],
+        "desc": """A beküldött ensemble: **E3** (EfficientNet-B0, target
+attention, kanonikus mediális/laterális keret, side pooling, EMA; 3 fold) + **R50**
+(RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel; 3 fold) + **E3_v3** (az E3,
+train_v3 címkékkel tanítva; 3 fold) + **V2S_E3** (EfficientNetV2-S az E3 fejével és
+kerettel; 3 fold), a 12 modell sigmoid-átlaga.""",
+        "fallback": """Ha nem fér bele, az E3 (train_v2) foldok elhagyása (R50 + E3_v3 + V2S_E3, 9 modell) a
+tartalék; végső tartalék az E3 + R50 (LB 0.917).
+Mindkettő ront a pontosságon.""",
+    },
+    "v3": {
+        "members": [
+            ("train_v3/E3_img320_trainv3", "knee-e3v3"),
+            ("train_v3/R50_E3_img320_trainv3_cv3_20261001_110141", "knee-r50v3"),
+            ("train_v3/V2S_E3_img320_train_v3_cv3_20261001_112722", "knee-v2sv3"),
+        ],
+        "desc": """A beküldött ensemble csak train_v3 címkékkel tanított
+modellekből áll: **E3_v3** (EfficientNet-B0, target attention, kanonikus mediális/laterális
+keret, side pooling, EMA; 3 fold) + **R50_v3** (RadImageNet ResNet-50, ugyanezzel a fejjel
+és kerettel; 3 fold) + **V2S_v3** (EfficientNetV2-S az E3 fejével és kerettel; 3 fold),
+a 9 modell sigmoid-átlaga.""",
+        "fallback": """Ha nem fér bele, a V2S_v3 foldok elhagyása (E3_v3 + R50_v3, 6 modell) a tartalék;
+ez ront a pontosságon.""",
+    },
+    "holdout3": {
+        "members": [
+            ("train_v4/B0_E3_img320_trainv4_holdout158", "knee-b0-holdout", SINGLE),
+            ("train_v4/R50_E3_img320_trainv4_holdout158", "knee-r50-holdout", SINGLE),
+            ("train_v4/V2S_E3_img320_trainv4_holdout158", "knee-v2s-holdout", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül, a train_v4 címkén
+(a train_v2 a 158 radiológus-studyja nélkül, 4249 study) tanított modellből áll:
+**B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side
+pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) +
+**V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
+    "holdout3_v6": {
+        "members": [
+            ("train_v6/B0_E3_img320_trainv6_holdout158_20261003_223313", "knee-b0-holdout-v6", SINGLE),
+            ("train_v6/R50_E3_img320_trainv6_holdout158_20261004_081434", "knee-r50-holdout-v6", SINGLE),
+            ("train_v6/V2S_E3_img320_trainv6_holdout158_20261003_222517", "knee-v2s-holdout-v6", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül, a train_v6 címkén
+(Lixin blend LLM-címke a 158 radiológus-study nélkül, 4249 study) tanított modellből áll:
+**B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side
+pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) +
+**V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
+    "holdout3_v8": {
+        "members": [
+            ("train_v8/B0_E3_img320_trainv8_holdout208_20261006_220251", "knee-b0-holdout-v8", SINGLE),
+            ("train_v8/R50_E3_img320_trainv8_holdout208_20261007_003442", "knee-r50-holdout-v8", SINGLE),
+            ("train_v8/V2S_E3_img320_trainv8_holdout208_20261007_053337", "knee-v2s-holdout-v8", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül, a train_v8 címkén
+(a train_v6 Lixin blend a 208 radiológus-study nélkül, 4199 study; a jelentésben nem említett
+eltérések 0.25 helyett 0.07, a Synovitis kivételével) tanított modellből áll:
+**B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side
+pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) +
+**V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
+    "holdout3_v6_r50t1": {
+        "members": [
+            ("train_v6/B0_E3_img320_trainv6_holdout158_20261003_223313", "knee-b0-holdout-v6", SINGLE),
+            ("train_v6/R50_E3T1_img320_trainv6_holdout158_20261005_063638", "knee-r50t1-holdout-v6", SINGLE),
+            ("train_v6/V2S_E3_img320_trainv6_holdout158_20261003_222517", "knee-v2s-holdout-v6", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül, a train_v6 címkén
+(Lixin blend LLM-címke a 158 radiológus-study nélkül, 4249 study) tanított modellből áll:
+**B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side
+pooling, EMA) + **R50_E3T1** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel, egy
+4. bemeneti slottal: coronal T1) + **V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és
+kerettel), a 3 modell sigmoid-átlaga. A sorozatkiválasztás és a cache a 4 slot unióját
+fedi le; a 3 slotos modellek a coronal T1-et nem olvassák.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
+    "holdout6": {
+        "members": [
+            ("train_v4/B0_E3_img320_trainv4_holdout158", "knee-b0-holdout", SINGLE),
+            ("train_v4/R50_E3_img320_trainv4_holdout158", "knee-r50-holdout", SINGLE),
+            ("train_v4/V2S_E3_img320_trainv4_holdout158", "knee-v2s-holdout", SINGLE),
+            ("train_v6/B0_E3_img320_trainv6_holdout158_20261003_223313", "knee-b0-holdout-v6", SINGLE),
+            ("train_v6/R50_E3_img320_trainv6_holdout158_20261004_081434", "knee-r50-holdout-v6", SINGLE),
+            ("train_v6/V2S_E3_img320_trainv6_holdout158_20261003_222517", "knee-v2s-holdout-v6", SINGLE),
+        ],
+        "desc": """A beküldött ensemble hat, foldok nélkül tanított modellből áll:
+a B0_E3, R50_E3 és V2S_E3 (EfficientNet-B0, RadImageNet ResNet-50, EfficientNetV2-S; target
+attention, kanonikus mediális/laterális keret, side pooling, EMA) egyszer a train_v4
+(Qwen soft címke), egyszer a train_v6 (Lixin blend címke) címkén, mindkettő a 158
+radiológus-study nélkül; a 6 modell sigmoid-átlaga.""",
+        "fallback": """Ha nem fér bele, a train_v6 hármas (holdout3_v6, 3 modell) a tartalék.""",
+    },
+}
+
+
+def _glob_lines(name: str, patterns: list[str]) -> str:
+    joined = ';"\n{}"'.format(" " * 22).join(patterns)
+    return '{} = ("{}")'.format(name.ljust(18), joined)
+
+
+def make_variants(ensemble: dict) -> dict:
+    """The two deployments (local, Kaggle) for one checkpoint set."""
+    # Directory patterns per member (local run dir, Kaggle dataset) and, for the layout, one
+    # (dataset dir, training run name) row per checkpoint.
+    local_dirs, online_patterns, online_dirs = [], [], []
+    for run, ds, *kind in ensemble["members"]:
+        name = run.split("/")[-1]
+        if kind == [SINGLE]:
+            local_dirs.append(run)
+            online_patterns.append(ds)
+            online_dirs.append((ds, name))
+        else:
+            local_dirs.append(run + "_fold[012]")
+            online_patterns.append(ds + "-fold[012]")
+            online_dirs += [("{}-fold{}".format(ds, fold), "{}_fold{}".format(name, fold)) for fold in range(3)]
+    local_globs = ["{}/{}/best.pt".format(LOCAL_RUNS, d) for d in local_dirs]
+    online_globs = ["{}/{}/best.pt".format(KAGGLE_DATASETS, p) for p in online_patterns]
+    local_layout = "\n".join(
+        "{}  best.pt, config.yaml".format("<repo>/work/runs/{}/".format(d).ljust(71)) for d in local_dirs
+    )
+    online_layout = "\n".join(
+        "{}  best.pt, config.yaml  ({})".format("{}/{}/".format(KAGGLE_DATASETS, ds).ljust(61), name)
+        for ds, name in online_dirs
+    )
+    shared = {"ENSEMBLE_DESC": ensemble["desc"], "FALLBACK": ensemble["fallback"]}
+    return {
+        "local": {
+            "notebook": REPO / "notebooks" / "04_kaggle_test_local.ipynb",
+            "package": "knee_mri",
+            "paths": "\n".join([
+                'COMPETITION_DIR    = "f:/Kaggle/data"',
+                'CODE_DIR           = "h:/Work/ai_development_sandbox/kaggle_2026/src"   # contains knee_mri/',
+                _glob_lines("CHECKPOINT_GLOB", local_globs),
+                'WORK_DIR           = "h:/Work/ai_development_sandbox/kaggle_2026/work/knee_infer"',
+                'SUBMISSION_PATH    = "h:/Work/ai_development_sandbox/kaggle_2026/work/submission.csv"',
+            ]),
+            "intro_paths": """## Ez a **lokális** változat
 
 A repo `src/` mappájából importál és az `F:/Kaggle/data` exportból dolgozik — a publikus
 teszt 3 study-ján próbálható. A Kaggle-re felmenő párja a `04_kaggle_test_online.ipynb`;
-a kettő csak az 1. cella útvonalaiban és a csomagnévben tér el.''',
-        "layout": '''```
-f:/Kaggle/data/                       test.csv, test_series/
-<repo>/src/                           knee_mri/*.py
-<repo>/work/runs/cv3_*_fold[012]/     best.pt, config.yaml
-```''',
-    },
-    "online": {
-        "notebook": REPO / "notebooks" / "04_kaggle_test_online.ipynb",
-        "package": "srcknee2",
-        "paths": '''COMPETITION_DIR    = "/kaggle/input/competitions/rsna-knee-abnormality-detection"
-CODE_DIR           = "/kaggle/input/datasets/zoltanseress"   # contains srcknee2/
-CHECKPOINT_GLOB    = "/kaggle/input/datasets/zoltanseress/checkpointsfold*best-py/best.pt"
-WORK_DIR           = "/kaggle/working/knee_infer"
-SUBMISSION_PATH    = "/kaggle/working/submission.csv"''',
-        "intro_paths": '''## Ez a **Kaggle** változat
+a kettő csak az 1. cella útvonalaiban és a csomagnévben tér el.""",
+            "layout": "\n".join([
+                "```",
+                "f:/Kaggle/data/                       test.csv, test_series/",
+                "<repo>/src/                           knee_mri/*.py",
+                local_layout,
+                "```",
+            ]),
+            **shared,
+        },
+        "online": {
+            "notebook": REPO / "notebooks" / "04_kaggle_test_online.ipynb",
+            "package": "srcknee2",
+            "paths": "\n".join([
+                'COMPETITION_DIR    = "/kaggle/input/competitions/rsna-knee-abnormality-detection"',
+                'CODE_DIR           = "/kaggle/input/datasets/zoltanseress"   # contains srcknee2/',
+                _glob_lines("CHECKPOINT_GLOB", online_globs),
+                'WORK_DIR           = "/kaggle/working/knee_infer"',
+                'SUBMISSION_PATH    = "/kaggle/working/submission.csv"',
+            ]),
+            "intro_paths": """## Ez a **Kaggle** változat
 
 Csatolt datasetekből dolgozik; a lokális párja a `04_kaggle_test_local.ipynb`, a kettő
 csak az 1. cella útvonalaiban és a csomagnévben tér el. Ha átnevezed a datasetjeidet,
-az 1. cellában írd át az útvonalakat.''',
-        "layout": '''```
-/kaggle/input/competitions/rsna-knee-abnormality-detection/   test.csv, test_series/
-/kaggle/input/datasets/zoltanseress/                          srcknee2/*.py
-/kaggle/input/datasets/zoltanseress/checkpointsfold0best-py/  best.pt, config.yaml
-/kaggle/input/datasets/zoltanseress/checkpointsfold1best-py/  best.pt, config.yaml
-/kaggle/input/datasets/zoltanseress/checkpointsfold2best-py/  best.pt, config.yaml
-```''',
-    },
-}
+az 1. cellában írd át az útvonalakat.""",
+            "layout": "\n".join([
+                "```",
+                "/kaggle/input/competitions/rsna-knee-abnormality-detection/   test.csv, test_series/",
+                "/kaggle/input/datasets/zoltanseress/                          srcknee2/*.py",
+                online_layout,
+                "```",
+            ]),
+            **shared,
+        },
+    }
 
 
 def render(source: str, variant: dict) -> str:
@@ -728,6 +952,8 @@ def render(source: str, variant: dict) -> str:
         source.replace("{{PATHS}}", variant["paths"])
         .replace("{{INTRO_PATHS}}", variant["intro_paths"])
         .replace("{{LAYOUT}}", variant["layout"])
+        .replace("{{ENSEMBLE_DESC}}", variant["ENSEMBLE_DESC"])
+        .replace("{{FALLBACK}}", variant["FALLBACK"])
     )
     return text.replace("knee_mri", variant["package"])
 
@@ -805,7 +1031,17 @@ def build_flat(variant: dict, flat: Path) -> None:
 
 
 if __name__ == "__main__":
+    args = sys.argv[1:]
+    name = "main12"
+    if "--ensemble" in args:
+        i = args.index("--ensemble")
+        name = args[i + 1]
+        del args[i:i + 2]
+    if name not in ENSEMBLES:
+        sys.exit("unknown ensemble {!r}; choose from {}".format(name, sorted(ENSEMBLES)))
+    print("ensemble:", name)
+    VARIANTS = make_variants(ENSEMBLES[name])
     for variant in VARIANTS.values():
         build(variant)
-    if len(sys.argv) > 1:                  # optional flat copy of the local variant
-        build_flat(VARIANTS["local"], Path(sys.argv[1]))
+    if args:                               # optional flat copy of the local variant
+        build_flat(VARIANTS["local"], Path(args[0]))
