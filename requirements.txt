@@ -11,6 +11,14 @@ scikit-learn>=1.3
 matplotlib>=3.8
 PyYAML>=6.0
 
+# Only for model.backbone=dinov2_vits14 (verified: timm 1.0.30, huggingface_hub 2.0.0,
+# safetensors 0.8.0). Install timm with --no-deps so pip cannot replace the CUDA torch build:
+#   pip install --no-deps timm && pip install huggingface_hub safetensors
+# Nothing is imported or downloaded until a DINOv2 encoder is built.
+timm>=1.0
+huggingface_hub>=0.20
+safetensors>=0.4
+
 # Optional, only needed for compressed DICOM transfer syntaxes:
 # pylibjpeg
 # pylibjpeg-libjpeg
