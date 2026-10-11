@@ -321,6 +321,11 @@ def cmd_train(args: argparse.Namespace) -> int:
             summary = run_fold(cfg, study_limit=args.n_studies, name=args.name, allow_unready=args.allow_unready)
         if distributed.is_main():
             print(json.dumps(summary, indent=2, default=str))
+    except Exception:
+        # Logged, not re-raised: the traceback then reaches run.log too (once the run got that
+        # far) instead of only the terminal, and the exit code still tells the run script.
+        LOG.exception("Training stopped with an error")
+        return 1
     finally:
         distributed.cleanup()
     return 0
