@@ -16,6 +16,12 @@
 #  ugyanazzal a kiserlettel (8 study / optimizer lepes, ugyanannyi lepes /
 #  epoch). GPU-nkent train.num_workers worker indul. Egy igy inditott run
 #  csak ugyanennyi GPU-val folytathato (--resume).
+#
+#  Probafuttatas reszhalmazon (--n-studies N, barhol allhat): a tanitas a
+#  split elso N studyjan fut, a validacio az elso N/2 referencia-studyn
+#  (N >= 416 eseten mind a 208). A szamok igy nem vethetok ossze a teljes
+#  runokkal; folytatasnal ugyanazt az N-t kell megadni.
+#     ./run_holdout.sh --gpu 0,1 --n-studies 600 DDP_smoke --set train.max_epochs=4
 #  Ha az elso (nem --gpu) argumentum nem "-"-vel kezdodik, az a run nevenek
 #  elotagja: E3_img320_holdout208_<idobelyeg>
 #
@@ -57,10 +63,24 @@ VAL_CSV="${VAL_CSV:-$DATA_ROOT/train_labeled_${HOLDOUT}_reference.csv}"
 SPLITS="${SPLITS:-$ROOT/work/splits/holdout${HOLDOUT}/splits.csv}"
 FROZEN_REF="${FROZEN_REF:-$ROOT/work/labels/frozen_reference_ref${HOLDOUT}.csv}"
 
-# --gpu N / --gpu=N kiszedese (barhol allhat), a tobbi argumentum marad
+# --gpu N / --gpu=N es --n-studies N / --n-studies=N kiszedese (barhol
+# allhat), a tobbi argumentum marad
+N_STUDIES=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --n-studies)
+            if [[ $# -lt 2 ]]; then
+                echo "[HIBA] A --n-studies utan meg kell adni a studyk szamat."
+                exit 1
+            fi
+            N_STUDIES="$2"
+            shift 2
+            ;;
+        --n-studies=*)
+            N_STUDIES="${1#--n-studies=}"
+            shift
+            ;;
         --gpu)
             if [[ $# -lt 2 ]]; then
                 echo "[HIBA] A --gpu utan meg kell adni a GPU id-t."
@@ -80,6 +100,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+if [[ -n "$N_STUDIES" && ! "$N_STUDIES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[HIBA] A --n-studies erteke pozitiv egesz szam legyen, kapott: $N_STUDIES"
+    exit 1
+fi
 
 PREFIX=""
 RESUME=""
@@ -189,6 +213,9 @@ fi
 RUN="$RUNS_DIR/$NAME"
 
 START=()
+if [[ -n "$N_STUDIES" ]]; then
+    START+=(--n-studies "$N_STUDIES")
+fi
 if [[ -n "$RESUME" ]]; then
     if [[ -f "$RUN/run_summary.json" ]]; then
         echo "[INFO] A run mar kesz (run_summary.json), nincs mit folytatni: $RUN"
@@ -199,7 +226,7 @@ if [[ -n "$RESUME" ]]; then
         echo "       Ellenorizd a nevet, es hogy a TRAIN_CSV ugyanaz-e, mint az eredeti inditasnal."
         exit 1
     fi
-    START=(--set "train.resume=$RUN/last.pt")
+    START+=(--set "train.resume=$RUN/last.pt")
 fi
 
 echo "======================================================================"
@@ -210,6 +237,7 @@ echo " Validacio  : $VAL_CSV"
 echo " Config     : $CONFIG"
 echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}$( (( NPROC > 1 )) && echo "  ($NPROC processz, DDP)")"
 echo " Extra args : ${EXTRA[*]:-}"
+[[ -n "$N_STUDIES" ]] && echo " Reszhalmaz : --n-studies $N_STUDIES (proba, nem teljes run)"
 echo " Kimenet    : $RUN"
 echo "======================================================================"
 
@@ -217,7 +245,7 @@ if ! "${TRAIN_LAUNCH[@]}" "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
         --set "split.fold=0" "${PATHS[@]}" --name "$NAME" "${EXTRA[@]}" "${START[@]+"${START[@]}"}"; then
     echo
     echo "[HIBA] A tanitas hibaval leallt. Log: $RUN/run.log"
-    echo "       Folytatas: ./run_holdout.sh ${GPU:+--gpu $GPU }--resume $NAME <ugyanazok az extra argumentumok>"
+    echo "       Folytatas: ./run_holdout.sh ${GPU:+--gpu $GPU }${N_STUDIES:+--n-studies $N_STUDIES }--resume $NAME <ugyanazok az extra argumentumok>"
     exit 1
 fi
 
