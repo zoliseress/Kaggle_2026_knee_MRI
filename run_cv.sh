@@ -9,12 +9,16 @@
 #     ./run_cv.sh --set data.image_size=288 --set train.max_epochs=10
 #     ./run_cv.sh V2soft_img320 --set data.image_size=320
 #     ./run_cv.sh --gpu 1 V2soft_img320 --set data.image_size=320
+#     ./run_cv.sh --gpu 0,1 V2soft_img320 --set data.image_size=320
 #  Minden ide irt extra argumentum MINDHAROM foldra ervenyes.
 #  Ha az elso (nem --gpu) argumentum nem "-"-vel kezdodik, az a run-group
 #  elotagja:
 #     V2soft_img320_cv3_<idobelyeg>_fold<N>, ..._oof
 #  A --gpu N (vagy --gpu=N) barhol allhat; CUDA_VISIBLE_DEVICES=N-t allit,
 #  igy a python oldalon a kivalasztott GPU lesz a cuda:0.
+#  Tobb GPU-id (--gpu 0,1): minden fold mindket GPU-n fut (DDP, torchrun),
+#  ugyanazzal a kiserlettel; egy igy inditott fold csak ugyanennyi GPU-val
+#  folytathato. Alternativa: ket kulon run-group parhuzamosan (--gpu 0 / --gpu 1).
 #
 #  Folytatas: --resume <run-group> (vagy --resume=<run-group>, barhol allhat)
 #     ./run_cv.sh --gpu 3 --resume V2S_E3_img320_train_v3_cv3_20261001_111938 --set ...
@@ -115,6 +119,19 @@ if [[ -n "$GPU" ]]; then
     export CUDA_VISIBLE_DEVICES="$GPU"
 fi
 
+# Tobb GPU (--gpu 0,1): egy tanitas DDP-vel, GPU-nkent egy processz
+# (torchrun = python -m torch.distributed.run, a conda kornyezet python-javal).
+NPROC=1
+if [[ -n "$GPU" ]]; then
+    IFS=',' read -ra GPU_IDS <<< "$GPU"
+    NPROC=${#GPU_IDS[@]}
+fi
+if (( NPROC > 1 )); then
+    TRAIN_LAUNCH=(python -m torch.distributed.run --standalone --nproc_per_node="$NPROC")
+else
+    TRAIN_LAUNCH=(python)
+fi
+
 cd "$ROOT" || exit 1
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -204,7 +221,7 @@ echo " Foldok     : 0 .. $LAST"
 echo " Config     : $CONFIG"
 echo " Train CSV  : $TRAIN_CSV_RESOLVED"
 echo " Split      : $SPLITS"
-echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
+echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}$( (( NPROC > 1 )) && echo "  ($NPROC processz, DDP)")"
 echo " Extra args : ${EXTRA[*]:-}"
 echo " Kimenet    : $RUNS_DIR/${GROUP}_fold<N>"
 echo "======================================================================"
@@ -228,7 +245,7 @@ for ((F = 0; F <= LAST; F++)); do
             START=(--set "train.resume=$RUN/last.pt")
         fi
     fi
-    if ! python "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
+    if ! "${TRAIN_LAUNCH[@]}" "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
             --set "split.fold=$F" --name "$NAME" "${EXTRA[@]}" "${START[@]+"${START[@]}"}"; then
         echo
         echo "[HIBA] A $F. fold hibaval leallt. A script nem folytatja."

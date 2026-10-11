@@ -597,6 +597,43 @@ batch averages. No positive-class weighting or oversampling is used.
   run from a checkpoint's model weights with a fresh optimizer, best score and history.
   Setting both is refused.
 
+### Several GPUs (DDP)
+
+One run can train on several GPUs of one machine with DistributedDataParallel, one process
+per GPU (`src/knee_mri/distributed.py`):
+
+```bash
+./run_holdout.sh --gpu 0,1 E3_img320 --set data.image_size=320    # or run_cv.sh --gpu 0,1 ...
+# by hand: torchrun --standalone --nproc_per_node=2 src/train.py --mode fold --config ... --name ...
+```
+
+It is the **same experiment** as on one GPU, not a bigger batch: `train.accumulation_steps`
+stays the global window (8 studies per optimizer step), each GPU runs `8 / n_gpus` of its
+micro-batches, and rank r takes every n-th study of the same seeded order — the k-th global
+window holds exactly the studies of the single-GPU k-th window, and the epoch-to-epoch order
+is the single-GPU one too. Gradients are all-reduced once per window (`no_sync` before), the
+window-sum objectives (`global`, `window`) are scaled back from DDP's average, and the
+skip/step decisions are taken over all GPUs. Without augmentation randomness the weights match
+a single-process run to ~1e-8 (selftest `ddp_matches_single_process`, CPU/gloo).
+
+* Validation is split across the GPUs and gathered; every rank computes the same metrics, so
+  the best-epoch and early-stopping decisions agree. Only rank 0 logs at INFO and writes files.
+* BatchNorm: train-mode BN normalises each micro-batch with its own statistics, exactly as on one
+  GPU (no SyncBatchNorm, which would pool the GPUs' micro-batches). With
+  `model.freeze_bn_running_stats=false` the running statistics follow each GPU's studies; they
+  (and the EMA's copies) are averaged over the GPUs at every epoch's end, before validation and
+  the checkpoint (selftest `ddp_bn_buffers_in_sync`). They are therefore close to, not identical
+  with, the single-GPU running statistics; with the default `true` nothing changes.
+* Each GPU starts its own `train.num_workers` loader workers (2 × 8 with the Linux config);
+  lower it with `--set train.num_workers=6` if host memory is tight. Under DDP the workers are
+  started with `spawn` (not forked from a process holding CUDA/NCCL state): a few seconds more
+  per validation, and worker warnings (e.g. `Cache read failed`) reach the console, not `run.log`.
+* Exact resume needs the same number of GPUs (`world_size` is in the resume signature; every
+  rank's RNG streams are in `last.pt`). With another count, start from `train.init_weights`.
+* `train.accumulation_steps` must be divisible by the number of GPUs.
+* NCCL on Linux; Windows builds fall back to gloo (works, but slow — not worth it there).
+* For a CV the alternative is two independent folds/run-groups in parallel (`--gpu 0`, `--gpu 1`).
+
 ## Splits and leakage control
 
 `splits.csv` is created before training and persisted with its metadata. DICOM `PatientID`

@@ -16,6 +16,7 @@ import json
 import math
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -23,8 +24,9 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, RandomSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
+from . import distributed as dist_utils
 from .config import Config, save_config
 from .constants import (
     CHECKPOINT_VERSION, DEFAULT_BACKBONE, LABELS_VERSION, PREPROCESS_VERSION, SPLITS_VERSION, STUDY_ID, TARGETS,
@@ -66,6 +68,7 @@ from .utils import (
     LOG,
     add_file_logging,
     atomic_write_dataframe,
+    atomic_torch_save,
     atomic_write_json,
     autocast_ctx,
     log_environment,
@@ -248,9 +251,28 @@ class Trainer:
         self.provenance = provenance or {}
         self.selection_name = str(cfg.eval.get("selection_metric", "macro_soft_auc"))
 
-        self.device_spec = select_device(cfg.train.amp)
+        # Multi-GPU (torchrun): one process per GPU, see distributed.py. `self.model` stays the
+        # bare module (state_dict keys, EMA, validation and checkpoints are unchanged); only the
+        # training forward goes through the DDP wrapper, `self.train_model`.
+        self.world_size = dist_utils.world_size()
+        self.rank = dist_utils.rank()
+        self.device_spec = select_device(cfg.train.amp, dist_utils.device_str())
         LOG.info("Compute: %s", self.device_spec.describe())
         self.model = model.to(self.device_spec.device)
+        self.train_model: torch.nn.Module = self.model
+        if self.world_size > 1:
+            from torch.nn.parallel import DistributedDataParallel
+
+            # Built before the EMA copy: DDP broadcasts rank 0's weights, so every rank (and
+            # every rank's EMA) starts from the same model. No buffer broadcast per forward:
+            # train-mode BatchNorm normalises with the micro-batch's own statistics, as on one
+            # GPU; the running statistics (if not frozen) are averaged at the epoch's end.
+            self.train_model = DistributedDataParallel(
+                self.model,
+                device_ids=[dist_utils.local_rank()] if self.device_spec.device.type == "cuda" else None,
+                broadcast_buffers=False,
+            )
+            LOG.info("DistributedDataParallel: %d processes, this is rank %d", self.world_size, self.rank)
         # Weight EMA (train.ema_decay > 0): validated, selected and saved as "model"; the raw
         # weights keep training and are scored alongside for a paired comparison.
         self.ema_decay = float(cfg.train.get("ema_decay") or 0.0)
@@ -266,7 +288,7 @@ class Trainer:
         self.norm_std = torch.tensor(std, dtype=torch.float32).view(1, 1, 1, 3, 1, 1).to(self.device_spec.device)
         self.augment_noise_std = float(cfg.augment.noise_std or 0.0)
         self.augment_generator = torch.Generator(device=self.device_spec.device)
-        self.augment_generator.manual_seed(int(cfg.seed))
+        self.augment_generator.manual_seed(int(cfg.seed) + self.rank)  # rank 0: the single-device seed
         LOG.info(
             "Augmentation: %s (augment.device=%s, enabled=%s)",
             "on the training device" if self.augment_device == "cuda" else "in the DataLoader workers",
@@ -275,7 +297,11 @@ class Trainer:
         )
 
         self.sampler_generator: torch.Generator | None = None  # set by the shuffled loader
+        self.n_val_studies = len(val_dataset)
         self.train_loader = self._make_loader(train_dataset, shuffle=True, batch_size=int(cfg.train.microbatch_studies))
+        if self.world_size > 1:
+            # Every rank predicts every world_size-th validation study; _score gathers them all.
+            val_dataset = Subset(val_dataset, list(range(self.rank, len(val_dataset), self.world_size)))
         self.val_loader = self._make_loader(
             val_dataset, shuffle=False, batch_size=int(cfg.train.eval_batch_studies), role="eval"
         )
@@ -287,7 +313,14 @@ class Trainer:
                 weight_decay=float(cfg.train.weight_decay),
             )
         )
+        # train.accumulation_steps is the global window; each rank runs its share of it.
         self.accumulation_steps = int(cfg.train.accumulation_steps)
+        if self.accumulation_steps % self.world_size != 0:
+            raise ValueError(
+                f"train.accumulation_steps={self.accumulation_steps} must be divisible by the number of "
+                f"processes ({self.world_size}) so every GPU runs the same share of each window"
+            )
+        self.local_accumulation = self.accumulation_steps // self.world_size
         self.loss_normalization = str(cfg.train.get("loss_normalization", "microbatch"))
         self.global_normalizer: GlobalNormalizer | None = None
         if self.loss_normalization == "global":
@@ -296,7 +329,7 @@ class Trainer:
                 window_studies=int(cfg.train.microbatch_studies) * self.accumulation_steps,
             )
             LOG.info("Global loss denominators D_c (expected weight per window): %s", self.global_normalizer.describe())
-        self.steps_per_epoch = max(1, math.ceil(len(self.train_loader) / self.accumulation_steps))
+        self.steps_per_epoch = max(1, math.ceil(len(self.train_loader) / self.local_accumulation))
         self.scheduler = make_scheduler(
             self.optimizer,
             warmup_steps=self.steps_per_epoch * int(cfg.train.warmup_epochs),
@@ -313,9 +346,15 @@ class Trainer:
             int(cfg.train.microbatch_studies),
             self.accumulation_steps,
             int(cfg.train.microbatch_studies) * self.accumulation_steps,
-            len(self.train_loader),
+            len(self.train_loader) * self.world_size,
             self.steps_per_epoch,
         )
+        if self.world_size > 1:
+            LOG.info(
+                "Per GPU: %d micro-batches per window, %d micro-batches per epoch",
+                self.local_accumulation,
+                len(self.train_loader),
+            )
 
     def _make_loader(self, dataset: Dataset, shuffle: bool, batch_size: int, role: str = "train") -> DataLoader:
         """Build a loader. `role="eval"` uses the evaluation worker budget (see eval_loader_settings).
@@ -339,13 +378,21 @@ class Trainer:
             kwargs["persistent_workers"] = persistent
             if prefetch_factor:
                 kwargs["prefetch_factor"] = int(prefetch_factor)
+            if self.world_size > 1:
+                # DDP: workers start from a clean interpreter, not a fork of a process holding
+                # CUDA contexts and NCCL threads (what Windows always does).
+                kwargs["multiprocessing_context"] = "spawn"
         if shuffle:
             # Same seeded shuffle as `shuffle=True, generator=...`; the EpochSampler only attaches
             # the epoch to every index, because persistent workers never see dataset.set_epoch().
+            # Under DDP every rank draws the same order and takes every world_size-th study of it.
             generator = torch.Generator()
             generator.manual_seed(int(self.cfg.seed))
             kwargs["shuffle"] = False
-            kwargs["sampler"] = EpochSampler(RandomSampler(dataset, generator=generator))
+            sampler: Any = RandomSampler(dataset, generator=generator)
+            if self.world_size > 1:
+                sampler = dist_utils.ShardSampler(sampler, self.rank, self.world_size)
+            kwargs["sampler"] = EpochSampler(sampler)
             self.sampler_generator = generator  # its state is the next epoch's order; checkpointed
         return DataLoader(dataset, **kwargs)
 
@@ -389,6 +436,10 @@ class Trainer:
         # Only when on, so checkpoints from before the key existed still resume.
         if self.ema_decay > 0:
             signature["train.ema_decay"] = self.ema_decay
+        # Only under DDP: the shard order and per-rank RNG streams need the same process count.
+        world_size = getattr(self, "world_size", 1)
+        if world_size > 1:
+            signature["world_size"] = world_size
         signature["train_labels"] = _train_label_fingerprint(train_dataset)
         signature["validation_reference"] = _fingerprint(
             list(self.reference.study_ids), self.reference.values.astype(np.float32), self.reference.valid.astype(bool)
@@ -422,8 +473,27 @@ class Trainer:
             )
 
         with autocast_ctx(self.device_spec):
-            logits = self.model(images, slice_valid, present)
+            logits = self.train_model(images, slice_valid, present)
         return logits, targets, weights
+
+    def _sync_context(self, window_end: bool):
+        """DDP: gradients are all-reduced only at the last backward of an accumulation window."""
+        if self.world_size > 1 and not window_end:
+            return self.train_model.no_sync()
+        return nullcontext()
+
+    def _ddp_loss(self, loss: torch.Tensor, scale: float) -> torch.Tensor:
+        """The loss one rank backpropagates under DDP; unchanged on a single device.
+
+        `scale` undoes DDP's gradient averaging where the objective is a sum over the window.
+        The zero term puts every trainable parameter into the graph: a study without any
+        valid slice skips the encoder (model.py), and DDP refuses a parameter that got no
+        gradient on one rank.
+        """
+        if self.world_size == 1:
+            return loss
+        touch = sum(p.sum() for p in self.model.parameters() if p.requires_grad)
+        return loss * scale + touch * 0.0
 
     def _optimizer_step(self) -> None:
         if float(self.cfg.train.grad_clip) > 0:
@@ -455,7 +525,7 @@ class Trainer:
             accumulator.macro,
             self.optimizer.param_groups[0]["lr"],
             self.optimizer.param_groups[1]["lr"],
-            n_studies / max(elapsed, 1e-6),
+            n_studies * self.world_size / max(elapsed, 1e-6),  # all GPUs together
             peak_gpu_memory_gb(),
         )
 
@@ -476,6 +546,14 @@ class Trainer:
         else:
             accumulator, n_studies, data_failures = self._train_microbatches(epoch, started)
             objective = None
+        if self.world_size > 1:
+            n_studies, data_failures = self._reduce_epoch_counts(accumulator, n_studies, data_failures)
+            # With model.freeze_bn_running_stats=false each rank's BatchNorm running statistics
+            # (and the EMA's copies) followed its own studies. Validation scores every rank's
+            # shard and the checkpoint stores rank 0's: both need one set.
+            dist_utils.sync_buffers_(self.model)
+            if self.ema is not None:
+                dist_utils.sync_buffers_(self.ema.module)
 
         summary = accumulator.summary()
         summary.update(
@@ -494,30 +572,55 @@ class Trainer:
         )
         return summary
 
+    def _reduce_epoch_counts(self, accumulator: LossAccumulator, n_studies: int, data_failures: int) -> tuple[int, int]:
+        """DDP: sum the epoch's loss accounting over the ranks, so every rank reports the whole epoch."""
+        totals = dist_utils.all_reduce_sum(
+            np.concatenate(
+                [
+                    accumulator.numerators,
+                    accumulator.denominators,
+                    [accumulator.n_microbatches, accumulator.n_empty_microbatches, accumulator.n_studies],
+                    [n_studies, data_failures],
+                ]
+            )
+        )
+        k = len(accumulator.numerators)
+        accumulator.numerators = totals[:k]
+        accumulator.denominators = totals[k : 2 * k]
+        accumulator.n_microbatches, accumulator.n_empty_microbatches, accumulator.n_studies = (
+            int(v) for v in totals[2 * k : 2 * k + 3]
+        )
+        return int(totals[-2]), int(totals[-1])
+
     def _train_microbatches(self, epoch: int, started: float) -> tuple[LossAccumulator, int, int]:
-        """Original policy: class-normalise each micro-batch, average over the window."""
+        """Original policy: class-normalise each micro-batch, average over the window.
+
+        Under DDP the local average over this rank's share, averaged by DDP over the ranks,
+        is the average over the whole window.
+        """
         accumulator = LossAccumulator()
-        sizes = window_sizes(len(self.train_loader), self.accumulation_steps)
+        sizes = window_sizes(len(self.train_loader), self.local_accumulation)
         window_supervised = False
         n_studies = 0
         data_failures = 0
 
         for index, batch in enumerate(self.train_loader):
+            is_window_end = (index + 1) == len(self.train_loader) or ((index + 1) % self.local_accumulation == 0)
             data_failures += int(sum(1 for m in batch["meta"] if m.get("n_present_slots", 0) == 0))
-            logits, targets, weights = self._forward(batch)
-            output = masked_class_normalized_bce(logits, targets, weights)
-            accumulator.update(output, n_studies=logits.shape[0])
-            n_studies += logits.shape[0]
-            window_supervised = window_supervised or output.has_supervision
+            with self._sync_context(is_window_end):
+                logits, targets, weights = self._forward(batch)
+                output = masked_class_normalized_bce(logits, targets, weights)
+                accumulator.update(output, n_studies=logits.shape[0])
+                n_studies += logits.shape[0]
+                window_supervised = window_supervised or output.has_supervision
 
-            scaled_loss = output.loss / float(sizes[index])
-            self.scaler.scale(scaled_loss).backward()
+                scaled_loss = self._ddp_loss(output.loss / float(sizes[index]), scale=1.0)
+                self.scaler.scale(scaled_loss).backward()
 
-            is_window_end = (index + 1) == len(self.train_loader) or ((index + 1) % self.accumulation_steps == 0)
             if not is_window_end:
                 continue
 
-            if window_supervised:
+            if dist_utils.all_reduce_any(window_supervised):
                 self._optimizer_step()
             else:
                 LOG.warning("Accumulation window ending at micro-batch %d had no supervision; step skipped", index)
@@ -535,6 +638,11 @@ class Trainer:
         micro-batch at a time. A micro-batch without any valid label is not forwarded at
         all; a window without any valid label skips the optimizer and scheduler step.
         Returns the mean window objective - the quantity that is actually minimised.
+
+        Under DDP each rank runs its share of the window. The window normaliser and the
+        supervised/skip decision are taken over the whole window (all ranks), and every rank
+        forwards every micro-batch of a supervised window - an unlabelled one with a zero
+        loss - so the ranks always run the same number of backward passes.
         """
         accumulator = LossAccumulator()
         n_studies = 0
@@ -544,7 +652,7 @@ class Trainer:
         remaining = len(self.train_loader)
 
         while remaining > 0:
-            size = min(self.accumulation_steps, remaining)
+            size = min(self.local_accumulation, remaining)
             remaining -= size
             window = [next(iterator) for _ in range(size)]
             window_supervised = any(bool((b["label_weights"] > 0).any()) for b in window)
@@ -552,22 +660,27 @@ class Trainer:
                 normalizer: WindowNormalizer | GlobalNormalizer = self.global_normalizer
                 loss_fn = global_normalized_bce
             else:
-                normalizer = WindowNormalizer.from_weights([b["label_weights"] for b in window])
+                window_weights = [b["label_weights"] for b in window]
+                if self.world_size > 1:
+                    window_weights = [w for part in dist_utils.all_gather_object(window_weights) for w in part]
+                normalizer = WindowNormalizer.from_weights(window_weights)
                 loss_fn = window_normalized_bce
-            window_supervised = window_supervised and normalizer.has_supervision
+            window_supervised = dist_utils.all_reduce_any(window_supervised and normalizer.has_supervision)
             window_objective = 0.0
 
-            for batch in window:
+            for position, batch in enumerate(window):
                 data_failures += int(sum(1 for m in batch["meta"] if m.get("n_present_slots", 0) == 0))
                 n_batch = int(batch["label_weights"].shape[0])
                 n_studies += n_batch
-                if not bool((batch["label_weights"] > 0).any()) or not window_supervised:
+                labelled = bool((batch["label_weights"] > 0).any())
+                if not window_supervised or (not labelled and self.world_size == 1):
                     accumulator.record_empty(n_batch)
                     continue
-                logits, targets, weights = self._forward(batch)
-                output = loss_fn(logits, targets, weights, normalizer)
-                accumulator.update(output, n_studies=n_batch)
-                self.scaler.scale(output.loss).backward()
+                with self._sync_context(position == size - 1):
+                    logits, targets, weights = self._forward(batch)
+                    output = loss_fn(logits, targets, weights, normalizer)
+                    accumulator.update(output, n_studies=n_batch)
+                    self.scaler.scale(self._ddp_loss(output.loss, scale=float(self.world_size))).backward()
                 window_objective += float(output.loss.detach())
 
             if window_supervised:
@@ -578,6 +691,9 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             self._log_progress(epoch, accumulator, n_studies, started)
 
+        if self.world_size > 1 and objectives:
+            # Every rank stepped on the same windows, so the lists line up: sum the shares.
+            objectives = list(dist_utils.all_reduce_sum(objectives))
         objective = float(np.mean(objectives)) if objectives else float("nan")
         return accumulator, n_studies, data_failures, objective
 
@@ -616,6 +732,12 @@ class Trainer:
 
     def _score(self, model: torch.nn.Module, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
         study_ids, scores = self.predict(self.val_loader, model)
+        if self.world_size > 1:
+            # Every rank scored its shard; all of them get the full set, so the metrics - and the
+            # best-epoch and early-stopping decisions taken from them - are identical everywhere.
+            parts = dist_utils.all_gather_object((study_ids, scores))
+            study_ids = [sid for ids, _ in parts for sid in ids]
+            scores = np.concatenate([part for _, part in parts], axis=0)
         order = {sid: i for i, sid in enumerate(study_ids)}
         missing = [s for s in self.reference.study_ids if s not in order]
         if missing:
@@ -659,7 +781,21 @@ class Trainer:
 
     # -- checkpoints -----------------------------------------------------------------
 
+    def _rank_rng_state(self) -> dict:
+        """This rank's own RNG streams (DDP); the sampler order is shared and stored once."""
+        return {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state() if self.device_spec.device.type == "cuda" else None,
+            "numpy": np.random.get_state(),
+            "augment": self.augment_generator.get_state(),
+        }
+
     def checkpoint_payload(self, extra: dict | None = None) -> dict:
+        """The checkpoint content. Under DDP every rank must call it (it gathers the ranks' RNG)."""
+        by_rank = (
+            {"rng_state_by_rank": dist_utils.all_gather_object(self._rank_rng_state())} if self.world_size > 1 else {}
+        )
         ema_state = (
             {"model_raw": self.model.state_dict(), "ema": {"decay": self.ema.decay, "updates": self.ema.updates}}
             if self.ema is not None
@@ -700,11 +836,14 @@ class Trainer:
             "rng_state": {
                 "python": random.getstate(),
                 "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                # Under DDP each rank's own device state is in rng_state_by_rank; reading every
+                # visible GPU here would open a CUDA context on the other ranks' devices.
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() and self.world_size == 1 else [],
                 "numpy": np.random.get_state(),
                 "sampler": self.sampler_generator.get_state() if self.sampler_generator is not None else None,
                 "augment": self.augment_generator.get_state(),
             },
+            **by_rank,
             **(extra or {}),
         }
 
@@ -725,8 +864,12 @@ class Trainer:
         }
 
     def save_checkpoint(self, name: str, extra: dict | None = None) -> Path:
+        """Under DDP every rank calls this; rank 0 writes the file (atomically: an interrupted
+        save keeps the previous best.pt / last.pt)."""
         path = self.run_dir / name
-        torch.save(self.checkpoint_payload(extra), path)
+        payload = self.checkpoint_payload(extra)
+        if dist_utils.is_main():
+            atomic_torch_save(payload, path)
         return path
 
     def _read_checkpoint(self, path: str | Path) -> dict:
@@ -811,13 +954,18 @@ class Trainer:
         self.state.history = list(train_state["history"])
 
         rng = payload["rng_state"]
+        if rng["sampler"] is not None:
+            self.sampler_generator.set_state(rng["sampler"].cpu())
+        if self.world_size > 1:
+            # The resume signature guarantees the same process count, hence one entry per rank.
+            rng = payload["rng_state_by_rank"][self.rank]
+            if rng["cuda"] is not None:
+                torch.cuda.set_rng_state(rng["cuda"].cpu())
+        elif rng["cuda"]:
+            torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
         random.setstate(rng["python"])
         np.random.set_state(rng["numpy"])
         torch.set_rng_state(rng["torch"].cpu())
-        if rng["cuda"]:
-            torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
-        if rng["sampler"] is not None:
-            self.sampler_generator.set_state(rng["sampler"].cpu())
         self.augment_generator.set_state(rng["augment"].cpu())
         LOG.info(
             "Resumed from %s at epoch %d (best %.4f @ epoch %d, %d epochs without improvement, %d history "
@@ -833,7 +981,10 @@ class Trainer:
     # -- driver ----------------------------------------------------------------------
 
     def fit(self) -> dict:
+        """Train to the end or early stop. Under DDP every rank runs this loop: the validation
+        metrics are identical on all ranks, so are the decisions; rank 0 alone writes files."""
         history_path = self.run_dir / "history.csv"
+        main = dist_utils.is_main()
         start_epoch = self.state.epoch
         no_defined_auc_epochs = 0
 
@@ -877,7 +1028,8 @@ class Trainer:
                     val_summary["raw_selection_score"],
                 )
             self.state.history.append(record)
-            atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
+            if main:
+                atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
             LOG.info(
                 "epoch %d | train loss %.4f | val %s %s | macro ROC-AUC %s (%s defined) | AP %s",
                 epoch,
@@ -913,9 +1065,10 @@ class Trainer:
                     self.state.best_epoch = epoch
                     self.state.epochs_without_improvement = 0
                     self.save_checkpoint("best.pt")
-                    atomic_write_dataframe(table, self.run_dir / "metrics_per_class.csv")
-                    atomic_write_dataframe(predictions, self.run_dir / "validation_predictions.csv")
-                    atomic_write_json(self.run_dir / "val_summary.json", val_summary)
+                    if main:
+                        atomic_write_dataframe(table, self.run_dir / "metrics_per_class.csv")
+                        atomic_write_dataframe(predictions, self.run_dir / "validation_predictions.csv")
+                        atomic_write_json(self.run_dir / "val_summary.json", val_summary)
                     LOG.info("New best %s %.4f at epoch %d -> best.pt", self.selection_name, score, epoch)
                 else:
                     self.state.epochs_without_improvement += 1
@@ -943,8 +1096,9 @@ class Trainer:
             "epochs_run": self.state.epoch + 1,
             "optimizer_steps": self.state.global_step,
             "n_train_studies": len(self.train_loader.dataset),
-            "n_val_studies": len(self.val_loader.dataset),
+            "n_val_studies": self.n_val_studies,
             "device": self.device_spec.describe(),
+            "world_size": self.world_size,
             "provenance": self.provenance,
             "metric_scope": (
                 f"selection on the local evaluable-target {self.selection_name} (soft ROC-AUC equals ROC-AUC "
@@ -961,7 +1115,8 @@ class Trainer:
             summary["warning"] = "SYNTHETIC SMOKE TEST on generated images. No claim about real data."
         if self.reference.note:
             summary["reference_note"] = self.reference.note
-        atomic_write_json(self.run_dir / "run_summary.json", summary)
+        if dist_utils.is_main():
+            atomic_write_json(self.run_dir / "run_summary.json", summary)
         LOG.info("Run summary: %s", json.dumps(summary, indent=2, default=str))
         return summary
 
@@ -974,7 +1129,18 @@ class Trainer:
 def _run_dir(cfg: Config, mode: str, name: str | None = None) -> Path:
     stamp = time.strftime("%Y%m%dT%H%M%S")
     label = name or f"{mode}_fold{int(cfg.split.fold)}_{stamp}"
-    return Path(cfg.paths.output_dir) / label
+    # Under DDP rank 0's choice, so a timestamp ticking between ranks cannot split the run.
+    return dist_utils.broadcast_object(Path(cfg.paths.output_dir) / label)
+
+
+def _start_run_files(cfg: Config, run_dir: Path) -> None:
+    """Log file, environment and config of a new run (rank 0 only under DDP)."""
+    if not dist_utils.is_main():
+        return
+    run_dir.mkdir(parents=True, exist_ok=True)
+    add_file_logging(run_dir / "run.log")
+    atomic_write_json(run_dir / "environment.json", log_environment())
+    save_config(cfg, run_dir / "config.yaml")
 
 
 def _apply_start(trainer: Trainer, cfg: Config) -> None:
@@ -1000,12 +1166,9 @@ def build_synthetic_trainer(
     if epochs is not None:
         cfg.train.max_epochs = int(epochs)
         cfg.train.warmup_epochs = min(int(cfg.train.warmup_epochs), max(1, int(epochs) - 1))
-    seed_everything(int(cfg.seed))
+    seed_everything(int(cfg.seed) + dist_utils.rank())  # rank 0: the single-device seed
     run_dir = _run_dir(cfg, "synthetic", name)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    add_file_logging(run_dir / "run.log")
-    atomic_write_json(run_dir / "environment.json", log_environment())
-    save_config(cfg, run_dir / "config.yaml")
+    _start_run_files(cfg, run_dir)
 
     train_ds = SyntheticBagDataset(cfg, n_studies=n_studies, seed=int(cfg.seed))
     val_ds = SyntheticBagDataset(cfg, n_studies=max(8, n_studies // 2), seed=int(cfg.seed) + 1)
@@ -1017,7 +1180,8 @@ def build_synthetic_trainer(
         values=values.astype(np.float32),
         valid=weights > 0,
     )
-    reference.save(run_dir / "validation_reference.csv")
+    if dist_utils.is_main():
+        reference.save(run_dir / "validation_reference.csv")
 
     model = build_model(cfg)
     trainer = Trainer(
@@ -1048,7 +1212,8 @@ def _report_split_label_counts(
         counts.insert(0, "split", split_name)
         frames.append(counts)
     table = pd.concat(frames, ignore_index=True)
-    atomic_write_dataframe(table, run_dir / "label_counts_per_split.csv")
+    if dist_utils.is_main():
+        atomic_write_dataframe(table, run_dir / "label_counts_per_split.csv")
     LOG.info("Label counts per target and split:\n%s", table.to_string(index=False))
 
     for split_name in ("train", "validation"):
@@ -1073,12 +1238,10 @@ def _prepare_real_run(
     name: str | None,
     allow_unready: bool,
 ) -> tuple[Trainer, dict]:
-    seed_everything(int(cfg.seed))
+    seed_everything(int(cfg.seed) + dist_utils.rank())  # rank 0: the single-device seed
     run_dir = _run_dir(cfg, mode, name)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    add_file_logging(run_dir / "run.log")
-    atomic_write_json(run_dir / "environment.json", log_environment())
-    save_config(cfg, run_dir / "config.yaml")
+    _start_run_files(cfg, run_dir)
+    main = dist_utils.is_main()
 
     splits = load_splits(cfg)
     fold = int(cfg.split.fold)
@@ -1118,14 +1281,16 @@ def _prepare_real_run(
 
     train_coverage = check_study_coverage(cfg, train_ids)
     val_coverage = check_study_coverage(cfg, val_ids)
-    atomic_write_json(run_dir / "coverage.json", {"train": train_coverage, "validation": val_coverage})
+    if main:
+        atomic_write_json(run_dir / "coverage.json", {"train": train_coverage, "validation": val_coverage})
     excluded_train = enforce_coverage_gate(cfg, train_coverage, "training")
     excluded_val = enforce_coverage_gate(cfg, val_coverage, "validation")
     train_ids = [s for s in train_ids if s not in set(excluded_train)]
     val_ids = [s for s in val_ids if s not in set(excluded_val)]
 
     reference = EvaluationReference.for_run(cfg, label_table, val_ids)
-    reference.save(run_dir / "validation_reference.csv")
+    if main:
+        reference.save(run_dir / "validation_reference.csv")
     if reference.note:
         LOG.warning("%s", reference.note)
 

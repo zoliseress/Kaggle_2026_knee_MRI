@@ -303,17 +303,36 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
+    from . import distributed
     from .train import run_fold, run_overfit, run_synthetic
 
-    cfg = _load(args)
-    if args.mode == "synthetic":
-        summary = run_synthetic(cfg, n_studies=args.n_studies or 16, epochs=args.epochs, name=args.name)
-    elif args.mode == "overfit":
-        summary = run_overfit(cfg, n_studies=args.n_studies or 8, name=args.name)
-    else:
-        summary = run_fold(cfg, study_limit=args.n_studies, name=args.name, allow_unready=args.allow_unready)
-    print(json.dumps(summary, indent=2, default=str))
+    # Under torchrun (WORLD_SIZE > 1) every process joins the group; rank 0 alone logs at
+    # INFO and writes the run's files, the other ranks only report warnings and errors.
+    distributed.init_distributed()
+    if not distributed.is_main():
+        quiet_rank_logging(distributed.rank())
+    try:
+        cfg = _load(args)
+        if args.mode == "synthetic":
+            summary = run_synthetic(cfg, n_studies=args.n_studies or 16, epochs=args.epochs, name=args.name)
+        elif args.mode == "overfit":
+            summary = run_overfit(cfg, n_studies=args.n_studies or 8, name=args.name)
+        else:
+            summary = run_fold(cfg, study_limit=args.n_studies, name=args.name, allow_unready=args.allow_unready)
+        if distributed.is_main():
+            print(json.dumps(summary, indent=2, default=str))
+    finally:
+        distributed.cleanup()
     return 0
+
+
+def quiet_rank_logging(rank: int) -> None:
+    """A non-zero rank: warnings and errors only, tagged with the rank."""
+    import logging
+
+    LOG.setLevel(logging.WARNING)
+    for handler in LOG.handlers:
+        handler.setFormatter(logging.Formatter(f"%(asctime)s %(levelname)-7s %(name)s [rank{rank}] | %(message)s"))
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:

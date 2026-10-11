@@ -2936,6 +2936,353 @@ def check_ema_skipped_step() -> str:
     return "the EMA is updated once per optimizer step actually taken, never on a skipped one"
 
 
+def check_atomic_checkpoint_save(tmp) -> str:
+    """A save that fails half-way (here: an unpicklable object late in the payload) keeps the
+    previous checkpoint loadable and leaves no temporary file behind."""
+    from .utils import atomic_torch_save
+
+    path = Path(tmp) / "atomic" / "last.pt"
+    atomic_torch_save({"epoch": 1, "weights": torch.ones(1000)}, path)
+    try:
+        atomic_torch_save({"epoch": 2, "weights": torch.zeros(1000), "broken": lambda: None}, path)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("the unpicklable payload was saved")
+    kept = torch.load(path, map_location="cpu", weights_only=False)
+    assert kept["epoch"] == 1 and torch.equal(kept["weights"], torch.ones(1000)), "the previous checkpoint was damaged"
+    leftovers = [f.name for f in path.parent.iterdir() if f.name != "last.pt"]
+    assert not leftovers, f"temporary files left behind: {leftovers}"
+    atomic_torch_save({"epoch": 3}, path)
+    assert torch.load(path, map_location="cpu", weights_only=False)["epoch"] == 3, "a good save did not replace the file"
+    return "failed save keeps the previous checkpoint, no temp file left; a good save replaces it"
+
+
+def check_shard_sampler_partition() -> str:
+    """Rank r takes every W-th study of the shared order: equal lengths, full cover, same windows,
+    and the sampler's generator advances exactly as in the single-device run."""
+    import itertools
+
+    from torch.utils.data import RandomSampler
+
+    from .distributed import ShardSampler
+
+    def seeded(n: int) -> tuple[RandomSampler, torch.Generator]:
+        generator = torch.Generator().manual_seed(3)
+        return RandomSampler(range(n), generator=generator), generator
+
+    for n, world, local_accumulation in ((16, 2, 4), (17, 2, 4), (7, 3, 1), (2, 3, 1), (5, 1, 8)):
+        order = list(seeded(n)[0])
+        shards = []
+        for rank in range(world):
+            sampler = ShardSampler(seeded(n)[0], rank, world)
+            shard = list(sampler)
+            assert len(shard) == len(sampler), "__len__ disagrees with the iteration"
+            shards.append(shard)
+        assert len({len(s) for s in shards}) == 1, f"ranks got unequal shares for n={n}, W={world}"
+        assert set().union(*map(set, shards)) == set(range(n)), "a study is missing from every shard"
+        assert sum(map(len, shards)) - n == (-n) % world, "more padding than needed for equal shares"
+        # The k-th global window (local windows of every rank) is the single-device k-th window.
+        window = local_accumulation * world
+        for k in range(n // window):
+            local = [s[k * local_accumulation : (k + 1) * local_accumulation] for s in shards]
+            assert sorted(i for part in local for i in part) == sorted(order[k * window : (k + 1) * window]), (
+                f"window {k} differs from the single-device window (n={n}, W={world})"
+            )
+
+    # The next epoch's order comes from the generator state: a full pass and a pass that stops
+    # after exactly len() items (the window loop) must leave it where the single device does.
+    for exhaust in (True, False):
+        single, single_generator = seeded(16)
+        shard, shard_generator = seeded(16)
+        if exhaust:
+            list(single), list(ShardSampler(shard, 1, 2))
+        else:
+            list(itertools.islice(iter(single), 16)), list(itertools.islice(iter(ShardSampler(shard, 1, 2)), 8))
+        assert torch.equal(single_generator.get_state(), shard_generator.get_state()), (
+            f"the shard sampler moved the generator differently (run to the end: {exhaust})"
+        )
+    return "equal shares, full cover, at most W-1 repeats, single-device windows and generator state"
+
+
+class _PartlyUnlabelledSynthetic(SyntheticBagDataset):
+    """Synthetic studies of which some carry no valid label at all."""
+
+    def __init__(self, cfg: Config, unlabelled: set[int], **kwargs) -> None:
+        super().__init__(cfg, **kwargs)
+        self.unlabelled = set(unlabelled)
+
+    def label_weight_matrix(self) -> np.ndarray:
+        weights = super().label_weight_matrix()
+        weights[sorted(self.unlabelled)] = 0.0
+        return weights
+
+    def __getitem__(self, key):
+        item = super().__getitem__(key)
+        index = key[0] if isinstance(key, tuple) else key
+        if int(index) in self.unlabelled:
+            item["label_weights"] = torch.zeros_like(item["label_weights"])
+        return item
+
+
+def _ddp_check_worker(
+    rank: int,
+    world: int,
+    cfg: Config,
+    unlabelled: set[int],
+    port: int,
+    out: str,
+    deterministic: bool = True,
+    stop_after_epochs: int | None = None,
+    complete_studies: bool = False,
+) -> None:
+    """One process of the DDP checks (CPU, gloo); rank 0 saves the outcome.
+
+    `deterministic` switches dropout off; `stop_after_epochs` interrupts the run like a crash
+    would (schedule and signature still built for train.max_epochs); `train.resume` resumes;
+    `complete_studies` gives every training study all slots and full stacks.
+    """
+    import os
+
+    from . import distributed
+    from .model import build_model
+    from .train import EvaluationReference, Trainer, _run_dir
+    from .utils import seed_everything
+
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": str(world),
+            "USE_LIBUV": "0",  # Windows builds have no libuv TCPStore
+        }
+    )
+    # CPU only, so every process computes in the same fp32 numerics on any machine. (Hiding
+    # the GPUs through CUDA_VISIBLE_DEVICES is not portable: "-1" crashes torch on Windows.)
+    torch.cuda.is_available = lambda: False
+    distributed.init_distributed()
+    try:
+        seed_everything(int(cfg.seed) + distributed.rank())
+        shape = {"missing_slot_probability": 0.0, "short_stack_probability": 0.0} if complete_studies else {}
+        train_ds = _PartlyUnlabelledSynthetic(cfg, unlabelled, n_studies=16, seed=int(cfg.seed), **shape)
+        val_ds = SyntheticBagDataset(cfg, n_studies=9, seed=int(cfg.seed) + 1)  # odd: unequal validation shards
+        items = [val_ds[i] for i in range(len(val_ds))]
+        reference = EvaluationReference(
+            study_ids=[item["study_id"] for item in items],
+            values=np.stack([item["targets"].numpy() for item in items]).astype(np.float32),
+            valid=np.stack([item["label_weights"].numpy() for item in items]) > 0,
+        )
+        trainer = Trainer(
+            cfg, build_model(cfg), train_ds, val_ds, reference, _run_dir(cfg, "synthetic", "run"), mode="synthetic",
+            provenance={"label_source": "synthetic", "prep_hash": "synthetic"},
+        )
+        if deterministic:
+            # Dropout and stochastic depth draw per rank; comparing with one process needs them off.
+            for module in trainer.model.modules():
+                if isinstance(getattr(module, "p", None), float):
+                    module.p = 0.0
+        if cfg.train.get("resume"):
+            trainer.load_checkpoint(cfg.train.resume)
+        if stop_after_epochs is not None:
+            trainer.cfg.train.max_epochs = stop_after_epochs
+        initial_buffers = {name: b.detach().cpu().clone() for name, b in trainer.model.named_buffers()}
+        trainer.fit()
+        # Every rank's buffers after the run (a collective: all ranks take part).
+        rank_buffers = distributed.all_gather_object(
+            {
+                "model": {name: b.detach().cpu() for name, b in trainer.model.named_buffers()},
+                "ema": None if trainer.ema is None else {n: b.detach().cpu() for n, b in trainer.ema.module.named_buffers()},
+            }
+        )
+        if distributed.is_main():
+            torch.save(
+                {
+                    "state": trainer.model.state_dict(),
+                    "history": trainer.state.history,
+                    "steps": trainer.state.global_step,
+                    "initial_buffers": initial_buffers,
+                    "rank_buffers": rank_buffers,
+                },
+                out,
+            )
+    finally:
+        distributed.cleanup()
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
+def check_ddp_matches_single_process(cfg: Config) -> str:
+    """2 DDP processes train the same model as one process, for every loss policy.
+
+    CPU + gloo, so it runs on any machine. Rank 1's whole first local window is unlabelled
+    while rank 0's is not: the ranks must still agree on every collective (no hang), and the
+    weights after two epochs - steps, epoch boundary, sharded validation and checkpointing
+    included - must equal the single-process ones, which skip those micro-batches.
+    """
+    import tempfile
+
+    import torch.multiprocessing as mp
+    from torch.utils.data import RandomSampler
+
+    small = cfg.copy()
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.microbatch_studies = 1
+    small.train.accumulation_steps = 8
+    small.train.max_epochs = 2
+    small.train.warmup_epochs = 1
+    small.train.early_stopping_patience = 10
+    small.train.ema_decay = 0.0
+    small.train.resume = None
+    small.train.init_weights = None
+    small.train.amp = "fp32"
+    small.augment.enabled = False
+    small.augment.noise_std = 0.0
+    small.model.head_dropout = 0.0
+    # Epoch 0's order: rank 1 takes positions 1, 3, 5, 7 - its whole first local window.
+    order = list(RandomSampler(range(16), generator=torch.Generator().manual_seed(int(small.seed))))
+    unlabelled = {order[i] for i in (1, 3, 5, 7)}
+
+    details = []
+    with tempfile.TemporaryDirectory(prefix="knee_mri_ddp_") as tmp:
+        for policy in ("global", "window", "microbatch"):
+            outcome = {}
+            for world in (1, 2):
+                run_cfg = small.copy()
+                run_cfg.train.loss_normalization = policy
+                run_cfg.paths.output_dir = str(Path(tmp) / f"{policy}_w{world}")
+                out = str(Path(tmp) / f"{policy}_w{world}.pt")
+                mp.spawn(
+                    _ddp_check_worker, args=(world, run_cfg, unlabelled, _free_port(), out), nprocs=world, join=True
+                )
+                outcome[world] = torch.load(out, map_location="cpu", weights_only=False)
+            single, ddp = outcome[1], outcome[2]
+            assert single["steps"] == ddp["steps"] > 0, f"{policy}: {single['steps']} vs {ddp['steps']} steps"
+            worst = max(
+                float((value - ddp["state"][key]).abs().max())
+                for key, value in single["state"].items()
+                if value.is_floating_point()
+            )
+            assert worst < 1e-6, f"{policy}: DDP weights differ from the single process by {worst:.2e}"
+            assert len(single["history"]) == len(ddp["history"]), f"{policy}: epoch counts differ"
+            for a, b in zip(single["history"], ddp["history"]):
+                for column in ("train_loss", "val_selection_score"):
+                    assert abs(a[column] - b[column]) < 1e-6, f"{policy} epoch {a['epoch']} {column}: {a[column]} vs {b[column]}"
+                for column in ("train_empty_microbatches", "optimizer_steps"):
+                    assert a[column] == b[column], f"{policy} epoch {a['epoch']} {column}: {a[column]} vs {b[column]}"
+            details.append(f"{policy} {worst:.0e}")
+    return "2 processes = 1 process (max weight diff: " + ", ".join(details) + "); half-unlabelled window, no hang"
+
+
+def check_ddp_exact_resume(cfg: Config) -> str:
+    """A 2-process run resumed from last.pt equals the uninterrupted one (dropout on: every rank's
+    RNG streams are restored), and a 2-process checkpoint is refused by a single process."""
+    import tempfile
+
+    import torch.multiprocessing as mp
+
+    from .train import build_synthetic_trainer
+
+    small = cfg.copy()
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.microbatch_studies = 1
+    small.train.accumulation_steps = 4
+    small.train.max_epochs = 2
+    small.train.warmup_epochs = 1
+    small.train.early_stopping_patience = 10
+    small.train.ema_decay = 0.0
+    small.train.resume = None
+    small.train.init_weights = None
+    small.train.amp = "fp32"
+    small.model.head_dropout = 0.5  # draws from each rank's own torch RNG
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_ddp_resume_") as tmp:
+        outcome = {}
+        for run, resume, stop in (("full", None, None), ("interrupted", None, 1), ("resumed", "interrupted", None)):
+            run_cfg = small.copy()
+            run_cfg.paths.output_dir = str(Path(tmp) / run)
+            if resume:
+                run_cfg.train.resume = str(Path(tmp) / resume / "run" / "last.pt")
+            out = str(Path(tmp) / f"{run}.pt")
+            mp.spawn(
+                _ddp_check_worker, args=(2, run_cfg, set(), _free_port(), out, False, stop), nprocs=2, join=True
+            )
+            outcome[run] = torch.load(out, map_location="cpu", weights_only=False)
+        full, resumed = outcome["full"], outcome["resumed"]
+        assert full["steps"] == resumed["steps"] > 0, "optimizer steps differ after resume"
+        drift = max(float((value - resumed["state"][key]).abs().max()) for key, value in full["state"].items()
+                    if value.is_floating_point())
+        assert drift <= 1e-6, f"DDP weights differ after resume (max {drift:.2e})"
+        assert [h["train_loss"] for h in full["history"]] == [h["train_loss"] for h in resumed["history"]]
+
+        single = small.copy()
+        single.paths.output_dir = str(Path(tmp) / "single")
+        single.train.resume = str(Path(tmp) / "full" / "run" / "last.pt")
+        try:
+            build_synthetic_trainer(single, n_studies=16, name="single")
+        except ValueError as error:
+            assert "world_size" in str(error), f"the process-count mismatch is not named: {error}"
+        else:
+            raise AssertionError("a single process resumed a 2-process checkpoint")
+        finally:
+            remove_file_logging(tmp)  # Windows cannot delete an open run.log
+    return f"resumed 2-process run = uninterrupted (max drift {drift:.0e}); 1-process resume refused"
+
+
+def check_ddp_bn_buffers_in_sync(cfg: Config) -> str:
+    """model.freeze_bn_running_stats=false under DDP: the running statistics move on every rank,
+    and after each epoch all ranks (model and EMA) hold one averaged set - the one validation
+    scores on every shard and the checkpoint stores.
+
+    Needs a trainable encoder with BatchNorm: run it on `efficientnet_config` (B0, encoder
+    trainable), not the configured backbone (DINOv2 has none, a frozen encoder never updates).
+    """
+    import tempfile
+
+    import torch.multiprocessing as mp
+
+    small = cfg.copy()
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.microbatch_studies = 1
+    small.train.accumulation_steps = 4
+    small.train.max_epochs = 1
+    small.train.warmup_epochs = 1
+    small.train.ema_decay = 0.9
+    small.train.resume = None
+    small.train.init_weights = None
+    small.train.amp = "fp32"
+    small.model.freeze_bn_running_stats = False
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_ddp_bn_") as tmp:
+        small.paths.output_dir = tmp
+        out = str(Path(tmp) / "out.pt")
+        # Complete studies: train-mode BatchNorm needs more than one triplet per micro-batch at
+        # the tiny size's 1x1 maps (a single-device run would fail the same way).
+        mp.spawn(_ddp_check_worker, args=(2, small, set(), _free_port(), out, False, None, True), nprocs=2, join=True)
+        result = torch.load(out, map_location="cpu", weights_only=False)
+
+    stats = [name for name in result["initial_buffers"] if name.endswith("running_mean")]
+    assert stats, "the model has no BatchNorm running statistics to check"
+    moved = sum(not torch.equal(result["initial_buffers"][n], result["rank_buffers"][0]["model"][n]) for n in stats)
+    assert moved > 0, "freeze_bn_running_stats=false but no running statistic changed: the test checks nothing"
+    for part in ("model", "ema"):
+        reference = result["rank_buffers"][0][part]
+        for rank, buffers in enumerate(result["rank_buffers"][1:], start=1):
+            for name, value in reference.items():
+                assert torch.equal(value, buffers[part][name]), f"{part} buffer {name} differs between rank 0 and rank {rank}"
+    return f"{moved}/{len(stats)} BatchNorm layers updated; model and EMA buffers identical on both ranks"
+
+
 def _ema_synthetic_trainer(cfg: Config, tmp, name: str, ema_decay: float, epochs: int = 2):
     from .train import build_synthetic_trainer
 
@@ -3758,6 +4105,8 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("dataset_contract", lambda: check_dataset_contract(small)),
             ("augment_device_resolution", lambda: check_augment_device_resolution(small)),
             ("augment_device_equivalence", lambda: check_augment_device_equivalence(small)),
+            ("shard_sampler_partition", check_shard_sampler_partition),
+            ("atomic_checkpoint_save", lambda: check_atomic_checkpoint_save(tmp_dir)),
         ]
         if not quick:
             checks += [
@@ -3800,6 +4149,9 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("new_backbone_grad_checkpointing", lambda: check_new_backbone_grad_checkpointing(small)),
                 ("radimagenet_loader", lambda: check_radimagenet_loader(small, tmp_dir)),
                 ("new_backbone_training_roundtrip", lambda: check_new_backbone_training_roundtrip(small)),
+                ("ddp_matches_single_process", lambda: check_ddp_matches_single_process(small)),
+                ("ddp_exact_resume", lambda: check_ddp_exact_resume(small)),
+                ("ddp_bn_buffers_in_sync", lambda: check_ddp_bn_buffers_in_sync(effnet)),
             ]
 
         for name, function in checks:

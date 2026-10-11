@@ -11,6 +11,11 @@
 #     ./run_holdout.sh
 #     ./run_holdout.sh E3_img320 --set data.image_size=320
 #     ./run_holdout.sh --gpu 1 E3_img320 --set data.image_size=320
+#     ./run_holdout.sh --gpu 0,1 E3_img320 --set data.image_size=320
+#  Tobb GPU-id (--gpu 0,1): egyetlen tanitas mindket GPU-n (DDP, torchrun),
+#  ugyanazzal a kiserlettel (8 study / optimizer lepes, ugyanannyi lepes /
+#  epoch). GPU-nkent train.num_workers worker indul. Egy igy inditott run
+#  csak ugyanennyi GPU-val folytathato (--resume).
 #  Ha az elso (nem --gpu) argumentum nem "-"-vel kezdodik, az a run nevenek
 #  elotagja: E3_img320_holdout208_<idobelyeg>
 #
@@ -93,6 +98,19 @@ EXTRA=("$@")
 
 if [[ -n "$GPU" ]]; then
     export CUDA_VISIBLE_DEVICES="$GPU"
+fi
+
+# Tobb GPU (--gpu 0,1): egy tanitas DDP-vel, GPU-nkent egy processz
+# (torchrun = python -m torch.distributed.run, a conda kornyezet python-javal).
+NPROC=1
+if [[ -n "$GPU" ]]; then
+    IFS=',' read -ra GPU_IDS <<< "$GPU"
+    NPROC=${#GPU_IDS[@]}
+fi
+if (( NPROC > 1 )); then
+    TRAIN_LAUNCH=(python -m torch.distributed.run --standalone --nproc_per_node="$NPROC")
+else
+    TRAIN_LAUNCH=(python)
 fi
 
 cd "$ROOT" || exit 1
@@ -190,16 +208,16 @@ echo " Run        : $NAME"
 echo " Tanitas    : $TRAIN_CSV"
 echo " Validacio  : $VAL_CSV"
 echo " Config     : $CONFIG"
-echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}"
+echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}$( (( NPROC > 1 )) && echo "  ($NPROC processz, DDP)")"
 echo " Extra args : ${EXTRA[*]:-}"
 echo " Kimenet    : $RUN"
 echo "======================================================================"
 
-if ! python "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
+if ! "${TRAIN_LAUNCH[@]}" "$ROOT/src/train.py" --mode fold --config "$CONFIG" \
         --set "split.fold=0" "${PATHS[@]}" --name "$NAME" "${EXTRA[@]}" "${START[@]+"${START[@]}"}"; then
     echo
     echo "[HIBA] A tanitas hibaval leallt. Log: $RUN/run.log"
-    echo "       Folytatas: ./run_holdout.sh --resume $NAME <ugyanazok az extra argumentumok>"
+    echo "       Folytatas: ./run_holdout.sh ${GPU:+--gpu $GPU }--resume $NAME <ugyanazok az extra argumentumok>"
     exit 1
 fi
 

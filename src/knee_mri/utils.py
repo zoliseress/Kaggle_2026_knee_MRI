@@ -190,6 +190,26 @@ def atomic_write_bytes(path: str | Path, data: bytes) -> Path:
     return path
 
 
+def atomic_torch_save(payload: Any, path: str | Path) -> Path:
+    """torch.save to a temporary file next to `path`, then os.replace: an interrupted or failed
+    save leaves the previous file intact instead of a truncated checkpoint."""
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    try:
+        with tmp.open("wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())  # on disk before the rename makes it the checkpoint
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
+
+
 def atomic_write_text(path: str | Path, text: str) -> Path:
     return atomic_write_bytes(path, text.encode("utf-8"))
 
