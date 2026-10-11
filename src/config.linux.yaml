@@ -105,9 +105,12 @@ augment:
   noise_std: 0.01
 
 model:
-  # efficientnet_b0 | efficientnet_v2_s | radimagenet_resnet50 | dinov2_vits14 (encoders.py).
+  # efficientnet_b0 | efficientnet_v2_s | radimagenet_resnet50 | dinov2_vits14 | coatnet_0_rw | coatnet_rmlp_1_rw2
+  # (encoders.py; CoAtNet: weights sw_in1k / sw_in12k_ft_in1k, data.encoder_normalization=inception, size % 32 == 0).
   # b0 / v2_s give 1280 features at stride 32. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
   #   b0: 6.3 GB, 10.4 train study/s | v2_s: 11.1 GB, 5.6 study/s | v2_s + grad_checkpointing: 4.1 GB, 4.0 study/s
+  #   full train step (E3 head, AdamW + EMA, src/tools/memory_probe.py): coatnet_0_rw 12.7 GB, 225 ms |
+  #   + grad_checkpointing 4.3 GB, 285 ms | coatnet_rmlp_1_rw2 + grad_checkpointing 6.1 GB, 498 ms (without: OOM at 16 GB)
   # Switching the backbone is a new experiment: its pretrained weights, not another backbone's checkpoint.
   backbone: "efficientnet_b0"
   weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth (of the chosen backbone)

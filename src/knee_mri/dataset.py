@@ -62,14 +62,22 @@ def normalization_stats(cfg: Config) -> tuple[tuple[float, float, float], tuple[
     return NORMALIZATION_PROFILES[profile]
 
 
-def bin_centers(n_slices: int, n_centers: int, rng: np.random.Generator | None) -> tuple[np.ndarray, np.ndarray]:
+def bin_centers(
+    n_slices: int, n_centers: int, rng: np.random.Generator | None, offset: float | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Centre indices plus their validity.
 
     With at least `n_centers` slices the full index range is divided into `n_centers`
     bins: one random centre per bin while training, the deterministic bin midpoint in
     validation. Shorter stacks use every slice once and pad the remaining slots as
     invalid - padded centres must never gain pooling weight.
+
+    `offset` (inference only, ignored with `rng`): a fixed position inside every bin
+    instead of the midpoint, 0 = the bin's first slice, 1 = its last. Several offsets
+    give shifted views of the same stack for test-time averaging.
     """
+    if offset is not None and not 0.0 <= float(offset) <= 1.0:
+        raise ValueError(f"bin offset must be in [0, 1], got {offset}")
     valid = np.zeros(n_centers, dtype=bool)
     centers = np.zeros(n_centers, dtype=np.int64)
     if n_slices <= 0:
@@ -84,7 +92,9 @@ def bin_centers(n_slices: int, n_centers: int, rng: np.random.Generator | None) 
         lo = int(np.floor(edges[i]))
         hi = max(lo + 1, int(np.ceil(edges[i + 1])))
         hi = min(hi, n_slices)
-        if rng is None:
+        if rng is None and offset is not None:
+            centers[i] = min(hi - 1, lo + int(float(offset) * (hi - lo)))
+        elif rng is None:
             centers[i] = min(n_slices - 1, (lo + hi - 1) // 2)
         else:
             centers[i] = int(rng.integers(lo, hi))
@@ -386,10 +396,16 @@ class StudyBagDataset(Dataset):
         epoch: int = 0,
         strict_cache: bool = True,
         allow_unbuilt_cache: bool = False,
+        center_offset: float | None = None,
     ) -> None:
         """`allow_unbuilt_cache`: selected series without a cache entry only warn, however many -
-        for a caller that has just built the cache and reports its failures itself (inference)."""
+        for a caller that has just built the cache and reports its failures itself (inference).
+        `center_offset`: fixed in-bin centre position for a non-training dataset (see `bin_centers`);
+        None keeps the bin midpoint."""
+        if train and center_offset is not None:
+            raise ValueError("center_offset is an inference option; training draws a random centre per bin")
         self.cfg = cfg
+        self.center_offset = center_offset
         self.allow_unbuilt_cache = bool(allow_unbuilt_cache)
         self.study_ids = [str(s) for s in study_ids]
         self.slots = list(cfg.data.series_slots)
@@ -562,7 +578,9 @@ class StudyBagDataset(Dataset):
                 reverse, flip = canonical_ops(side, slot_plane(slot), normal_x)
                 image, gap_ok = apply_canonical(image, gap_ok, reverse, flip)
             rng = self._rng(index, p, epoch)
-            centers, valid = bin_centers(image.shape[0], self.n_centers, rng if self.train else None)
+            centers, valid = bin_centers(
+                image.shape[0], self.n_centers, rng if self.train else None, self.center_offset
+            )
             bag, subs = build_bag(image, centers, valid, gap_ok)
             substitutions += subs
             tensor = torch.from_numpy(bag)

@@ -58,6 +58,10 @@ def test_dino_patch_grid(cfg):
     selftest.check_dino_patch_grid(cfg)
 
 
+def test_coatnet_input_size(cfg):
+    selftest.check_coatnet_input_size(cfg)
+
+
 def test_freeze_policies(cfg):
     selftest.check_freeze_policies(cfg)
 
@@ -104,13 +108,26 @@ def test_image_size_rule_is_per_backbone():
         with pytest.raises(ValueError, match="multiple of 8"):
             load_config(SRC / config, ["data.image_size=378"])
         load_config(SRC / config, ["data.image_size=320"])
+    # CoAtNet: multiples of 32 only (its attention stages need an exact token grid).
+    load_config(SRC / "config.yaml", COATNET_OVERRIDES + ["data.image_size=320"])
+    for size in (232, 336):  # multiples of 8, not of 32
+        with pytest.raises(ValueError, match="multiple of 32"):
+            load_config(SRC / "config.yaml", COATNET_OVERRIDES + [f"data.image_size={size}"])
 
 
-@pytest.mark.parametrize("config_name", ["config.dinov2_vits14.yaml", "config.radimagenet_resnet50.yaml"])
+# CoAtNet has no example config: it runs from the machine's own config with these overrides.
+COATNET_OVERRIDES = ["model.backbone=coatnet_0_rw", "model.weights=sw_in1k", "data.encoder_normalization=inception"]
+
+
+@pytest.mark.parametrize("config_name", ["config.dinov2_vits14.yaml", "config.radimagenet_resnet50.yaml", "coatnet"])
 def test_older_checks_run_under_new_backbone_configs(config_name, tmp_path):
     """The selftest sizes follow the configured backbone (DINOv2 refuses 32/64 px); the checks
     about EfficientNet itself get an explicit EfficientNet config."""
-    small = selftest.tiny_config(load_config(SRC / config_name))
+    if config_name == "coatnet":
+        loaded = load_config(SRC / "config.yaml", COATNET_OVERRIDES + ["data.image_size=320"])
+    else:
+        loaded = load_config(SRC / config_name)
+    small = selftest.tiny_config(loaded)
     backbone = small.model.backbone
     assert small.data.image_size == selftest.TINY_SIZES[backbone]
     assert selftest.wide_config(small).data.image_size == selftest.WIDE_SIZES[backbone]

@@ -66,45 +66,60 @@ CHECKPOINT_VERSION = "ckpt_v1"
 # (torchvision EfficientNet IMAGENET1K_V1 and timm DINOv2 lvd142m both use them).
 # `radimagenet_torch` reproduces the official RadImageNet PyTorch demo, which feeds
 # (uint8 - 127.5) * 2 / 255, i.e. [0, 1] -> [-1, 1]: mean 0.5, std 0.5 per channel.
+# `inception` is the same [0, 1] -> [-1, 1] mapping under timm's name for it
+# (IMAGENET_INCEPTION_MEAN/STD), the statistics of the timm CoAtNet `sw_in*` weights.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 MRI_SCALAR_MEAN = (0.5, 0.5, 0.5)
 MRI_SCALAR_STD = (0.25, 0.25, 0.25)
 RADIMAGENET_TORCH_MEAN = (0.5, 0.5, 0.5)
 RADIMAGENET_TORCH_STD = (0.5, 0.5, 0.5)
+INCEPTION_MEAN = (0.5, 0.5, 0.5)
+INCEPTION_STD = (0.5, 0.5, 0.5)
 NORMALIZATION_PROFILES = {
     "mri_scalar": (MRI_SCALAR_MEAN, MRI_SCALAR_STD),
     "imagenet": (IMAGENET_MEAN, IMAGENET_STD),
     "radimagenet_torch": (RADIMAGENET_TORCH_MEAN, RADIMAGENET_TORCH_STD),
+    "inception": (INCEPTION_MEAN, INCEPTION_STD),
 }
 
 EFFICIENTNET_B0_FEATURES = 1280
 # Encoder backbones (model.backbone) -> channels of their last feature map (encoders.py).
-# The CNNs have an output stride of 32 (224 px -> 7x7, 320 px -> 10x10); DINOv2 has 14 px
-# patches (224 px -> 16x16, 336 px -> 24x24).
+# The CNNs and the CoAtNets have an output stride of 32 (224 px -> 7x7, 320 px -> 10x10);
+# DINOv2 has 14 px patches (224 px -> 16x16, 336 px -> 24x24).
 ENCODER_FEATURES = {
     "efficientnet_b0": 1280,
     "efficientnet_v2_s": 1280,
     "radimagenet_resnet50": 2048,
     "dinov2_vits14": 384,
+    "coatnet_0_rw": 768,
+    "coatnet_rmlp_1_rw2": 768,
 }
 BACKBONES = tuple(ENCODER_FEATURES)
 DEFAULT_BACKBONE = "efficientnet_b0"  # also what checkpoints without model.backbone were trained with
 # Units the `last_n` freeze policy counts: EfficientNet feature stages, ResNet residual
-# stages (layer1..layer4), DINOv2 transformer blocks.
+# stages (layer1..layer4), DINOv2 transformer blocks, CoAtNet stages (2 MBConv + 2 transformer).
 ENCODER_UNITS = {
     "efficientnet_b0": 9,
     "efficientnet_v2_s": 8,
     "radimagenet_resnet50": 4,
     "dinov2_vits14": 12,
+    "coatnet_0_rw": 4,
+    "coatnet_rmlp_1_rw2": 4,
 }
 # The normalisation each backbone's pretrained weights expect. Another profile is allowed
 # (with a warning) as an explicit ablation; EfficientNet keeps the project default mri_scalar.
 RECOMMENDED_NORMALIZATION = {
     "radimagenet_resnet50": "radimagenet_torch",
     "dinov2_vits14": "imagenet",
+    "coatnet_0_rw": "inception",
+    "coatnet_rmlp_1_rw2": "inception",
 }
 DINOV2_PATCH_SIZE = 14
+# Backbones built for exactly one input size (position embeddings / relative-position tables
+# sized at build time): a checkpoint is always rebuilt at the size it was trained with.
+FIXED_INPUT_BACKBONES = ("dinov2_vits14", "coatnet_0_rw", "coatnet_rmlp_1_rw2")
+COATNET_STRIDE = 32
 
 # Label status vocabulary of the report-extraction export.
 STATUS_POSITIVE = "positive"

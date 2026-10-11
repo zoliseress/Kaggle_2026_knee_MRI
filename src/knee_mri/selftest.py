@@ -61,11 +61,18 @@ from .utils import LOG, remove_file_logging
 
 
 # Smallest input each backbone accepts in the synthetic checks: EfficientNet 32 px (a 1x1 map),
-# ResNet-50 64 px (2x2), DINOv2 56 px (4x4 patches; a multiple of 14 - 32 and 64 are refused).
-TINY_SIZES = {"efficientnet_b0": 32, "efficientnet_v2_s": 32, "radimagenet_resnet50": 64, "dinov2_vits14": 56}
+# ResNet-50 64 px (2x2), DINOv2 56 px (4x4 patches; a multiple of 14 - 32 and 64 are refused),
+# CoAtNet 64 px (2x2; a multiple of 32, and its attention stages want more than one token).
+TINY_SIZES = {
+    "efficientnet_b0": 32, "efficientnet_v2_s": 32, "radimagenet_resnet50": 64, "dinov2_vits14": 56,
+    "coatnet_0_rw": 64, "coatnet_rmlp_1_rw2": 64,
+}
 # Smallest input whose map is at least 2 wide, for checks that need two distinct column halves
-# or a non-trivial spatial softmax: EfficientNet / ResNet 64 px (2x2), DINOv2 56 px (4x4).
-WIDE_SIZES = {"efficientnet_b0": 64, "efficientnet_v2_s": 64, "radimagenet_resnet50": 64, "dinov2_vits14": 56}
+# or a non-trivial spatial softmax: EfficientNet / ResNet / CoAtNet 64 px (2x2), DINOv2 56 px (4x4).
+WIDE_SIZES = {
+    "efficientnet_b0": 64, "efficientnet_v2_s": 64, "radimagenet_resnet50": 64, "dinov2_vits14": 56,
+    "coatnet_0_rw": 64, "coatnet_rmlp_1_rw2": 64,
+}
 
 
 def _backbone_of(cfg: Config) -> str:
@@ -95,15 +102,15 @@ def wide_config(cfg: Config) -> Config:
 def efficientnet_config(cfg: Config, backbone: str = "efficientnet_b0") -> Config:
     """`cfg` switched to an EfficientNet, for the checks about EfficientNet behaviour itself.
 
-    Everything else (data, train, labels) stays as configured; the RadImageNet-only input
-    profile falls back to the project default.
+    Everything else (data, train, labels) stays as configured; the RadImageNet-only and the
+    CoAtNet (inception) input profiles fall back to the project default.
     """
     chosen = cfg.copy()
     chosen.model.backbone = backbone
     chosen.model.weights = "none"
     chosen.model.encoder_trainable = "all"
     chosen.data.image_size = TINY_SIZES[backbone]
-    if chosen.data.encoder_normalization == "radimagenet_torch":
+    if chosen.data.encoder_normalization in ("radimagenet_torch", "inception"):
         chosen.data.encoder_normalization = "mri_scalar"
     return chosen
 
@@ -353,7 +360,23 @@ def check_short_stack_padding() -> str:
     centers_t, valid_t = bin_centers(100, 8, np.random.default_rng(0))
     assert valid_t.all() and len(set(centers_t.tolist())) == 8
     assert bin_centers(0, 8, None)[1].sum() == 0
-    return "short stacks pad with invalid centres; full stacks use one centre per bin"
+    # In-bin offsets (inference views): 0 / 1 = the bin's first / last slice, always inside the
+    # bin and the stack; short stacks are unaffected (every slice is used anyway).
+    edges = np.linspace(0, 30, 25)
+    first, _ = bin_centers(30, 24, None, offset=0.0)
+    last, _ = bin_centers(30, 24, None, offset=1.0)
+    for i in range(24):
+        lo, hi = int(np.floor(edges[i])), min(30, max(int(np.floor(edges[i])) + 1, int(np.ceil(edges[i + 1]))))
+        assert first[i] == lo and last[i] == hi - 1, f"bin {i}: [{lo}, {hi}) -> {first[i]}, {last[i]}"
+    assert not np.array_equal(first, last)
+    assert np.array_equal(bin_centers(3, 8, None, offset=1.0)[0], centers)
+    for bad in (-0.1, 1.5):
+        try:
+            bin_centers(30, 24, None, offset=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"offset {bad} accepted")
+    return "short stacks pad with invalid centres; full stacks use one centre per bin; offsets stay in-bin"
 
 
 def check_masked_pooling() -> str:
@@ -3005,8 +3028,10 @@ EXPECTED_MAPS_224 = {
     "efficientnet_v2_s": (1280, 7, 7),
     "radimagenet_resnet50": (2048, 7, 7),
     "dinov2_vits14": (384, 16, 16),
+    "coatnet_0_rw": (768, 7, 7),
+    "coatnet_rmlp_1_rw2": (768, 7, 7),
 }
-NEW_BACKBONES = ("radimagenet_resnet50", "dinov2_vits14")
+NEW_BACKBONES = ("radimagenet_resnet50", "dinov2_vits14", "coatnet_0_rw", "coatnet_rmlp_1_rw2")
 
 
 def _backbone_cfg(cfg: Config, backbone: str, **model_keys) -> Config:
@@ -3075,7 +3100,14 @@ def check_encoder_feature_maps(cfg: Config) -> str:
     with torch.no_grad():
         big = dino336(torch.randn((1, 3, 336, 336)))
     assert tuple(big.shape) == (1, 384, 24, 24), tuple(big.shape)
-    return f"maps at 224 px: {shapes}; dinov2 at 336 px: {tuple(big.shape[1:])}; finite [B, 12] logits"
+    coat320 = build_encoder_adapter("coatnet_0_rw", "none", image_size=320).eval()
+    with torch.no_grad():
+        wide = coat320(torch.randn((1, 3, 320, 320)))
+    assert tuple(wide.shape) == (1, 768, 10, 10), tuple(wide.shape)
+    return (
+        f"maps at 224 px: {shapes}; dinov2 at 336 px: {tuple(big.shape[1:])}; coatnet at 320 px: "
+        f"{tuple(wide.shape[1:])}; finite [B, 12] logits"
+    )
 
 
 def check_new_backbone_masking(cfg: Config) -> str:
@@ -3215,6 +3247,48 @@ def check_dino_patch_grid(cfg: Config) -> str:
     )
 
 
+def check_coatnet_input_size(cfg: Config) -> str:
+    """CoAtNet is built for one size: other inputs are refused at runtime, sizes the stride 32 does
+    not divide are refused by the adapter and the config, and pretrained names stay per variant."""
+    from .encoders import build_encoder_adapter, coatnet_map_size
+
+    assert coatnet_map_size(224) == (7, 7) and coatnet_map_size(320) == (10, 10)
+    refused = []
+    for size in (48, 300, 336):
+        try:
+            coatnet_map_size(size)
+        except ValueError:
+            refused.append(size)
+        else:
+            raise AssertionError(f"coatnet_map_size accepted {size}")
+        bad = cfg.copy()
+        bad.model.backbone, bad.model.weights, bad.data.image_size = "coatnet_0_rw", "none", size
+        bad.data.encoder_normalization = "inception"
+        try:
+            validate_config(bad)
+        except ValueError as error:
+            assert "multiple of 32" in str(error) or "multiple of 8" in str(error), error
+        else:
+            raise AssertionError(f"validate_config accepted data.image_size={size} for CoAtNet")
+    wrong_tag = cfg.copy()
+    wrong_tag.model.backbone, wrong_tag.model.weights, wrong_tag.data.image_size = "coatnet_0_rw", "sw_in12k_ft_in1k", 64
+    try:
+        validate_config(wrong_tag)
+    except ValueError as error:
+        assert "not a pretrained source" in str(error), error
+    else:
+        raise AssertionError("coatnet_0_rw accepted the rmlp variant's pretrained tag")
+
+    encoder = build_encoder_adapter("coatnet_0_rw", "none", image_size=64).eval()
+    try:
+        encoder(torch.zeros((1, 3, 96, 96)))
+    except ValueError as error:
+        assert "built for 64x64" in str(error), error
+    else:
+        raise AssertionError("an input of another size than the built one was accepted")
+    return f"64 px -> 2x2, 224 -> 7x7, 320 -> 10x10; sizes {refused} refused; other input sizes refused at runtime"
+
+
 def _gradient_split(model) -> tuple[list[str], list[str], list[str]]:
     """(trainable with a non-zero gradient, trainable without one, frozen with a gradient)."""
     moving, silent, leaking = [], [], []
@@ -3240,6 +3314,9 @@ def check_freeze_policies(cfg: Config) -> str:
         ("radimagenet_resnet50", "last_n", 3, lambda n: n.startswith(("layer2.", "layer3.", "layer4."))),
         ("radimagenet_resnet50", "frozen", 0, lambda n: False),
         ("efficientnet_b0", "last_n", 2, lambda n: n.startswith(("7.", "8."))),
+        ("coatnet_0_rw", "last_n", 1, lambda n: n.startswith(("model.stages.3.", "model.norm."))),
+        ("coatnet_0_rw", "last_n", 3, lambda n: n.startswith(("model.stages.1.", "model.stages.2.", "model.stages.3.", "model.norm."))),
+        ("coatnet_rmlp_1_rw2", "frozen", 0, lambda n: False),
     ]
     summary = []
     for backbone, mode, units, expected in cases:
@@ -3282,6 +3359,8 @@ def check_parameter_groups_complete(cfg: Config) -> str:
         ("dinov2_vits14", "last_n", 4, {"target_attention": True}),
         ("dinov2_vits14", "frozen", 0, {"spatial_pool": "attention"}),
         ("radimagenet_resnet50", "last_n", 1, {"side_pooling": True}),
+        ("coatnet_0_rw", "last_n", 2, {"side_pooling": True, "target_attention": True}),
+        ("coatnet_rmlp_1_rw2", "all", 0, {}),
     ]
     out = []
     for backbone, mode, units, extra in cases:
@@ -3443,7 +3522,7 @@ def check_new_backbone_grad_checkpointing(cfg: Config) -> str:
     from .model import build_model
 
     worst = {}
-    for backbone, units in (("dinov2_vits14", 2), ("radimagenet_resnet50", 2)):
+    for backbone, units in (("dinov2_vits14", 2), ("radimagenet_resnet50", 2), ("coatnet_0_rw", 2), ("coatnet_rmlp_1_rw2", 2)):
         results = []
         for enabled in (False, True):
             chosen = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=units, grad_checkpointing=enabled)
@@ -3537,6 +3616,7 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
     from pathlib import Path
     from unittest import mock
 
+    from .constants import FIXED_INPUT_BACKBONES
     from .evaluate import load_checkpoint_for_inference
     from .train import build_synthetic_trainer
 
@@ -3544,7 +3624,11 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
         raise RuntimeError("network access during an offline checkpoint load")
 
     out = []
-    for backbone, pretrained in (("dinov2_vits14", "lvd142m"), ("radimagenet_resnet50", "Z:/nowhere/RadImageNet/ResNet50.pt")):
+    for backbone, pretrained in (
+        ("dinov2_vits14", "lvd142m"),
+        ("radimagenet_resnet50", "Z:/nowhere/RadImageNet/ResNet50.pt"),
+        ("coatnet_0_rw", "sw_in1k"),
+    ):
         run_cfg = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=1, side_pooling=True)
         run_cfg.train.num_workers = run_cfg.train.eval_num_workers = 0
         run_cfg.train.microbatch_studies, run_cfg.train.accumulation_steps = 1, 2
@@ -3586,15 +3670,15 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
                     actual = loaded.cpu()(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
                 assert torch.equal(expected, actual), f"{backbone}: offline reload predictions differ"
 
-                if backbone == "dinov2_vits14":
+                if backbone in FIXED_INPUT_BACKBONES:
                     other = Config(payload["config"])
-                    other.data.image_size = 112
+                    other.data.image_size = 2 * int(run_cfg.data.image_size)
                     try:
                         load_checkpoint_for_inference(other, best, allow_data_overrides=["data.image_size"])
                     except ValueError as error:
-                        assert "trained at data.image_size=56" in str(error), error
+                        assert f"trained at data.image_size={run_cfg.data.image_size}" in str(error), error
                     else:
-                        raise AssertionError("a DINOv2 checkpoint was rebuilt for another input size")
+                        raise AssertionError(f"a {backbone} checkpoint was rebuilt for another input size")
                 out.append(f"{backbone} (loss {trainer.state.history[-1]['train_loss']:.3f})")
             finally:
                 remove_file_logging(tmp)
@@ -3708,6 +3792,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("new_backbone_masking", lambda: check_new_backbone_masking(small)),
                 ("new_backbone_pooling_options", lambda: check_new_backbone_pooling_options(small)),
                 ("dino_patch_grid", lambda: check_dino_patch_grid(small)),
+                ("coatnet_input_size", lambda: check_coatnet_input_size(small)),
                 ("freeze_policies", lambda: check_freeze_policies(small)),
                 ("parameter_groups_complete", lambda: check_parameter_groups_complete(small)),
                 ("normalization_profiles", lambda: check_normalization_profiles(small)),

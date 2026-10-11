@@ -17,6 +17,7 @@ from typing import Any, Iterable
 import yaml
 
 from .constants import (
+    COATNET_STRIDE,
     DEFAULT_BACKBONE,
     DINOV2_PATCH_SIZE,
     ENCODER_FEATURES,
@@ -39,6 +40,8 @@ BACKBONE_WEIGHT_NAMES = {
     "efficientnet_v2_s": None,
     "radimagenet_resnet50": (),
     "dinov2_vits14": ("lvd142m",),
+    "coatnet_0_rw": ("sw_in1k",),
+    "coatnet_rmlp_1_rw2": ("sw_in12k_ft_in1k",),
 }
 _LOG = logging.getLogger("knee_mri")
 
@@ -279,6 +282,11 @@ def validate_encoder_config(cfg: Config) -> None:
             f"data.image_size={size} is not a multiple of the DINOv2 patch size {DINOV2_PATCH_SIZE}. The "
             "dinov2_vits14 adapter does no padding, cropping or resizing; use e.g. 224 (16x16 patches) or "
             "336 (24x24 patches)."
+        )
+    if backbone.startswith("coatnet_") and size % COATNET_STRIDE != 0:
+        raise ValueError(
+            f"data.image_size={size} is not a multiple of {COATNET_STRIDE}, the CoAtNet output stride. Its "
+            "transformer stages are built for an exact token grid; use e.g. 224 (7x7) or 320 (10x10)."
         )
 
     profile = str(cfg.data.encoder_normalization)

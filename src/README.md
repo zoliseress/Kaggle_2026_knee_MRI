@@ -478,6 +478,8 @@ common width.
 | `efficientnet_v2_s` | `IMAGENET1K_V1` \| file \| `none` | `[N, 1280, 7, 7]` | 8 feature stages | — |
 | `radimagenet_resnet50` | RadImageNet `ResNet50.pt` \| `none` | `[N, 2048, 7, 7]` | `layer1`…`layer4` | `config.radimagenet_resnet50.yaml` |
 | `dinov2_vits14` | `lvd142m` \| file \| `none` | `[N, 384, 16, 16]` | 12 transformer blocks | `config.dinov2_vits14.yaml` |
+| `coatnet_0_rw` | `sw_in1k` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
+| `coatnet_rmlp_1_rw2` | `sw_in12k_ft_in1k` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
 
 ```powershell
 python -m knee_mri.cli train --config src/config.dinov2_vits14.yaml --mode fold --set split.fold=0
@@ -501,6 +503,28 @@ changed backbone, freeze policy or adapter version.
   `lvd142m` downloads `timm/vit_small_patch14_dinov2.lvd142m/model.safetensors` once into the
   Hugging Face cache (`HF_HUB_OFFLINE=1` works afterwards), or point `model.weights` at a local
   copy of that file.
+* **CoAtNet** — timm `coatnet_0_rw_224.sw_in1k` (27M, ImageNet-1k) and
+  `coatnet_rmlp_1_rw2_224.sw_in12k_ft_in1k` (41M, ImageNet-12k → 1k): MBConv stages 0–1,
+  relative-position self-attention over the whole map in stages 2–3, final LayerNorm2d; the
+  adapter returns `forward_features()` (`[N, 768, H/32, W/32]`, 10×10 at 320 px). Like DINOv2 the
+  model is built for exactly `data.image_size`, which must be a **multiple of 32** (224, 320 …);
+  another input size is refused. When the weights load, timm resizes the 224 px relative-position
+  bias tables of `coatnet_0_rw` to the 320 px grids (20×20, 10×10); the `rmlp` variant computes its
+  biases with an MLP and has no table. Use `data.encoder_normalization=inception` (mean = std = 0.5,
+  the `sw_in*` statistics). The weight name downloads `timm/<model>.<tag>/model.safetensors` once
+  into the Hugging Face cache, or point `model.weights` at a local copy. There is no example
+  config: run it from the machine's own config (paths stay right on Windows and Linux) with
+  `--set model.backbone=coatnet_0_rw --set model.weights=sw_in1k --set data.encoder_normalization=inception`.
+  One training step (1 study × 3 slots × 24 windows, 320 px, bf16, E3 head, AdamW + EMA; measure on
+  another GPU with `python tools/memory_probe.py <the same --set options>`):
+
+  | encoder, RTX 5080 16 GB | peak allocated / reserved | step |
+  |---|---|---|
+  | `efficientnet_v2_s`, grad checkpointing | 4.4 / 8.4 GiB | 261 ms |
+  | `coatnet_0_rw` | 12.7 / 13.9 GiB | 225 ms |
+  | `coatnet_0_rw`, grad checkpointing | 4.3 / 5.3 GiB | 285 ms |
+  | `coatnet_rmlp_1_rw2`, grad checkpointing | 6.1 / 7.8 GiB | 498 ms |
+  | `coatnet_rmlp_1_rw2` | out of memory | – |
 * **RadImageNet ResNet-50** — torchvision ResNet-50 up to `layer4` (no pooling, no fc) with the
   official RadImageNet PyTorch weights: `RadImageNet_pytorch/ResNet50.pt` from
   `RadImageNet_pytorch.zip` (Google Drive link in the README of
@@ -515,7 +539,7 @@ changed backbone, freeze policy or adapter version.
   their running statistics (mean |Δμ|/σ 0.10), with `mri_scalar` or `imagenet` they do not (≈ 4).
 
 **Normalisation.** `data.encoder_normalization` (`mri_scalar` default | `imagenet` |
-`radimagenet_torch`) is applied exactly once, by `dataset.normalization_stats()` — in the
+`radimagenet_torch` | `inception`) is applied exactly once, by `dataset.normalization_stats()` — in the
 worker or in `augment_batch` on the GPU, identically, and the same in training, validation and
 inference. The robust intensity scaling and the geometry are unchanged. The profile, its
 mean/std, the encoder id, adapter version and weight provenance (path + sha256) are stored in
@@ -523,20 +547,22 @@ every checkpoint (`payload["encoder"]`, `model_description`).
 
 **Freezing** (`model.encoder_trainable`): `all` (default), `frozen` (head only) or `last_n`
 with `model.encoder_trainable_units` — the last N transformer blocks plus the final norm
-(DINOv2), the last N residual stages (ResNet), the last N feature stages (EfficientNet). The
+(DINOv2), the last N stages plus the final norm (CoAtNet), the last N residual stages
+(ResNet), the last N feature stages (EfficientNet). The
 example configs start from DINOv2 `last_n=4` and RadImageNet `layer4` only: first experiments,
 not tuned optima. Frozen units get `requires_grad=False`, are left out of the optimizer
 groups and run in eval mode after every `model.train()` (their BatchNorm statistics never
 move); `model.freeze_bn_running_stats` separately decides the BN statistics of trainable units.
 
 **Memory.** `model.grad_checkpointing` is backbone-specific: per EfficientNet stage, per
-trainable ResNet stage, per DINOv2 block (non-reentrant, so trainable blocks after frozen ones
+trainable ResNet stage, per DINOv2 block, per CoAtNet block (timm `checkpoint_seq`; non-reentrant, so trainable blocks after frozen ones
 still get gradients). Frozen units keep no autograd graph. `model.encoder_chunk_size` still
 works but bounds only the size of one encoder call, not the training memory.
 
 **Inference** rebuilds the architecture from the checkpoint's own config with
 `model.weights=none` — no network and no pretrained file — then loads the full project
-checkpoint strictly. A DINOv2 checkpoint must be run at its trained `data.image_size`.
+checkpoint strictly. A DINOv2 or CoAtNet checkpoint is always rebuilt at its trained
+`data.image_size`; an inference config with another size is refused.
 
 ## Loss
 

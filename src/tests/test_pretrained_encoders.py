@@ -8,6 +8,8 @@ RadImageNet:  KNEE_MRI_RADIMAGENET_WEIGHTS=<.../RadImageNet_pytorch/ResNet50.pt>
               linked from github.com/BMEII-AI/RadImageNet).
 DINOv2:       timm/vit_small_patch14_dinov2.lvd142m model.safetensors in the Hugging Face
               cache; set KNEE_MRI_ALLOW_DOWNLOAD=1 to let the test download it.
+CoAtNet:      timm/coatnet_0_rw_224.sw_in1k and timm/coatnet_rmlp_1_rw2_224.sw_in12k_ft_in1k,
+              the same way (Hugging Face cache, or KNEE_MRI_ALLOW_DOWNLOAD=1).
 Existing runs: every work/runs/<dataset>/*/best.pt is rebuilt offline and must give finite logits.
 """
 
@@ -25,6 +27,9 @@ REPO = SRC.parent
 sys.path.insert(0, str(SRC))
 
 from knee_mri.encoders import (  # noqa: E402
+    COATNET_HF_FILE,
+    COATNETS,
+    CoAtNetEncoder,
     DINOV2_HF_FILE,
     DINOV2_HF_HUB_ID,
     RADIMAGENET_RESNET50_SHA256,
@@ -111,6 +116,51 @@ def test_dinov2_real_weights_and_position_embeddings(size, grid):
     assert ours.shape == (2, 384, grid, grid) and torch.isfinite(ours).all()
     assert float((ours - timm_map).abs().max()) < 1e-4
     assert encoder.weights_info["hf_hub_id"] == DINOV2_HF_HUB_ID and len(encoder.weights_info["sha256"]) == 64
+
+
+def _coatnet_file(hub_id: str) -> Path:
+    try:
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+    except ImportError:
+        pytest.skip("huggingface_hub is not installed")
+    cached = try_to_load_from_cache(hub_id, COATNET_HF_FILE)
+    if isinstance(cached, str) and Path(cached).is_file():
+        return Path(cached)
+    if os.environ.get("KNEE_MRI_ALLOW_DOWNLOAD") == "1":
+        return Path(hf_hub_download(hub_id, COATNET_HF_FILE))
+    pytest.skip(f"{hub_id} is not in the Hugging Face cache (set KNEE_MRI_ALLOW_DOWNLOAD=1)")
+
+
+@pytest.mark.parametrize("backbone,n_tables", [("coatnet_0_rw", 9), ("coatnet_rmlp_1_rw2", 0)])
+def test_coatnet_real_weights_at_320(backbone, n_tables):
+    """Every tensor of the file is in the model unchanged, except the relative-position bias tables,
+    which timm resizes from the 224 px (14x14) grids to the 320 px (20x20 / 10x10) ones; the rmlp
+    variant has none (MLP biases). The classifier head is the only thing left out."""
+    name, tag = COATNETS[backbone]
+    path = _coatnet_file(f"timm/{name}.{tag}")
+    from safetensors.torch import load_file
+
+    reference = load_file(str(path))
+    encoder = CoAtNetEncoder(backbone, tag, 320).eval()
+    state = encoder.model.state_dict()
+    assert set(reference) - set(state) == {"head.fc.weight", "head.fc.bias"} and set(state) <= set(reference)
+    resized = []
+    for key, value in reference.items():
+        if key.startswith("head."):
+            continue
+        if key.endswith("relative_position_bias_table"):
+            module = encoder.model.get_submodule(key[: -len(".relative_position_bias_table")])
+            window = tuple(module.window_size)
+            assert window in ((20, 20), (10, 10)), f"{key}: window {window} is not a 320 px stage grid"
+            assert state[key].shape[0] == (2 * window[0] - 1) * (2 * window[1] - 1), key
+            resized.append(key)
+            continue
+        assert torch.equal(state[key], value), f"{key} differs from the file"
+    assert len(resized) == n_tables
+    with torch.no_grad():
+        feature_map = encoder(torch.rand((2, 3, 320, 320)) * 2 - 1)  # inception range [-1, 1]
+    assert feature_map.shape == (2, 768, 10, 10) and torch.isfinite(feature_map).all()
+    assert encoder.weights_info["hf_hub_id"] == f"timm/{name}.{tag}" and len(encoder.weights_info["sha256"]) == 64
 
 
 def test_existing_run_checkpoints_rebuild_offline():

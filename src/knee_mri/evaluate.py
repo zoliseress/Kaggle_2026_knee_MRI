@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 
 from .config import Config
-from .constants import CHECKPOINT_VERSION, DEFAULT_BACKBONE, STUDY_ID, TARGETS
+from .constants import CHECKPOINT_VERSION, DEFAULT_BACKBONE, FIXED_INPUT_BACKBONES, STUDY_ID, TARGETS
 from .dataset import StudyBagDataset, check_study_coverage, collate_studies, enforce_coverage_gate
 from .labels import build_label_table, load_reference_table
 from .metrics import evaluate_predictions, soft_roc_auc
@@ -100,13 +100,15 @@ def load_checkpoint_for_inference(
     else:
         LOG.warning("%s carries no model config; building the architecture from the current config", path)
     build_cfg.model.weights = "none"
-    if str(build_cfg.model.get("backbone", DEFAULT_BACKBONE)) == "dinov2_vits14":
-        # DINOv2 is built for one input size (its position embeddings); no override can change it.
+    backbone = str(build_cfg.model.get("backbone", DEFAULT_BACKBONE))
+    if backbone in FIXED_INPUT_BACKBONES:
+        # Built for one input size (DINOv2 position embeddings, CoAtNet relative-position
+        # tables); no override can change it.
         trained_size = int(stored_cfg.get_dotted("data.image_size"))
         if int(cfg.data.image_size) != trained_size:
             raise ValueError(
-                f"{path}: the dinov2_vits14 encoder was trained at data.image_size={trained_size}; the inference "
-                f"config uses {cfg.data.image_size}. DINOv2 inputs must have the trained size."
+                f"{path}: the {backbone} encoder was trained at data.image_size={trained_size}; the inference "
+                f"config uses {cfg.data.image_size}. {backbone} inputs must have the trained size."
             )
         build_cfg.data.image_size = trained_size
     model = build_model(build_cfg, n_slots=len(stored_cfg.get_dotted("data.series_slots") or cfg.data.series_slots))
@@ -128,39 +130,59 @@ def predict_studies(
     model: torch.nn.Module,
     study_ids: Sequence[str],
     label_table=None,
+    center_offsets: Sequence[float | None] = (None,),
 ) -> tuple[list[str], np.ndarray]:
-    """Deterministic inference: eval mode, no augmentation, no TTA."""
+    """Deterministic inference: eval mode, no augmentation.
+
+    `center_offsets`: one slice-window view per entry (the in-bin centre position, None = the
+    bin midpoint, see `bin_centers`); the views' logits are averaged before the sigmoid. The
+    default single midpoint view is the plain, TTA-free inference.
+    """
     from torch.utils.data import DataLoader
 
+    from .train import eval_loader_settings
+
+    if not center_offsets:
+        raise ValueError("center_offsets needs at least one view")
     spec = select_device(cfg.train.amp)
     model = model.to(spec.device)
     model.eval()
-    dataset = StudyBagDataset(cfg, list(study_ids), label_table, train=False)
-    from .train import eval_loader_settings
-
     num_workers, prefetch_factor, _ = eval_loader_settings(cfg)
-    loader = DataLoader(
-        dataset,
-        batch_size=max(1, int(cfg.train.eval_batch_studies)),
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_studies,
-        pin_memory=spec.device.type == "cuda",
-        **({"prefetch_factor": prefetch_factor} if num_workers > 0 and prefetch_factor else {}),
-    )
     ids: list[str] = []
-    scores: list[np.ndarray] = []
-    for batch in loader:
-        with autocast_ctx(spec):
-            logits = model(
-                batch["images"].to(spec.device),
-                batch["slice_valid_mask"].to(spec.device),
-                batch["series_present_mask"].to(spec.device),
-            )
-        scores.append(torch.sigmoid(logits.float()).cpu().numpy())
-        ids.extend(batch["study_ids"])
-    stacked = np.concatenate(scores, axis=0) if scores else np.zeros((0, len(TARGETS)), dtype=np.float32)
-    return ids, stacked
+    logit_sum: np.ndarray | None = None
+    for offset in center_offsets:
+        dataset = StudyBagDataset(cfg, list(study_ids), label_table, train=False, center_offset=offset)
+        loader = DataLoader(
+            dataset,
+            batch_size=max(1, int(cfg.train.eval_batch_studies)),
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_studies,
+            pin_memory=spec.device.type == "cuda",
+            **({"prefetch_factor": prefetch_factor} if num_workers > 0 and prefetch_factor else {}),
+        )
+        view_ids: list[str] = []
+        view_logits: list[np.ndarray] = []
+        for batch in loader:
+            with autocast_ctx(spec):
+                logits = model(
+                    batch["images"].to(spec.device),
+                    batch["slice_valid_mask"].to(spec.device),
+                    batch["series_present_mask"].to(spec.device),
+                )
+            view_logits.append(logits.float().cpu().numpy())
+            view_ids.extend(batch["study_ids"])
+        stacked = (
+            np.concatenate(view_logits, axis=0) if view_logits else np.zeros((0, len(TARGETS)), dtype=np.float32)
+        )
+        if logit_sum is None:
+            ids, logit_sum = view_ids, stacked.astype(np.float64)
+        else:
+            assert view_ids == ids, "views must visit the studies in the same order"
+            logit_sum += stacked
+    assert logit_sum is not None
+    mean_logits = torch.from_numpy(logit_sum / len(center_offsets))
+    return ids, torch.sigmoid(mean_logits).numpy().astype(np.float32)
 
 
 def evaluate_checkpoint(

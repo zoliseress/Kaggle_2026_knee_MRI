@@ -8,6 +8,9 @@ attend over. Every backbone is wrapped so that it delivers exactly that and noth
     efficientnet_v2_s     torchvision efficientnet_v2_s          [N, 1280,  7,  7]  1280
     radimagenet_resnet50  torchvision resnet50, RadImageNet      [N, 2048,  7,  7]  2048
     dinov2_vits14         timm vit_small_patch14_dinov2.lvd142m  [N,  384, 16, 16]   384
+    coatnet_0_rw          timm coatnet_0_rw_224.sw_in1k          [N,  768,  7,  7]   768
+    coatnet_rmlp_1_rw2    timm coatnet_rmlp_1_rw2_224            [N,  768,  7,  7]   768
+                          .sw_in12k_ft_in1k
 
 The head is sized from `out_channels`; nothing is projected to a common width.
 
@@ -36,7 +39,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
-from .constants import DEFAULT_BACKBONE, DINOV2_PATCH_SIZE, ENCODER_FEATURES, ENCODER_UNITS
+from .constants import COATNET_STRIDE, DEFAULT_BACKBONE, DINOV2_PATCH_SIZE, ENCODER_FEATURES, ENCODER_UNITS
 from .utils import LOG
 
 # Bump when an adapter's output semantics change (token handling, which layer is returned,
@@ -46,6 +49,8 @@ ADAPTER_VERSIONS = {
     "efficientnet_v2_s": "efficientnet_features_v1",
     "radimagenet_resnet50": "resnet50_layer4_v1",
     "dinov2_vits14": "dinov2_patch_tokens_v1",
+    "coatnet_0_rw": "coatnet_features_v1",
+    "coatnet_rmlp_1_rw2": "coatnet_features_v1",
 }
 FREEZE_MODES = ("all", "frozen", "last_n")
 RANDOM_WEIGHTS = ("none", "random", "null")
@@ -611,6 +616,164 @@ class DinoV2Encoder(EncoderMixin, nn.Module):
 
 
 # --------------------------------------------------------------------------------------
+# CoAtNet (timm MaxxVit family): MBConv stages 0-1, relative-position transformer stages 2-3
+# --------------------------------------------------------------------------------------
+
+
+# model.backbone -> (timm architecture, pretrained tag). The tag is also the model.weights name.
+COATNETS = {
+    "coatnet_0_rw": ("coatnet_0_rw_224", "sw_in1k"),
+    "coatnet_rmlp_1_rw2": ("coatnet_rmlp_1_rw2_224", "sw_in12k_ft_in1k"),
+}
+COATNET_HF_FILE = "model.safetensors"
+
+
+def coatnet_map_size(image_size: int) -> tuple[int, int]:
+    """Map of a square input; refuses sizes the stride does not divide (the attention stages are
+    built for an exact token grid, so there is no rounding as in the CNNs)."""
+    size = int(image_size)
+    if size <= 0 or size % COATNET_STRIDE != 0:
+        raise ValueError(
+            f"data.image_size={size} is not a multiple of {COATNET_STRIDE}, the CoAtNet output stride. Its "
+            "transformer stages are built for an exact token grid; use e.g. 224 (7x7) or 320 (10x10)."
+        )
+    return size // COATNET_STRIDE, size // COATNET_STRIDE
+
+
+class CoAtNetEncoder(EncoderMixin, nn.Module):
+    """timm CoAtNet `forward_features` (stem, 4 stages, final LayerNorm2d) -> `[N, 768, H/32, W/32]`.
+
+    The classifier head is not built (`num_classes=0`). The model is created for exactly
+    `image_size` px: stages 2-3 attend over the whole map with relative-position biases sized
+    for that token grid. When pretrained weights load, timm's `checkpoint_filter_fn` resizes the
+    224 px bias tables (`coatnet_0_rw`); the `rmlp` variant computes its biases with an MLP and
+    has no table to resize. Any other input size is refused at runtime.
+
+    Units for `last_n` are the 4 stages; the final norm trains with them; the stem only trains
+    under `all`. Stem and MBConv stages contain BatchNorm (`freeze_bn_running_stats` applies).
+    """
+
+    def __init__(self, backbone: str, weights: str, image_size: int) -> None:
+        nn.Module.__init__(self)
+        if backbone not in COATNETS:
+            raise ValueError(f"CoAtNetEncoder builds {sorted(COATNETS)}, got {backbone!r}")
+        self._init_policy()
+        self.backbone = backbone
+        self.timm_name, self.timm_tag = COATNETS[backbone]
+        self.hf_hub_id = f"timm/{self.timm_name}.{self.timm_tag}"
+        self.model_id = self.hf_hub_id
+        self.input_size = int(image_size)
+        self.grid = coatnet_map_size(self.input_size)
+
+        try:
+            import timm
+        except ImportError as exc:  # pragma: no cover - environment
+            raise ImportError(f"model.backbone={backbone} needs timm (pip install 'timm>=1.0')") from exc
+
+        spec = str(weights)
+        info: dict[str, Any] = {"timm": timm.__version__, "backbone": backbone, "weights_request": spec}
+        kwargs = {"img_size": self.input_size, "num_classes": 0}
+        if _is_random(spec):
+            _random_warning(backbone, spec)
+            self.model = timm.create_model(self.timm_name, pretrained=False, **kwargs)
+            info["weights_used"] = "random"
+        else:
+            path = self._pretrained_file(spec)
+            self.model = timm.create_model(
+                f"{self.timm_name}.{self.timm_tag}", pretrained=True, pretrained_cfg_overlay={"file": str(path)}, **kwargs
+            )
+            self._verify_loaded(path)
+            info.update({"weights_used": str(path), "sha256": sha256_file(path), "hf_hub_id": self.hf_hub_id})
+            LOG.info("Loaded %s weights from %s at %d px (%dx%d map)", self.hf_hub_id, path, self.input_size, *self.grid)
+        self.weights_info = info
+
+        self.out_channels = int(self.model.num_features)
+        if self.out_channels != ENCODER_FEATURES[backbone]:
+            raise RuntimeError(f"{backbone} num_features {self.out_channels} != {ENCODER_FEATURES[backbone]}")
+        # The built model must map exactly this size to the expected grid (catches a timm that
+        # ignored img_size). Eval mode: a train-mode probe would move the BatchNorm statistics.
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            probe = self.model.forward_features(torch.zeros((1, 3, self.input_size, self.input_size)))
+        self.model.train(was_training)
+        if tuple(probe.shape[1:]) != (self.out_channels, *self.grid):
+            raise RuntimeError(
+                f"{backbone} built for {self.input_size} px gives {tuple(probe.shape[1:])}, expected "
+                f"{(self.out_channels, *self.grid)}"
+            )
+
+    def _pretrained_file(self, spec: str) -> Path:
+        """The pretrained tag = the timm/HF hub file (cached after the first download); else a local timm-format file."""
+        if spec == self.timm_tag:
+            try:
+                from huggingface_hub import hf_hub_download
+
+                return Path(hf_hub_download(self.hf_hub_id, COATNET_HF_FILE))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not obtain {self.hf_hub_id}/{COATNET_HF_FILE}: {exc}. Never train silently from "
+                    "random initialisation. Download it once with network access (it is then cached, "
+                    "HF_HUB_OFFLINE=1 works afterwards), point model.weights at a local copy of that file, "
+                    "or set model.weights=none deliberately."
+                ) from exc
+        path = resolve_weight_path(spec)
+        if path is None:
+            raise FileNotFoundError(
+                f"model.weights={spec!r}: use {self.timm_tag!r} (timm/HF hub {self.hf_hub_id}), a local copy of "
+                f"its {COATNET_HF_FILE}, or 'none'."
+            )
+        return path
+
+    def _verify_loaded(self, path: Path) -> None:
+        """The file's last MLP weight really is in the model (a cheap cross-check of timm's load)."""
+        stage = self.model.stages[-1]
+        key = f"stages.{len(self.model.stages) - 1}.blocks.{len(stage.blocks) - 1}.mlp.fc2.weight"
+        if path.suffix == ".safetensors":
+            from safetensors import safe_open
+
+            with safe_open(str(path), framework="pt") as handle:
+                reference = handle.get_tensor(key) if key in handle.keys() else None
+        else:
+            state = torch.load(str(path), map_location="cpu", weights_only=True)
+            reference = state.get(key)
+        if reference is None:
+            raise ValueError(f"{path} is not a timm-format {self.backbone} checkpoint (no {key}); use the timm/HF hub file")
+        current = self.model.state_dict()[key]
+        # timm may store a 1x1 conv as a linear weight (checkpoint_filter_fn reshapes between them).
+        if not torch.equal(reference.to(current.dtype).reshape(current.shape), current):
+            raise RuntimeError(f"{self.backbone} weights from {path} did not end up in the model ({key} differs)")
+
+    def units(self) -> list[nn.Module]:
+        return list(self.model.stages)
+
+    def last_n_trainable_modules(self, n: int) -> list[nn.Module]:
+        return list(self.model.stages)[-n:] + [self.model.norm]
+
+    def feature_map_size(self, image_size: int) -> tuple[int, int]:
+        return coatnet_map_size(image_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        height, width = int(x.shape[-2]), int(x.shape[-1])
+        if (height, width) != (self.input_size, self.input_size):
+            raise ValueError(
+                f"the {self.backbone} encoder was built for {self.input_size}x{self.input_size} inputs "
+                f"(data.image_size at build time), got {height}x{width}"
+            )
+        use_ckpt = self.grad_checkpointing and self.training and torch.is_grad_enabled()
+        if use_ckpt:
+            from timm.layers.config import use_reentrant_ckpt
+
+            if use_reentrant_ckpt():
+                raise RuntimeError(
+                    "timm is set to reentrant checkpointing (TIMM_REENTRANT_CKPT): with a partially frozen "
+                    "encoder the trainable stages would silently get no gradients. Unset it."
+                )
+        self.model.set_grad_checkpointing(use_ckpt)
+        return self.model.forward_features(x)
+
+
+# --------------------------------------------------------------------------------------
 # Factory
 # --------------------------------------------------------------------------------------
 
@@ -632,6 +795,10 @@ def build_encoder_adapter(
         if image_size is None:
             raise ValueError("dinov2_vits14 needs the input size (data.image_size) at build time")
         encoder = DinoV2Encoder(weights, int(image_size))
+    elif backbone in COATNETS:
+        if image_size is None:
+            raise ValueError(f"{backbone} needs the input size (data.image_size) at build time")
+        encoder = CoAtNetEncoder(backbone, weights, int(image_size))
     else:
         raise ValueError(f"Unknown model.backbone={backbone!r}; known: {sorted(ENCODER_FEATURES)}")
     if len(encoder.units()) != ENCODER_UNITS[backbone]:

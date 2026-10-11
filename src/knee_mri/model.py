@@ -5,7 +5,7 @@ Tensor flow
     [B, P, S, 3, H, W] -> gather valid triplets -> [N_valid, 3, H, W]
     -> encoder adapter (encoders.py) -> feature map [N_valid, C, Hf, Wf]
        efficientnet_b0 / _v2_s: C=1280, 7x7 at 224 px | radimagenet_resnet50: C=2048, 7x7
-       dinov2_vits14: C=384, 16x16 patch-token map at 224 px
+       dinov2_vits14: C=384, 16x16 patch-token map at 224 px | coatnet_*: C=768, 7x7 (10x10 at 320 px)
     -> spatial pooling (model.spatial_pool) -> [N_valid, F]
        avg: global average (C) | avgmax: average and maximum (2C)
        attention: softmax-weighted average over the map (C), zero-initialised to avg
@@ -207,8 +207,8 @@ class EfficientNetMIL(nn.Module):
         if side_pooling and spatial_pool != "avg":
             raise ValueError("model.side_pooling needs model.spatial_pool=avg (it pools map halves itself)")
         self.backbone = str(backbone)
-        # The adapter maps [N, 3, H, W] -> [N, C, Hf, Wf]; image_size only matters for DINOv2,
-        # whose position embeddings are built for exactly that input.
+        # The adapter maps [N, 3, H, W] -> [N, C, Hf, Wf]; image_size only matters for DINOv2 and
+        # CoAtNet, whose position embeddings / relative-position tables are built for exactly that input.
         self.features = build_encoder_adapter(
             self.backbone,
             weights,
