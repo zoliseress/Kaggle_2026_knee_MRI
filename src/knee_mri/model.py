@@ -6,6 +6,7 @@ Tensor flow
     -> encoder adapter (encoders.py) -> feature map [N_valid, C, Hf, Wf]
        efficientnet_b0 / _v2_s: C=1280, 7x7 at 224 px | radimagenet_resnet50: C=2048, 7x7
        dinov2_vits14: C=384, 16x16 patch-token map at 224 px | coatnet_*: C=768, 7x7 (10x10 at 320 px)
+       convnext_tiny / convnextv2_tiny: C=768, convnext_nano: C=640, 7x7 (10x10 at 320 px)
     -> spatial pooling (model.spatial_pool) -> [N_valid, F]
        avg: global average (C) | avgmax: average and maximum (2C)
        attention: softmax-weighted average over the map (C), zero-initialised to avg
@@ -198,6 +199,7 @@ class EfficientNetMIL(nn.Module):
         image_size: int | None = None,
         encoder_trainable: str = "all",
         encoder_trainable_units: int = 0,
+        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
         if spatial_pool not in SPATIAL_POOLS:
@@ -216,6 +218,7 @@ class EfficientNetMIL(nn.Module):
             freeze=str(encoder_trainable),
             trainable_units=int(encoder_trainable_units),
             grad_checkpointing=bool(grad_checkpointing),
+            drop_path_rate=float(drop_path_rate),
         )
         self.weights_info = self.features.weights_info
         encoder_features = int(self.features.out_channels)
@@ -504,6 +507,7 @@ def build_model(cfg, n_slots: int | None = None) -> EfficientNetMIL:
         image_size=int(cfg.data.image_size),
         encoder_trainable=str(cfg.model.get("encoder_trainable", "all")),
         encoder_trainable_units=int(cfg.model.get("encoder_trainable_units", 0) or 0),
+        drop_path_rate=float(cfg.model.get("drop_path_rate", 0.0) or 0.0),
     )
     LOG.info("Model: %s", model.describe())
     return model

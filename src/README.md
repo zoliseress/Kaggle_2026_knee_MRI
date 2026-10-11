@@ -480,6 +480,9 @@ common width.
 | `dinov2_vits14` | `lvd142m` \| file \| `none` | `[N, 384, 16, 16]` | 12 transformer blocks | `config.dinov2_vits14.yaml` |
 | `coatnet_0_rw` | `sw_in1k` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
 | `coatnet_rmlp_1_rw2` | `sw_in12k_ft_in1k` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
+| `convnext_tiny` | `in12k_ft_in1k` \| `fb_in22k_ft_in1k` \| `dinov3_lvd1689m` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
+| `convnext_nano` | `in12k_ft_in1k` \| file \| `none` | `[N, 640, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
+| `convnextv2_tiny` | `fcmae_ft_in22k_in1k` \| file \| `none` | `[N, 768, 7, 7]` | 4 stages (+ final norm) | — (`--set`, see below) |
 
 ```powershell
 python -m knee_mri.cli train --config src/config.dinov2_vits14.yaml --mode fold --set split.fold=0
@@ -525,6 +528,33 @@ changed backbone, freeze policy or adapter version.
   | `coatnet_0_rw`, grad checkpointing | 4.3 / 5.3 GiB | 285 ms |
   | `coatnet_rmlp_1_rw2`, grad checkpointing | 6.1 / 7.8 GiB | 498 ms |
   | `coatnet_rmlp_1_rw2` | out of memory | – |
+* **ConvNeXt** — timm `convnext_tiny` (28M; weights `in12k_ft_in1k` ImageNet-12k → 1k,
+  `fb_in22k_ft_in1k` ImageNet-22k → 1k, `dinov3_lvd1689m` self-supervised DINOv3, distilled from
+  the 7B ViT, **own licence (`dinov3-license`), check the competition rules before a submission**),
+  `convnext_nano` (15M, `in12k_ft_in1k`) and `convnextv2_tiny` (28M, GRN blocks, `fcmae_ft_in22k_in1k`
+  masked-autoencoder pretraining). `model.weights` is the timm tag; it downloads
+  `timm/<backbone>.<tag>/model.safetensors` once into the Hugging Face cache, or point it at a
+  local copy. Both load strictly (only the linear classifier `head.fc.*` may be left over). The
+  checkpoint records the tag and `hf_hub_id` only for a tag; for a local file they are empty and
+  the path + sha256 identify the weights (the file itself does not say which pretraining it is). The adapter returns `forward_features()` followed by the pretrained final
+  `LayerNorm2d`, which timm keeps in the classifier head (`head.norm`, there applied to the pooled
+  vector); here it normalises every map position, so the head gets a normalised map as with
+  CoAtNet. Pure CNN: **any input size** (stride 32, rounded down: 320 px → 10×10), not rebuilt per
+  size. LayerNorm only, no BatchNorm (`freeze_bn_running_stats` has nothing to act on). Use
+  `data.encoder_normalization=imagenet`. `model.drop_path_rate` (ConvNeXt-only, default 0) sets
+  the timm stochastic depth; 0.1 is the usual fine-tuning value for the tiny models. Run it from
+  the machine's own config with
+  `--set model.backbone=convnext_tiny --set model.weights=in12k_ft_in1k --set data.encoder_normalization=imagenet --set model.drop_path_rate=0.1`.
+  The same training step as above (drop path 0.1):
+
+  | encoder, RTX 5080 16 GB | peak allocated / reserved | step |
+  |---|---|---|
+  | `convnext_nano` | 6.0 / 6.6 GiB | 98 ms |
+  | `convnext_nano`, grad checkpointing | 2.4 / 2.8 GiB | 122 ms |
+  | `convnext_tiny` | 9.3 / 9.8 GiB | 142 ms |
+  | `convnext_tiny`, grad checkpointing | 3.2 / 4.0 GiB | 177 ms |
+  | `convnextv2_tiny`, grad checkpointing | 5.6 / 6.0 GiB | 429 ms |
+  | `convnextv2_tiny` | out of memory | – |
 * **RadImageNet ResNet-50** — torchvision ResNet-50 up to `layer4` (no pooling, no fc) with the
   official RadImageNet PyTorch weights: `RadImageNet_pytorch/ResNet50.pt` from
   `RadImageNet_pytorch.zip` (Google Drive link in the README of
@@ -547,7 +577,7 @@ every checkpoint (`payload["encoder"]`, `model_description`).
 
 **Freezing** (`model.encoder_trainable`): `all` (default), `frozen` (head only) or `last_n`
 with `model.encoder_trainable_units` — the last N transformer blocks plus the final norm
-(DINOv2), the last N stages plus the final norm (CoAtNet), the last N residual stages
+(DINOv2), the last N stages plus the final norm (CoAtNet, ConvNeXt), the last N residual stages
 (ResNet), the last N feature stages (EfficientNet). The
 example configs start from DINOv2 `last_n=4` and RadImageNet `layer4` only: first experiments,
 not tuned optima. Frozen units get `requires_grad=False`, are left out of the optimizer
@@ -555,7 +585,7 @@ groups and run in eval mode after every `model.train()` (their BatchNorm statist
 move); `model.freeze_bn_running_stats` separately decides the BN statistics of trainable units.
 
 **Memory.** `model.grad_checkpointing` is backbone-specific: per EfficientNet stage, per
-trainable ResNet stage, per DINOv2 block, per CoAtNet block (timm `checkpoint_seq`; non-reentrant, so trainable blocks after frozen ones
+trainable ResNet stage, per DINOv2 block, per CoAtNet / ConvNeXt block (timm `checkpoint_seq`; non-reentrant, so trainable blocks after frozen ones
 still get gradients). Frozen units keep no autograd graph. `model.encoder_chunk_size` still
 works but bounds only the size of one encoder call, not the training memory.
 

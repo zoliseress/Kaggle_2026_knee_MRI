@@ -10,6 +10,7 @@ DINOv2:       timm/vit_small_patch14_dinov2.lvd142m model.safetensors in the Hug
               cache; set KNEE_MRI_ALLOW_DOWNLOAD=1 to let the test download it.
 CoAtNet:      timm/coatnet_0_rw_224.sw_in1k and timm/coatnet_rmlp_1_rw2_224.sw_in12k_ft_in1k,
               the same way (Hugging Face cache, or KNEE_MRI_ALLOW_DOWNLOAD=1).
+ConvNeXt:     timm/<backbone>.<tag> for every tag in CONVNEXT_WEIGHT_TAGS, the same way.
 Existing runs: every work/runs/<dataset>/*/best.pt is rebuilt offline and must give finite logits.
 """
 
@@ -26,10 +27,13 @@ SRC = Path(__file__).resolve().parents[1]
 REPO = SRC.parent
 sys.path.insert(0, str(SRC))
 
+from knee_mri.constants import CONVNEXT_WEIGHT_TAGS  # noqa: E402
 from knee_mri.encoders import (  # noqa: E402
     COATNET_HF_FILE,
     COATNETS,
+    CONVNEXT_HF_FILE,
     CoAtNetEncoder,
+    ConvNeXtEncoder,
     DINOV2_HF_FILE,
     DINOV2_HF_HUB_ID,
     RADIMAGENET_RESNET50_SHA256,
@@ -161,6 +165,31 @@ def test_coatnet_real_weights_at_320(backbone, n_tables):
         feature_map = encoder(torch.rand((2, 3, 320, 320)) * 2 - 1)  # inception range [-1, 1]
     assert feature_map.shape == (2, 768, 10, 10) and torch.isfinite(feature_map).all()
     assert encoder.weights_info["hf_hub_id"] == f"timm/{name}.{tag}" and len(encoder.weights_info["sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    "backbone,tag", [(backbone, tag) for backbone, tags in CONVNEXT_WEIGHT_TAGS.items() for tag in tags]
+)
+def test_convnext_real_weights_at_320(backbone, tag):
+    """Every tensor of the file is in the model unchanged (only the linear classifier is left out),
+    and the 320 px map is the pretrained final LayerNorm of forward_features at each position."""
+    path = _coatnet_file(f"timm/{backbone}.{tag}")  # same Hugging Face file layout as CoAtNet
+    assert path.name == CONVNEXT_HF_FILE
+    from safetensors.torch import load_file
+
+    reference = load_file(str(path))
+    encoder = ConvNeXtEncoder(backbone, tag).eval()
+    state = encoder.model.state_dict()
+    assert set(reference) - set(state) <= {"head.fc.weight", "head.fc.bias"} and set(state) <= set(reference)
+    for key, value in state.items():
+        assert torch.equal(value, reference[key]), f"{key} differs from the file"
+    x = (torch.rand((2, 3, 320, 320)) - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)) / torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    with torch.no_grad():
+        feature_map = encoder(x)
+        expected = encoder.model.head.norm(encoder.model.forward_features(x))
+    assert feature_map.shape == (2, encoder.out_channels, 10, 10) and torch.isfinite(feature_map).all()
+    assert torch.equal(feature_map, expected)
+    assert encoder.weights_info["hf_hub_id"] == f"timm/{backbone}.{tag}" and len(encoder.weights_info["sha256"]) == 64
 
 
 def test_existing_run_checkpoints_rebuild_offline():

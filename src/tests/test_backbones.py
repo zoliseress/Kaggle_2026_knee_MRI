@@ -1,4 +1,4 @@
-"""Encoder adapters (DINOv2 ViT-S/14, RadImageNet ResNet-50, EfficientNet) with RANDOM weights.
+"""Encoder adapters (DINOv2 ViT-S/14, RadImageNet ResNet-50, CoAtNet, ConvNeXt, EfficientNet) with RANDOM weights.
 
     cd src && python -m pytest tests/test_backbones.py -q
 
@@ -62,6 +62,10 @@ def test_coatnet_input_size(cfg):
     selftest.check_coatnet_input_size(cfg)
 
 
+def test_convnext_adapter(cfg):
+    selftest.check_convnext_adapter(cfg)
+
+
 def test_freeze_policies(cfg):
     selftest.check_freeze_policies(cfg)
 
@@ -113,18 +117,27 @@ def test_image_size_rule_is_per_backbone():
     for size in (232, 336):  # multiples of 8, not of 32
         with pytest.raises(ValueError, match="multiple of 32"):
             load_config(SRC / "config.yaml", COATNET_OVERRIDES + [f"data.image_size={size}"])
+    # ConvNeXt: any size of the CNN rule (multiples of 8), not only multiples of 32.
+    for size in (232, 320, 336):
+        load_config(SRC / "config.yaml", CONVNEXT_OVERRIDES + [f"data.image_size={size}"])
 
 
-# CoAtNet has no example config: it runs from the machine's own config with these overrides.
+# CoAtNet and ConvNeXt have no example config: they run from the machine's own config with these overrides.
 COATNET_OVERRIDES = ["model.backbone=coatnet_0_rw", "model.weights=sw_in1k", "data.encoder_normalization=inception"]
+CONVNEXT_OVERRIDES = [
+    "model.backbone=convnext_tiny", "model.weights=in12k_ft_in1k", "data.encoder_normalization=imagenet",
+    "model.drop_path_rate=0.1",
+]
 
 
-@pytest.mark.parametrize("config_name", ["config.dinov2_vits14.yaml", "config.radimagenet_resnet50.yaml", "coatnet"])
+@pytest.mark.parametrize("config_name", ["config.dinov2_vits14.yaml", "config.radimagenet_resnet50.yaml", "coatnet", "convnext"])
 def test_older_checks_run_under_new_backbone_configs(config_name, tmp_path):
     """The selftest sizes follow the configured backbone (DINOv2 refuses 32/64 px); the checks
     about EfficientNet itself get an explicit EfficientNet config."""
     if config_name == "coatnet":
         loaded = load_config(SRC / "config.yaml", COATNET_OVERRIDES + ["data.image_size=320"])
+    elif config_name == "convnext":
+        loaded = load_config(SRC / "config.yaml", CONVNEXT_OVERRIDES + ["data.image_size=320"])
     else:
         loaded = load_config(SRC / config_name)
     small = selftest.tiny_config(loaded)

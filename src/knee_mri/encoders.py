@@ -11,6 +11,9 @@ attend over. Every backbone is wrapped so that it delivers exactly that and noth
     coatnet_0_rw          timm coatnet_0_rw_224.sw_in1k          [N,  768,  7,  7]   768
     coatnet_rmlp_1_rw2    timm coatnet_rmlp_1_rw2_224            [N,  768,  7,  7]   768
                           .sw_in12k_ft_in1k
+    convnext_nano         timm convnext_nano.<tag>               [N,  640,  7,  7]   640
+    convnext_tiny         timm convnext_tiny.<tag>               [N,  768,  7,  7]   768
+    convnextv2_tiny       timm convnextv2_tiny.<tag>             [N,  768,  7,  7]   768
 
 The head is sized from `out_channels`; nothing is projected to a common width.
 
@@ -39,7 +42,14 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
-from .constants import COATNET_STRIDE, DEFAULT_BACKBONE, DINOV2_PATCH_SIZE, ENCODER_FEATURES, ENCODER_UNITS
+from .constants import (
+    COATNET_STRIDE,
+    CONVNEXT_WEIGHT_TAGS,
+    DEFAULT_BACKBONE,
+    DINOV2_PATCH_SIZE,
+    ENCODER_FEATURES,
+    ENCODER_UNITS,
+)
 from .utils import LOG
 
 # Bump when an adapter's output semantics change (token handling, which layer is returned,
@@ -51,6 +61,9 @@ ADAPTER_VERSIONS = {
     "dinov2_vits14": "dinov2_patch_tokens_v1",
     "coatnet_0_rw": "coatnet_features_v1",
     "coatnet_rmlp_1_rw2": "coatnet_features_v1",
+    "convnext_nano": "convnext_features_headnorm_v1",
+    "convnext_tiny": "convnext_features_headnorm_v1",
+    "convnextv2_tiny": "convnext_features_headnorm_v1",
 }
 FREEZE_MODES = ("all", "frozen", "last_n")
 RANDOM_WEIGHTS = ("none", "random", "null")
@@ -774,6 +787,177 @@ class CoAtNetEncoder(EncoderMixin, nn.Module):
 
 
 # --------------------------------------------------------------------------------------
+# ConvNeXt / ConvNeXt V2 (timm): patchify stem, 4 stages of 7x7 depthwise-conv blocks, LayerNorm
+# --------------------------------------------------------------------------------------
+
+
+CONVNEXT_HF_FILE = "model.safetensors"
+
+
+def convnext_map_size(image_size: int) -> tuple[int, int]:
+    """Map of a square input: the 4x4 stride-4 stem and three 2x2 stride-2 downsamplings,
+    each without padding, so every step rounds down (320 -> 10, 300 -> 9)."""
+    side = int(image_size) // 4
+    for _ in range(3):
+        side //= 2
+    if side < 1:
+        raise ValueError(f"data.image_size={image_size} is too small for ConvNeXt (at least 32 px)")
+    return side, side
+
+
+def convnext_model_id(backbone: str) -> str:
+    """The architecture id of a ConvNeXt adapter, independent of its pretrained weights."""
+    return f"timm/{backbone}"
+
+
+def canonical_encoder_model_id(backbone: str, model_id: Any) -> Any:
+    """A stored `encoder_model_id` as the architecture id the current adapter reports.
+
+    ConvNeXt checkpoints written before the id was made weight-independent carry the pretrained
+    tag (`timm/convnext_tiny.dinov3_lvd1689m`); that tag is weight provenance, not architecture,
+    so it maps to `timm/convnext_tiny`. Only the backbone's own known tags are stripped: any
+    other id is returned unchanged and still fails the architecture comparison.
+    """
+    if backbone in CONVNEXT_WEIGHT_TAGS and isinstance(model_id, str):
+        base = convnext_model_id(backbone)
+        if model_id in {f"{base}.{tag}" for tag in CONVNEXT_WEIGHT_TAGS[backbone]}:
+            return base
+    return model_id
+
+
+class ConvNeXtEncoder(EncoderMixin, nn.Module):
+    """timm ConvNeXt `forward_features` + the pretrained final LayerNorm2d -> `[N, C, H/32, W/32]`.
+
+    timm keeps the last norm in the classifier head (`head.norm`, applied there to the pooled
+    vector); the adapter applies it per map position instead, so the head gets a normalised map
+    like CoAtNet's (for the DINOv3 weights this is the norm their patch features were trained
+    with). `num_classes=0` drops only the linear classifier.
+
+    Not built for an input size: any size works. Units for `last_n` are the 4 stages; the final
+    norm trains with them; the stem only trains under `all`. No BatchNorm anywhere, so
+    `freeze_bn_running_stats` has nothing to act on. `drop_path_rate` is the timm stochastic
+    depth (linearly increasing over the blocks); it only acts in training.
+
+    `model_id` names the architecture only (`timm/convnext_tiny`), the same with or without
+    pretrained weights, so an inference rebuild (`weights=none`) matches the trained model; the
+    pretrained source is `weights_info["hf_hub_id"]` (`timm/convnext_tiny.dinov3_lvd1689m`).
+    """
+
+    def __init__(self, backbone: str, weights: str, drop_path_rate: float = 0.0) -> None:
+        nn.Module.__init__(self)
+        if backbone not in CONVNEXT_WEIGHT_TAGS:
+            raise ValueError(f"ConvNeXtEncoder builds {sorted(CONVNEXT_WEIGHT_TAGS)}, got {backbone!r}")
+        self._init_policy()
+        self.backbone = backbone
+        self.timm_tags = CONVNEXT_WEIGHT_TAGS[backbone]
+        self.model_id = convnext_model_id(backbone)
+
+        try:
+            import timm
+        except ImportError as exc:  # pragma: no cover - environment
+            raise ImportError(f"model.backbone={backbone} needs timm (pip install 'timm>=1.0')") from exc
+
+        spec = str(weights)
+        info: dict[str, Any] = {"timm": timm.__version__, "backbone": backbone, "weights_request": spec}
+        kwargs = {"num_classes": 0, "drop_path_rate": float(drop_path_rate)}
+        if _is_random(spec):
+            _random_warning(backbone, spec)
+            self.model = timm.create_model(backbone, pretrained=False, **kwargs)
+            info["weights_used"] = "random"
+        else:
+            # Hub and local files load the same way, independent of any tag's pretrained_cfg:
+            # the bare architecture, then a strict state_dict load from the file.
+            path, tag = self._pretrained_file(spec)
+            self.model = timm.create_model(backbone, pretrained=False, **kwargs)
+            self._load_file(path)
+            hub_id = f"timm/{backbone}.{tag}" if tag is not None else None
+            info.update({"weights_used": str(path), "sha256": sha256_file(path), "pretrained_tag": tag, "hf_hub_id": hub_id})
+            if hub_id is not None:
+                LOG.info("Loaded %s weights from %s", hub_id, path)
+            else:
+                LOG.info("Loaded %s weights from the local file %s (pretraining source unknown; sha256 recorded)", backbone, path)
+        self.weights_info = info
+
+        self.out_channels = int(self.model.num_features)
+        if self.out_channels != ENCODER_FEATURES[backbone]:
+            raise RuntimeError(f"{backbone} num_features {self.out_channels} != {ENCODER_FEATURES[backbone]}")
+        if not isinstance(self.model.norm_pre, nn.Identity):
+            raise RuntimeError(f"{backbone}: timm built a pre-head norm; the adapter expects the norm in head.norm")
+
+    def _pretrained_file(self, spec: str) -> tuple[Path, str | None]:
+        """(file, pretrained tag). A tag = its timm/HF hub file (cached after the first download).
+        Anything else is a local timm-format file: its pretraining is not known from the file, so
+        no tag is claimed - the path and sha256 in weights_info identify it."""
+        if spec in self.timm_tags:
+            hub_id = f"timm/{self.backbone}.{spec}"
+            try:
+                from huggingface_hub import hf_hub_download
+
+                return Path(hf_hub_download(hub_id, CONVNEXT_HF_FILE)), spec
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not obtain {hub_id}/{CONVNEXT_HF_FILE}: {exc}. Never train silently from "
+                    "random initialisation. Download it once with network access (it is then cached, "
+                    "HF_HUB_OFFLINE=1 works afterwards), point model.weights at a local copy of that file, "
+                    "or set model.weights=none deliberately."
+                ) from exc
+        path = resolve_weight_path(spec)
+        if path is None:
+            raise FileNotFoundError(
+                f"model.weights={spec!r}: use one of {list(self.timm_tags)} (timm/HF hub timm/{self.backbone}.<tag>), "
+                f"a local copy of its {CONVNEXT_HF_FILE}, or 'none'."
+            )
+        return path, None
+
+    def _load_file(self, path: Path) -> None:
+        """Strict load of a timm-format file: every model tensor must come from it, and the only
+        tensors it may have beyond the model are the linear classifier's (`head.fc.*`, absent
+        from the DINOv3 files). Anything else - another backbone, an original (non-timm) release,
+        a partial file - is refused instead of loading partially."""
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state = load_file(str(path))
+        else:
+            state = torch.load(str(path), map_location="cpu", weights_only=True)
+        state = {key: value for key, value in state.items() if not key.startswith("head.fc.")}
+        missing = sorted(set(self.model.state_dict()) - set(state))
+        unexpected = sorted(set(state) - set(self.model.state_dict()))
+        if missing or unexpected:
+            raise ValueError(
+                f"{path} is not a timm-format {self.backbone} file ({len(missing)} model tensors missing, e.g. "
+                f"{missing[:3]}; {len(unexpected)} unexpected, e.g. {unexpected[:3]}). Use the timm/HF hub "
+                f"{CONVNEXT_HF_FILE} of timm/{self.backbone}.<tag> or a copy of it."
+            )
+        try:
+            self.model.load_state_dict(state, strict=True)
+        except RuntimeError as exc:  # shape mismatch: same names, another width
+            raise ValueError(f"{path} does not fit {self.backbone}: {exc}") from exc
+
+    def units(self) -> list[nn.Module]:
+        return list(self.model.stages)
+
+    def last_n_trainable_modules(self, n: int) -> list[nn.Module]:
+        return list(self.model.stages)[-n:] + [self.model.head.norm]
+
+    def feature_map_size(self, image_size: int) -> tuple[int, int]:
+        return convnext_map_size(image_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        use_ckpt = self.grad_checkpointing and self.training and torch.is_grad_enabled()
+        if use_ckpt:
+            from timm.layers.config import use_reentrant_ckpt
+
+            if use_reentrant_ckpt():
+                raise RuntimeError(
+                    "timm is set to reentrant checkpointing (TIMM_REENTRANT_CKPT): with a partially frozen "
+                    "encoder the trainable stages would silently get no gradients. Unset it."
+                )
+        self.model.set_grad_checkpointing(use_ckpt)
+        return self.model.head.norm(self.model.forward_features(x))
+
+
+# --------------------------------------------------------------------------------------
 # Factory
 # --------------------------------------------------------------------------------------
 
@@ -785,8 +969,12 @@ def build_encoder_adapter(
     freeze: str = "all",
     trainable_units: int = 0,
     grad_checkpointing: bool = False,
+    drop_path_rate: float = 0.0,
 ) -> nn.Module:
-    """Build the adapter for `backbone` with its pretrained source and freeze policy applied."""
+    """Build the adapter for `backbone` with its pretrained source and freeze policy applied.
+    `drop_path_rate` (stochastic depth) is configurable for the ConvNeXts only."""
+    if float(drop_path_rate) and backbone not in CONVNEXT_WEIGHT_TAGS:
+        raise ValueError(f"drop_path_rate is a ConvNeXt option ({sorted(CONVNEXT_WEIGHT_TAGS)}), not one of {backbone}")
     if backbone in _EFFICIENTNETS:
         encoder: nn.Module = EfficientNetEncoder(backbone, weights)
     elif backbone == "radimagenet_resnet50":
@@ -799,6 +987,8 @@ def build_encoder_adapter(
         if image_size is None:
             raise ValueError(f"{backbone} needs the input size (data.image_size) at build time")
         encoder = CoAtNetEncoder(backbone, weights, int(image_size))
+    elif backbone in CONVNEXT_WEIGHT_TAGS:
+        encoder = ConvNeXtEncoder(backbone, weights, float(drop_path_rate))
     else:
         raise ValueError(f"Unknown model.backbone={backbone!r}; known: {sorted(ENCODER_FEATURES)}")
     if len(encoder.units()) != ENCODER_UNITS[backbone]:

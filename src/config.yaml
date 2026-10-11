@@ -106,11 +106,16 @@ augment:
 
 model:
   # efficientnet_b0 | efficientnet_v2_s | radimagenet_resnet50 | dinov2_vits14 | coatnet_0_rw | coatnet_rmlp_1_rw2
-  # (encoders.py; CoAtNet: weights sw_in1k / sw_in12k_ft_in1k, data.encoder_normalization=inception, size % 32 == 0).
+  # | convnext_nano | convnext_tiny | convnextv2_tiny
+  # (encoders.py; CoAtNet: weights sw_in1k / sw_in12k_ft_in1k, data.encoder_normalization=inception, size % 32 == 0;
+  #  ConvNeXt: weights convnext_tiny in12k_ft_in1k / fb_in22k_ft_in1k / dinov3_lvd1689m, convnext_nano in12k_ft_in1k,
+  #  convnextv2_tiny fcmae_ft_in22k_in1k, data.encoder_normalization=imagenet, any size).
   # b0 / v2_s give 1280 features at stride 32. Measured on the RTX 5080, 320 px, 72 triplets, bf16, one study:
   #   b0: 6.3 GB, 10.4 train study/s | v2_s: 11.1 GB, 5.6 study/s | v2_s + grad_checkpointing: 4.1 GB, 4.0 study/s
   #   full train step (E3 head, AdamW + EMA, src/tools/memory_probe.py): coatnet_0_rw 12.7 GB, 225 ms |
   #   + grad_checkpointing 4.3 GB, 285 ms | coatnet_rmlp_1_rw2 + grad_checkpointing 6.1 GB, 498 ms (without: OOM at 16 GB)
+  #   convnext_tiny 9.3 GB, 142 ms | + grad_checkpointing 3.2 GB, 177 ms | convnext_nano 6.0 GB, 98 ms |
+  #   convnextv2_tiny + grad_checkpointing 5.6 GB, 429 ms (without: OOM at 16 GB)
   # Switching the backbone is a new experiment: its pretrained weights, not another backbone's checkpoint.
   backbone: "efficientnet_b0"
   weights: "IMAGENET1K_V1"         # IMAGENET1K_V1 | none | /path/to/local.pth (of the chosen backbone)
@@ -121,6 +126,8 @@ model:
   # Recompute each encoder stage in backward instead of storing its activations: less
   # training memory for ~30% less throughput, identical results. Only if microbatch/size would OOM.
   grad_checkpointing: false
+  # Stochastic depth of the ConvNeXt blocks (timm drop_path_rate, e.g. 0.1); ConvNeXt only, 0 = off.
+  drop_path_rate: 0.0
   head_dropout: 0.2
   head_hidden: 256
   freeze_bn_running_stats: true

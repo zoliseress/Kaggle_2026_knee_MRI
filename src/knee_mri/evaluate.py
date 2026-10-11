@@ -13,6 +13,7 @@ import torch
 from .config import Config
 from .constants import CHECKPOINT_VERSION, DEFAULT_BACKBONE, FIXED_INPUT_BACKBONES, STUDY_ID, TARGETS
 from .dataset import StudyBagDataset, check_study_coverage, collate_studies, enforce_coverage_gate
+from .encoders import canonical_encoder_model_id
 from .labels import build_label_table, load_reference_table
 from .metrics import evaluate_predictions, soft_roc_auc
 from .model import build_model
@@ -112,7 +113,10 @@ def load_checkpoint_for_inference(
             )
         build_cfg.data.image_size = trained_size
     model = build_model(build_cfg, n_slots=len(stored_cfg.get_dotted("data.series_slots") or cfg.data.series_slots))
-    stored_description, built = payload.get("model_description") or {}, model.describe()
+    stored_description, built = dict(payload.get("model_description") or {}), model.describe()
+    if "encoder_model_id" in stored_description:
+        # Early ConvNeXt checkpoints stored the pretrained tag in the id (see canonical_encoder_model_id).
+        stored_description["encoder_model_id"] = canonical_encoder_model_id(backbone, stored_description["encoder_model_id"])
     differing = [k for k in ARCHITECTURE_KEYS if k in stored_description and stored_description[k] != built[k]]
     if differing:
         raise ValueError(

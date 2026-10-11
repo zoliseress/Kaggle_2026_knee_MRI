@@ -261,16 +261,28 @@ class Trainer:
         self.model = model.to(self.device_spec.device)
         self.train_model: torch.nn.Module = self.model
         if self.world_size > 1:
+            import inspect
+            import warnings
+
             from torch.nn.parallel import DistributedDataParallel
 
             # Built before the EMA copy: DDP broadcasts rank 0's weights, so every rank (and
             # every rank's EMA) starts from the same model. No buffer broadcast per forward:
             # train-mode BatchNorm normalises with the micro-batch's own statistics, as on one
             # GPU; the running statistics (if not frozen) are averaged at the epoch's end.
+            # Newer torch renames `broadcast_buffers` to `forward_sync_buffers` (the init sync
+            # it still does is what we want anyway); older torch only knows the old name.
+            ddp_params = inspect.signature(DistributedDataParallel.__init__).parameters
+            no_buffer_sync = (
+                {"forward_sync_buffers": False} if "forward_sync_buffers" in ddp_params else {"broadcast_buffers": False}
+            )
+            # Depthwise conv weights ([C, 1, k, k]) get cuDNN grads whose size-1 dim carries a
+            # different stride than the bucket view: same memory layout, so the warning is noise.
+            warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
             self.train_model = DistributedDataParallel(
                 self.model,
                 device_ids=[dist_utils.local_rank()] if self.device_spec.device.type == "cuda" else None,
-                broadcast_buffers=False,
+                **no_buffer_sync,
             )
             LOG.info("DistributedDataParallel: %d processes, this is rank %d", self.world_size, self.rank)
         # Weight EMA (train.ema_decay > 0): validated, selected and saved as "model"; the raw
@@ -413,6 +425,9 @@ class Trainer:
             signature["model"].pop("encoder_trainable", None)
         if signature["model"].get("encoder_trainable") != "last_n":
             signature["model"].pop("encoder_trainable_units", None)
+        # ConvNeXt stochastic depth: only when on, likewise.
+        if not signature["model"].get("drop_path_rate"):
+            signature["model"].pop("drop_path_rate", None)
         # The adapters added after the EfficientNets carry their version (token handling etc.).
         if not backbone.startswith("efficientnet"):
             signature["encoder_adapter_version"] = ADAPTER_VERSIONS[backbone]

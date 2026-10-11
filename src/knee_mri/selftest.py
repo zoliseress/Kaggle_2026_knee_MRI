@@ -62,16 +62,19 @@ from .utils import LOG, remove_file_logging
 
 # Smallest input each backbone accepts in the synthetic checks: EfficientNet 32 px (a 1x1 map),
 # ResNet-50 64 px (2x2), DINOv2 56 px (4x4 patches; a multiple of 14 - 32 and 64 are refused),
-# CoAtNet 64 px (2x2; a multiple of 32, and its attention stages want more than one token).
+# CoAtNet 64 px (2x2; a multiple of 32, and its attention stages want more than one token),
+# ConvNeXt 32 px (1x1).
 TINY_SIZES = {
     "efficientnet_b0": 32, "efficientnet_v2_s": 32, "radimagenet_resnet50": 64, "dinov2_vits14": 56,
     "coatnet_0_rw": 64, "coatnet_rmlp_1_rw2": 64,
+    "convnext_nano": 32, "convnext_tiny": 32, "convnextv2_tiny": 32,
 }
 # Smallest input whose map is at least 2 wide, for checks that need two distinct column halves
-# or a non-trivial spatial softmax: EfficientNet / ResNet / CoAtNet 64 px (2x2), DINOv2 56 px (4x4).
+# or a non-trivial spatial softmax: EfficientNet / ResNet / CoAtNet / ConvNeXt 64 px (2x2), DINOv2 56 px (4x4).
 WIDE_SIZES = {
     "efficientnet_b0": 64, "efficientnet_v2_s": 64, "radimagenet_resnet50": 64, "dinov2_vits14": 56,
     "coatnet_0_rw": 64, "coatnet_rmlp_1_rw2": 64,
+    "convnext_nano": 64, "convnext_tiny": 64, "convnextv2_tiny": 64,
 }
 
 
@@ -103,12 +106,14 @@ def efficientnet_config(cfg: Config, backbone: str = "efficientnet_b0") -> Confi
     """`cfg` switched to an EfficientNet, for the checks about EfficientNet behaviour itself.
 
     Everything else (data, train, labels) stays as configured; the RadImageNet-only and the
-    CoAtNet (inception) input profiles fall back to the project default.
+    CoAtNet (inception) input profiles fall back to the project default, ConvNeXt stochastic
+    depth is switched off.
     """
     chosen = cfg.copy()
     chosen.model.backbone = backbone
     chosen.model.weights = "none"
     chosen.model.encoder_trainable = "all"
+    chosen.model.drop_path_rate = 0.0  # a ConvNeXt-only option
     chosen.data.image_size = TINY_SIZES[backbone]
     if chosen.data.encoder_normalization in ("radimagenet_torch", "inception"):
         chosen.data.encoder_normalization = "mri_scalar"
@@ -3377,8 +3382,14 @@ EXPECTED_MAPS_224 = {
     "dinov2_vits14": (384, 16, 16),
     "coatnet_0_rw": (768, 7, 7),
     "coatnet_rmlp_1_rw2": (768, 7, 7),
+    "convnext_nano": (640, 7, 7),
+    "convnext_tiny": (768, 7, 7),
+    "convnextv2_tiny": (768, 7, 7),
 }
-NEW_BACKBONES = ("radimagenet_resnet50", "dinov2_vits14", "coatnet_0_rw", "coatnet_rmlp_1_rw2")
+NEW_BACKBONES = (
+    "radimagenet_resnet50", "dinov2_vits14", "coatnet_0_rw", "coatnet_rmlp_1_rw2",
+    "convnext_nano", "convnext_tiny", "convnextv2_tiny",
+)
 
 
 def _backbone_cfg(cfg: Config, backbone: str, **model_keys) -> Config:
@@ -3389,6 +3400,7 @@ def _backbone_cfg(cfg: Config, backbone: str, **model_keys) -> Config:
     chosen.model.backbone = backbone
     chosen.model.weights = "none"
     chosen.model.head_dropout = 0.0
+    chosen.model.drop_path_rate = 0.0  # a ConvNeXt-only option; a check that wants it passes it
     chosen.data.image_size = WIDE_SIZES[backbone]  # 2-column maps, so the half split is real
     chosen.data.encoder_normalization = RECOMMENDED_NORMALIZATION.get(backbone, cfg.data.encoder_normalization)
     for key, value in model_keys.items():
@@ -3451,9 +3463,13 @@ def check_encoder_feature_maps(cfg: Config) -> str:
     with torch.no_grad():
         wide = coat320(torch.randn((1, 3, 320, 320)))
     assert tuple(wide.shape) == (1, 768, 10, 10), tuple(wide.shape)
+    convnext320 = build_encoder_adapter("convnext_tiny", "none").eval()
+    with torch.no_grad():
+        convnext_map = convnext320(torch.randn((1, 3, 320, 320)))
+    assert tuple(convnext_map.shape) == (1, 768, 10, 10), tuple(convnext_map.shape)
     return (
-        f"maps at 224 px: {shapes}; dinov2 at 336 px: {tuple(big.shape[1:])}; coatnet at 320 px: "
-        f"{tuple(wide.shape[1:])}; finite [B, 12] logits"
+        f"maps at 224 px: {shapes}; dinov2 at 336 px: {tuple(big.shape[1:])}; coatnet and convnext at 320 px: "
+        f"{tuple(wide.shape[1:])}, {tuple(convnext_map.shape[1:])}; finite [B, 12] logits"
     )
 
 
@@ -3636,6 +3652,133 @@ def check_coatnet_input_size(cfg: Config) -> str:
     return f"64 px -> 2x2, 224 -> 7x7, 320 -> 10x10; sizes {refused} refused; other input sizes refused at runtime"
 
 
+def check_convnext_adapter(cfg: Config) -> str:
+    """ConvNeXt: any input size (floor-rounded stride 32), the pretrained final LayerNorm on every
+    map position, no BatchNorm, pretrained tags per architecture, and drop_path_rate as a
+    ConvNeXt-only, training-only option."""
+    import tempfile
+
+    from .constants import CONVNEXT_WEIGHT_TAGS
+    from .encoders import build_encoder_adapter, canonical_encoder_model_id, convnext_map_size
+
+    sizes = {size: convnext_map_size(size) for size in (32, 224, 300, 320)}
+    assert sizes == {32: (1, 1), 224: (7, 7), 300: (9, 9), 320: (10, 10)}, sizes
+    try:
+        convnext_map_size(16)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("convnext_map_size accepted 16 px")
+
+    for backbone in CONVNEXT_WEIGHT_TAGS:
+        torch.manual_seed(0)
+        encoder = build_encoder_adapter(backbone, "none").eval()
+        assert not any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in encoder.modules()), backbone
+        for size in (64, 96):  # one encoder, several input sizes
+            x = torch.randn((2, 3, size, size), generator=torch.Generator().manual_seed(size))
+            with torch.no_grad():
+                feature_map = encoder(x)
+                raw = encoder.model.forward_features(x)
+            assert tuple(feature_map.shape[2:]) == encoder.feature_map_size(size), f"{backbone} at {size} px"
+            assert torch.equal(feature_map, encoder.model.head.norm(raw)), f"{backbone}: final norm not applied"
+            # Freshly initialised LayerNorm (weight 1, bias 0): every position is normalised over channels.
+            assert float(feature_map.mean(dim=1).abs().max()) < 1e-4, f"{backbone}: map is not channel-normalised"
+
+    refused = []
+    for backbone, weights in (("convnext_nano", "dinov3_lvd1689m"), ("convnext_tiny", "sw_in1k"), ("convnextv2_tiny", "in12k_ft_in1k")):
+        wrong = cfg.copy()
+        wrong.model.backbone, wrong.model.weights, wrong.data.image_size = backbone, weights, 64
+        wrong.data.encoder_normalization = "imagenet"
+        try:
+            validate_config(wrong)
+        except ValueError as error:
+            assert "not a pretrained source" in str(error), error
+            refused.append(f"{backbone}/{weights}")
+        else:
+            raise AssertionError(f"{backbone} accepted the pretrained tag {weights}")
+
+    for backbone, rate in (("efficientnet_b0", 0.1), ("coatnet_0_rw", 0.1), ("convnext_tiny", 1.0), ("convnext_tiny", -0.1)):
+        bad = cfg.copy()
+        bad.model.backbone, bad.model.weights, bad.model.drop_path_rate = backbone, "none", rate
+        bad.data.image_size = 64
+        bad.data.encoder_normalization = "inception" if backbone.startswith("coatnet_") else "imagenet"
+        try:
+            validate_config(bad)
+        except ValueError as error:
+            assert "drop_path_rate" in str(error), error
+        else:
+            raise AssertionError(f"validate_config accepted model.drop_path_rate={rate} for {backbone}")
+    try:
+        build_encoder_adapter("efficientnet_b0", "none", drop_path_rate=0.1)
+    except ValueError as error:
+        assert "ConvNeXt option" in str(error), error
+    else:
+        raise AssertionError("build_encoder_adapter passed drop_path_rate to an EfficientNet")
+
+    torch.manual_seed(0)
+    plain = build_encoder_adapter("convnext_tiny", "none")
+    torch.manual_seed(0)
+    dropping = build_encoder_adapter("convnext_tiny", "none", drop_path_rate=0.3)
+    assert torch.equal(plain.model.stem[0].weight, dropping.model.stem[0].weight), "drop path changed the initialisation"
+    x = torch.randn((2, 3, 64, 64), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        assert torch.equal(plain.eval()(x), dropping.eval()(x)), "drop path acts in eval mode"
+        dropping.train()
+        torch.manual_seed(2)
+        first = dropping(x)
+        torch.manual_seed(3)
+        second = dropping(x)
+    assert not torch.equal(first, second), "drop_path_rate=0.3 drops nothing in training"
+
+    # The encoder id names the architecture only: a pretrained build and the weights=none rebuild
+    # of inference must agree; the source stays in weights_info. A local file claims no tag; a hub
+    # tag (download mocked with a local file) records exactly that tag. Wrong files are refused.
+    from unittest import mock
+
+    import huggingface_hub
+    from safetensors.torch import load_file, save_file
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_convnext_") as tmp:
+        nano_file = _fake_convnext_weights("convnext_nano", tmp)
+        tiny_file = _fake_convnext_weights("convnext_tiny", tmp)
+        pretrained = build_encoder_adapter("convnext_nano", str(nano_file))
+        assert torch.equal(pretrained.model.stem[0].weight, load_file(str(nano_file))["stem.0.weight"])
+        local = pretrained.weights_info
+        assert local["hf_hub_id"] is None and local["pretrained_tag"] is None and local["weights_used"] == str(nano_file), local
+        with mock.patch.object(huggingface_hub, "hf_hub_download", lambda *_a, **_k: str(tiny_file)):
+            hub = build_encoder_adapter("convnext_tiny", "dinov3_lvd1689m").weights_info
+        assert hub["hf_hub_id"] == "timm/convnext_tiny.dinov3_lvd1689m" and hub["pretrained_tag"] == "dinov3_lvd1689m", hub
+
+        state = {k: v.clone() for k, v in load_file(str(tiny_file)).items()}  # no memory map left open (Windows)
+        partial = Path(tmp) / "partial.safetensors"
+        save_file({k: v for k, v in state.items() if k != "head.norm.weight"}, str(partial))
+        extra = Path(tmp) / "extra.safetensors"
+        save_file({**state, "head.extra.weight": torch.zeros(1)}, str(extra))
+        del state
+        for backbone, path in (("convnext_tiny", nano_file), ("convnext_tiny", partial), ("convnext_tiny", extra), ("convnext_nano", tiny_file)):
+            try:
+                build_encoder_adapter(backbone, str(path))
+            except ValueError as error:
+                assert "not a timm-format" in str(error) or "does not fit" in str(error), error
+            else:
+                raise AssertionError(f"{backbone} loaded the wrong file {path.name}")
+    bare = build_encoder_adapter("convnext_nano", "none")
+    assert pretrained.describe()["encoder_model_id"] == bare.describe()["encoder_model_id"] == "timm/convnext_nano"
+    for backbone, stored, expected in (
+        ("convnext_tiny", "timm/convnext_tiny.dinov3_lvd1689m", "timm/convnext_tiny"),  # early checkpoints
+        ("convnext_tiny", "timm/convnext_tiny", "timm/convnext_tiny"),
+        ("convnext_tiny", "timm/convnext_tiny.sw_in1k", "timm/convnext_tiny.sw_in1k"),  # not its tag: kept, refused later
+        ("convnext_tiny", "timm/convnext_nano.in12k_ft_in1k", "timm/convnext_nano.in12k_ft_in1k"),
+        ("coatnet_0_rw", "timm/coatnet_0_rw_224.sw_in1k", "timm/coatnet_0_rw_224.sw_in1k"),
+    ):
+        assert canonical_encoder_model_id(backbone, stored) == expected, (backbone, stored)
+    return (
+        f"maps {sizes}; any input size, final LayerNorm per position, no BatchNorm; tags {refused} refused; "
+        "drop_path_rate ConvNeXt-only, in [0, 1), inactive in eval; encoder id independent of the weights; "
+        "local files claim no pretrained tag, wrong files refused"
+    )
+
+
 def _gradient_split(model) -> tuple[list[str], list[str], list[str]]:
     """(trainable with a non-zero gradient, trainable without one, frozen with a gradient)."""
     moving, silent, leaking = [], [], []
@@ -3664,6 +3807,9 @@ def check_freeze_policies(cfg: Config) -> str:
         ("coatnet_0_rw", "last_n", 1, lambda n: n.startswith(("model.stages.3.", "model.norm."))),
         ("coatnet_0_rw", "last_n", 3, lambda n: n.startswith(("model.stages.1.", "model.stages.2.", "model.stages.3.", "model.norm."))),
         ("coatnet_rmlp_1_rw2", "frozen", 0, lambda n: False),
+        ("convnext_tiny", "last_n", 1, lambda n: n.startswith(("model.stages.3.", "model.head.norm."))),
+        ("convnext_nano", "last_n", 2, lambda n: n.startswith(("model.stages.2.", "model.stages.3.", "model.head.norm."))),
+        ("convnextv2_tiny", "frozen", 0, lambda n: False),
     ]
     summary = []
     for backbone, mode, units, expected in cases:
@@ -3708,6 +3854,8 @@ def check_parameter_groups_complete(cfg: Config) -> str:
         ("radimagenet_resnet50", "last_n", 1, {"side_pooling": True}),
         ("coatnet_0_rw", "last_n", 2, {"side_pooling": True, "target_attention": True}),
         ("coatnet_rmlp_1_rw2", "all", 0, {}),
+        ("convnext_tiny", "last_n", 2, {"side_pooling": True, "target_attention": True}),
+        ("convnextv2_tiny", "all", 0, {"drop_path_rate": 0.1}),
     ]
     out = []
     for backbone, mode, units, extra in cases:
@@ -3836,11 +3984,18 @@ def check_backbone_resume_signature(cfg: Config) -> str:
         return Trainer._resume_signature(trainer, dataset)
 
     legacy = efficientnet_config(cfg)
-    for key in ("encoder_trainable", "encoder_trainable_units"):
+    for key in ("encoder_trainable", "encoder_trainable_units", "drop_path_rate"):
         legacy.model.pop(key, None)  # a B0 config from before the keys existed
     current = efficientnet_config(cfg)
     current.model.encoder_trainable, current.model.encoder_trainable_units = "all", 4
     assert signature(legacy) == signature(current), "the default freeze policy changed the B0 resume signature"
+
+    convnext = _backbone_cfg(cfg, "convnext_tiny")
+    no_key = convnext.copy()
+    no_key.model.pop("drop_path_rate", None)
+    dropping = _backbone_cfg(cfg, "convnext_tiny", drop_path_rate=0.1)
+    assert signature(no_key) == signature(convnext), "drop_path_rate=0 changed the resume signature"
+    assert signature(dropping) != signature(convnext), "model.drop_path_rate was not detected by the resume check"
 
     dino = _backbone_cfg(cfg, "dinov2_vits14", encoder_trainable="last_n", encoder_trainable_units=4)
     base = signature(dino)
@@ -3860,7 +4015,10 @@ def check_backbone_resume_signature(cfg: Config) -> str:
         assert "new experiment" in str(error), error
     else:
         raise AssertionError("init_weights from an EfficientNet checkpoint into ResNet-50 was accepted")
-    return "freeze policy and adapter changes are refused on resume; old B0 signature unchanged; cross-backbone init refused"
+    return (
+        "freeze policy, adapter and drop path changes are refused on resume; old B0 signature unchanged; "
+        "cross-backbone init refused"
+    )
 
 
 def check_new_backbone_grad_checkpointing(cfg: Config) -> str:
@@ -3869,10 +4027,17 @@ def check_new_backbone_grad_checkpointing(cfg: Config) -> str:
     from .model import build_model
 
     worst = {}
-    for backbone, units in (("dinov2_vits14", 2), ("radimagenet_resnet50", 2), ("coatnet_0_rw", 2), ("coatnet_rmlp_1_rw2", 2)):
+    # ConvNeXt with stochastic depth on: the recomputation must replay the same drop masks.
+    cases = (
+        ("dinov2_vits14", 2, {}), ("radimagenet_resnet50", 2, {}), ("coatnet_0_rw", 2, {}), ("coatnet_rmlp_1_rw2", 2, {}),
+        ("convnext_tiny", 2, {"drop_path_rate": 0.3}), ("convnextv2_tiny", 2, {}),
+    )
+    for backbone, units, extra in cases:
         results = []
         for enabled in (False, True):
-            chosen = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=units, grad_checkpointing=enabled)
+            chosen = _backbone_cfg(
+                cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=units, grad_checkpointing=enabled, **extra
+            )
             torch.manual_seed(0)
             model = build_model(chosen).train()
             batch = _random_batch(chosen, b=1, seed=7)
@@ -3956,14 +4121,31 @@ def check_radimagenet_loader(cfg: Config, tmp_dir) -> str:
     return f"official Backbone format loads all 318 tensors (159 BN buffers); {len(broken)} broken variants and a missing file refused"
 
 
+def _fake_convnext_weights(backbone: str, directory) -> Path:
+    """A timm-format pretrained file of `backbone` with random values (and the 1000-class classifier
+    the real ImageNet files have), so the pretrained code path runs without the real download."""
+    import timm
+    from safetensors.torch import save_file
+
+    torch.manual_seed(11)
+    source = timm.create_model(backbone, pretrained=False, num_classes=1000)
+    path = Path(directory) / f"{backbone}_fake_pretrained.safetensors"
+    save_file({key: value.contiguous() for key, value in source.state_dict().items()}, str(path))
+    return path
+
+
 def check_new_backbone_training_roundtrip(cfg: Config) -> str:
-    """Synthetic train epoch -> best.pt -> offline rebuild (no network, no pretrained file) -> same predictions."""
+    """Synthetic train epoch -> best.pt -> offline rebuild (no network, no pretrained file) -> same predictions.
+
+    ConvNeXt trains from a (fake) pretrained file, so the reload compares a pretrained-built
+    description with a `weights=none` rebuild; a checkpoint with the early tagged encoder id
+    (`timm/convnext_tiny.<tag>`) still loads, another architecture id is still refused."""
     import socket
     import tempfile
     from pathlib import Path
     from unittest import mock
 
-    from .constants import FIXED_INPUT_BACKBONES
+    from .constants import CONVNEXT_WEIGHT_TAGS, FIXED_INPUT_BACKBONES
     from .evaluate import load_checkpoint_for_inference
     from .train import build_synthetic_trainer
 
@@ -3975,12 +4157,15 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
         ("dinov2_vits14", "lvd142m"),
         ("radimagenet_resnet50", "Z:/nowhere/RadImageNet/ResNet50.pt"),
         ("coatnet_0_rw", "sw_in1k"),
+        ("convnext_tiny", "dinov3_lvd1689m"),
     ):
         run_cfg = _backbone_cfg(cfg, backbone, encoder_trainable="last_n", encoder_trainable_units=1, side_pooling=True)
         run_cfg.train.num_workers = run_cfg.train.eval_num_workers = 0
         run_cfg.train.microbatch_studies, run_cfg.train.accumulation_steps = 1, 2
         with tempfile.TemporaryDirectory(prefix=f"knee_mri_{backbone}_") as tmp:
             run_cfg.paths.output_dir = tmp
+            if backbone in CONVNEXT_WEIGHT_TAGS:
+                run_cfg.model.weights = str(_fake_convnext_weights(backbone, tmp))
             try:
                 trainer = build_synthetic_trainer(run_cfg, n_studies=4, epochs=1, name="run")
                 trainer.fit()
@@ -3990,6 +4175,12 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
                 assert record["backbone"] == backbone and record["normalization"]["profile"] == run_cfg.data.encoder_normalization
                 assert record["trainable"] == "last_n" and record["trainable_units"] == 1 and record["adapter_version"]
                 assert payload["model_description"]["encoder_model_id"] == record["model_id"]
+                if backbone in CONVNEXT_WEIGHT_TAGS:
+                    # A local file: its pretraining is unknown, so no hub id / tag is claimed.
+                    source = record["weights_source"]
+                    assert record["model_id"] == f"timm/{backbone}", record["model_id"]
+                    assert source["hf_hub_id"] is None and source["pretrained_tag"] is None, source
+                    assert source["weights_used"] == run_cfg.model.weights and len(source["sha256"]) == 64, source
 
                 # Pretend the run started from pretrained weights that this machine does not have.
                 payload["config"]["model"]["weights"] = pretrained
@@ -4016,6 +4207,21 @@ def check_new_backbone_training_roundtrip(cfg: Config) -> str:
                     expected = trained(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
                     actual = loaded.cpu()(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
                 assert torch.equal(expected, actual), f"{backbone}: offline reload predictions differ"
+
+                if backbone in CONVNEXT_WEIGHT_TAGS:
+                    for stored_id, accepted in ((f"timm/{backbone}.{pretrained}", True), ("timm/convnext_nano", False)):
+                        variant = dict(payload, model_description=dict(payload["model_description"], encoder_model_id=stored_id))
+                        variant_path = Path(tmp) / "run" / "variant.pt"
+                        torch.save(variant, variant_path)
+                        try:
+                            reloaded, _ = load_checkpoint_for_inference(Config(variant["config"]), variant_path)
+                        except ValueError as error:
+                            assert not accepted and "differs in ['encoder_model_id']" in str(error), error
+                        else:
+                            assert accepted, f"encoder_model_id {stored_id!r} was accepted for {backbone}"
+                            with torch.no_grad():
+                                again = reloaded.cpu()(batch["images"], batch["slice_valid_mask"], batch["series_present_mask"])
+                            assert torch.equal(expected, again), f"{backbone}: tagged-id checkpoint predicts differently"
 
                 if backbone in FIXED_INPUT_BACKBONES:
                     other = Config(payload["config"])
@@ -4142,6 +4348,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("new_backbone_pooling_options", lambda: check_new_backbone_pooling_options(small)),
                 ("dino_patch_grid", lambda: check_dino_patch_grid(small)),
                 ("coatnet_input_size", lambda: check_coatnet_input_size(small)),
+                ("convnext_adapter", lambda: check_convnext_adapter(small)),
                 ("freeze_policies", lambda: check_freeze_policies(small)),
                 ("parameter_groups_complete", lambda: check_parameter_groups_complete(small)),
                 ("normalization_profiles", lambda: check_normalization_profiles(small)),

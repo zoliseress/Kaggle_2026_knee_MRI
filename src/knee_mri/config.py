@@ -18,6 +18,7 @@ import yaml
 
 from .constants import (
     COATNET_STRIDE,
+    CONVNEXT_WEIGHT_TAGS,
     DEFAULT_BACKBONE,
     DINOV2_PATCH_SIZE,
     ENCODER_FEATURES,
@@ -42,6 +43,7 @@ BACKBONE_WEIGHT_NAMES = {
     "dinov2_vits14": ("lvd142m",),
     "coatnet_0_rw": ("sw_in1k",),
     "coatnet_rmlp_1_rw2": ("sw_in12k_ft_in1k",),
+    **CONVNEXT_WEIGHT_TAGS,
 }
 _LOG = logging.getLogger("knee_mri")
 
@@ -304,6 +306,15 @@ def validate_encoder_config(cfg: Config) -> None:
             backbone,
             recommended,
             recommended,
+        )
+
+    drop_path = float(cfg.model.get("drop_path_rate", 0.0) or 0.0)
+    if not 0.0 <= drop_path < 1.0:
+        raise ValueError(f"model.drop_path_rate must be in [0, 1), got {drop_path}")
+    if drop_path and backbone not in CONVNEXT_WEIGHT_TAGS:
+        raise ValueError(
+            f"model.drop_path_rate={drop_path} is a ConvNeXt option ({sorted(CONVNEXT_WEIGHT_TAGS)}); "
+            f"{backbone} keeps its built-in stochastic depth. Set it to 0."
         )
 
     mode = str(cfg.model.get("encoder_trainable", "all"))
