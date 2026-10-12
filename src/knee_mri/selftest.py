@@ -2119,9 +2119,18 @@ def check_train_step_reduces_loss(cfg: Config) -> str:
 
 def check_laterality_rules() -> str:
     """Tag parsing, the geometry threshold, the flip table and the gap_ok reversal."""
-    from .laterality import apply_canonical, canonical_ops, image_center_x, side_from_center_x, side_from_tag
+    from .laterality import (
+        apply_canonical,
+        canonical_ops,
+        image_center_x,
+        side_from_center_x,
+        side_from_tag,
+        side_from_tag_votes,
+    )
 
     assert side_from_tag([None, "", "B", "RIGHT"]) == "R" and side_from_tag(["l"]) == "L" and side_from_tag(["B", float("nan")]) == ""
+    assert side_from_tag_votes(["L", "R", "RIGHT", None, ""]) == "R" and side_from_tag_votes(["l", "", "B"]) == "L"
+    assert side_from_tag_votes(["L", "R"]) == "" and side_from_tag_votes([None, float("nan")]) == "", "a tie or no tag gives no side"
     assert side_from_center_x(-80.0, 20.0) == "R" and side_from_center_x(35.0, 20.0) == "L"
     assert side_from_center_x(-12.0, 20.0) == "" and side_from_center_x(float("nan"), 20.0) == ""
     # identity orientation, 100 x 200 pixels of 0.5 mm: centre = IPP + (200*0.5/2, 100*0.5/2)
@@ -2151,38 +2160,45 @@ def check_laterality_rules() -> str:
     assert gaps.tolist() == [True, False, True][::-1], "gap_ok must follow the slice reversal"
     out, gaps = apply_canonical(image, gap_ok, reverse_slices=False, flip_columns=False)
     assert out is image and gaps is gap_ok, "no-op must not copy"
-    return "tag > geometry (|x| >= offset), right knees mirrored on coronal/axial, sagittal ordered to lateral, gaps follow"
+    return "geometry (|x| >= offset) > tag vote, right knees mirrored on coronal/axial, sagittal ordered to lateral, gaps follow"
 
 
 def check_laterality_derivation() -> str:
-    """Tag first, geometry second, unresolved near the midline; normal_x from the selected sagittal volume."""
+    """Geometry first, the tag vote of the selected series second, unresolved otherwise; normal_x from the selected sagittal volume."""
     from .laterality import derive_laterality
 
     manifest = pd.DataFrame(
         {
-            STUDY_ID: ["a", "a", "b", "c", "d", "d"],
-            "volume_id": ["a_sag", "a_cor", "b_sag", "c_cor", "d_sag", "d_other_sag"],
-            "laterality": ["L", "", "", "", "RIGHT", "RIGHT"],
-            "normal_x": [-1.0, 0.0, 1.0, 0.0, 1.0, -1.0],
+            STUDY_ID: ["a", "a", "b", "c", "d", "d", "e", "e", "e", "e", "f", "f", "f"],
+            "volume_id": ["a_sag", "a_cor", "b_sag", "c_cor", "d_sag", "d_other_sag",
+                          "e_sag", "e_cor", "e_ax", "e_other", "f_sag", "f_cor", "f_other"],
+            "laterality": ["L", "", "", "", "RIGHT", "RIGHT", "R", "L", "R", "L", "L", "R", "R"],
+            "normal_x": [-1.0, 0.0, 1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         }
     )
     selection = pd.DataFrame(
         {
-            STUDY_ID: ["a", "a", "b", "b", "c", "d", "d"],
-            "slot": ["sagittal", "coronal", "sagittal", "axial", "coronal", "sagittal", "coronal"],
-            "volume_id": ["a_sag", "a_cor", "b_sag", "b_ax", "c_cor", "d_sag", "d_cor"],
-            "selected": [True] * 7,
-            "path": ["-", "a_cor", "-", "b_ax", "c_cor", "-", "d_cor"],
+            STUDY_ID: ["a", "a", "b", "b", "c", "d", "d", "e", "e", "e", "f", "f"],
+            "slot": ["sagittal", "coronal", "sagittal", "axial", "coronal", "sagittal", "coronal",
+                     "sagittal", "coronal", "axial", "sagittal", "coronal"],
+            "volume_id": ["a_sag", "a_cor", "b_sag", "b_ax", "c_cor", "d_sag", "d_cor",
+                          "e_sag", "e_cor", "e_ax", "f_sag", "f_cor"],
+            "selected": [True] * 12,
+            "path": ["-", "a_cor", "-", "b_ax", "c_cor", "-", "d_cor", "-", "e_cor", "e_ax", "-", "f_cor"],
         }
     )
-    centre_x = {"a_cor": -90.0, "b_ax": -75.0, "c_cor": 5.0, "d_cor": 60.0}  # a: tag L beats geometry R
+    # a: geometry R beats the tag L; c: near the midline, no tag; e/f: near the midline, tag vote decides
+    centre_x = {"a_cor": -90.0, "b_ax": -75.0, "c_cor": 5.0, "d_cor": 60.0, "e_cor": 8.0, "e_ax": 12.0, "f_cor": -4.0}
     table = derive_laterality(manifest, selection, min_offset_mm=20.0, workers=1, center_x_reader=centre_x.get).set_index(STUDY_ID)
-    assert table.loc["a", "side"] == "L" and table.loc["a", "side_source"] == "tag" and table.loc["a", "geometry_side"] == "R"
+    assert table.loc["a", "side"] == "R" and table.loc["a", "side_source"] == "geometry" and table.loc["a", "tag_side"] == "L"
     assert table.loc["b", "side"] == "R" and table.loc["b", "side_source"] == "geometry"
     assert table.loc["c", "side"] == "" and table.loc["c", "side_source"] == "unresolved"
-    assert table.loc["d", "side"] == "R" and table.loc["d", "sagittal_normal_x"] == 1.0, "normal_x of the SELECTED sagittal volume"
+    assert table.loc["d", "side"] == "L" and table.loc["d", "side_source"] == "geometry" and table.loc["d", "tag_side"] == "R"
+    assert table.loc["d", "sagittal_normal_x"] == 1.0, "normal_x of the SELECTED sagittal volume"
+    assert table.loc["e", "side"] == "R" and table.loc["e", "side_source"] == "tag", "2 R : 1 L among the selected series"
+    assert table.loc["f", "side"] == "" and table.loc["f", "tag_side"] == "", "selected L : R is a tie; the unselected R must not vote"
     assert table.loc["a", "sagittal_normal_x"] == -1.0 and np.isnan(table.loc["c", "sagittal_normal_x"])
-    return "tag wins, geometry fills in, |x| < offset stays unresolved, sagittal normal from the selected volume"
+    return "geometry wins, the selected series' tag vote fills in (ties and unselected series ignored), sagittal normal from the selected volume"
 
 
 def check_override_keys() -> str:

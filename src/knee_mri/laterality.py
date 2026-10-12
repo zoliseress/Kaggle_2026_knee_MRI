@@ -7,12 +7,19 @@ from a left knee's, and the sagittal slice order runs medial->lateral for one si
 lateral->medial for the other. Pooling cannot undo that; a canonical frame can.
 
 Side of the knee, in this order:
-  1. the DICOM `Laterality` / `ImageLaterality` tag (R/L; ~50% of the training studies);
-  2. otherwise geometry: the median x of the coronal/axial image centres in LPS patient
+  1. geometry: the median x of the selected coronal/axial image centres in LPS patient
      coordinates. The knee lies off the midline, x < 0 is the patient's right. Within
-     `min_offset_mm` of the midline the side stays unresolved. On the tagged training
-     studies this rule agrees with the tag in 97.4%.
+     `min_offset_mm` of the midline geometry gives no side;
+  2. otherwise the DICOM `Laterality` / `ImageLaterality` tag, majority vote over the
+     SELECTED series only (a tie gives no side);
   3. unresolved studies are left as they are (no flip).
+Geometry comes first because the tag is typed in at the scanner and is wrong more often:
+on the 2134 training studies with both, they disagree in 31; a radiologist review of the 29
+single-knee ones (YC, `tests/fixtures/laterality_yc_review.csv`) sided with geometry in all
+29, even where the report named the tag's side. Some sites stamp the tag from the protocol
+(e.g. `COR T1 CS` = L, every other series R, for either knee), so it differs between the
+series of one study; the vote over the selected series keeps unselected series out (in a
+study holding both knees they are the other knee's).
 
 Canonical frame: "lateral" is towards increasing column index (coronal, axial) and
 towards increasing slice index (sagittal). Coronal/axial columns point to the patient's
@@ -55,6 +62,15 @@ def side_from_tag(values) -> str:
         if text in ("L", "LEFT"):
             return "L"
     return ""
+
+
+def side_from_tag_votes(values) -> str:
+    """Majority of the R/L tag values ('R', 'RIGHT', 'L', 'LEFT'); '' when none or tied."""
+    votes = [side_from_tag([value]) for value in values]
+    right, left = votes.count("R"), votes.count("L")
+    if right == left:
+        return ""
+    return "R" if right > left else "L"
 
 
 def image_center_x(ipp, iop, pixel_spacing, rows: int, cols: int) -> float:
@@ -101,7 +117,14 @@ def derive_laterality(
     selected = selection[selection["selected"].fillna(False).astype(bool)].copy()
     selected[STUDY_ID] = selected[STUDY_ID].astype(str)
 
-    tags = manifest.groupby(STUDY_ID)["laterality"].agg(lambda s: side_from_tag(s.tolist())) if "laterality" in manifest else {}
+    tags: pd.Series | dict = {}
+    if "laterality" in manifest:
+        selected_tags = selected[[STUDY_ID, "volume_id"]].merge(
+            manifest[[STUDY_ID, "volume_id", "laterality"]].drop_duplicates([STUDY_ID, "volume_id"]),
+            on=[STUDY_ID, "volume_id"],
+            how="left",
+        )
+        tags = selected_tags.groupby(STUDY_ID)["laterality"].agg(lambda s: side_from_tag_votes(s.tolist()))
 
     geometry_rows = selected[selected["slot"].isin(GEOMETRY_PLANES)]
     paths = list(geometry_rows["path"].astype(str))
@@ -121,10 +144,10 @@ def derive_laterality(
         tag_side = str(tags.get(study, "")) if len(tags) else ""
         center_x = float(center_by_study.get(study, np.nan))
         geometry_side = side_from_center_x(center_x, min_offset_mm)
-        if tag_side:
-            side, source = tag_side, "tag"
-        elif geometry_side:
+        if geometry_side:
             side, source = geometry_side, "geometry"
+        elif tag_side:
+            side, source = tag_side, "tag"
         else:
             side, source = "", "unresolved"
         rows.append(

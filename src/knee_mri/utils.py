@@ -108,7 +108,10 @@ def select_device(amp_mode: str = "auto", device_str: str | None = None) -> Devi
         return DeviceSpec(device=device, amp_dtype=None, use_grad_scaler=False, name=platform.processor() or "cpu")
 
     name = torch.cuda.get_device_name(device.index or 0)
-    bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    # Native bf16 only (Ampere+, sm_80). torch.cuda.is_bf16_supported() also reports True on
+    # pre-Ampere GPUs (e.g. Kaggle T4, sm_75) through emulation, but cuDNN has no bf16 engine
+    # there for some convs (ConvNeXt's 7x7 depthwise conv_dw: "unable to find an engine").
+    bf16_ok = torch.cuda.get_device_capability(device.index or 0) >= (8, 0)
 
     if amp_mode == "fp32":
         return DeviceSpec(device, None, False, name)

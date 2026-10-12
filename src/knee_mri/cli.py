@@ -490,7 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = _common(sub.add_parser("select-series", help="Re-run series selection on an existing manifest"))
     p.set_defaults(func=cmd_select_series)
 
-    p = _common(sub.add_parser("build-laterality", help="Right/left knee per study (tag, else geometry) for data.laterality_canonical"))
+    p = _common(sub.add_parser("build-laterality", help="Right/left knee per study (geometry, else the selected series' tag vote) for data.laterality_canonical"))
     p.add_argument("--workers", type=int, default=16, help="Threads reading one DICOM header per coronal/axial series")
     p.set_defaults(func=cmd_build_laterality)
 
