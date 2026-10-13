@@ -508,6 +508,44 @@ def build_label_table(cfg: Config, study_ids: list[str]) -> LabelTable:
     else:
         table = build_from_wide_numeric(df, study_ids, cfg, source=source)
     table.policy["source_file"] = str(path)
+    return apply_label_mask(table, load_label_mask_ids(cfg), str(cfg.paths.get("label_mask_csv") or ""))
+
+
+def load_label_mask_ids(cfg: Config) -> set[str]:
+    """StudyInstanceUIDs of paths.label_mask_csv; empty when the key is unset.
+
+    A configured but missing or empty file is an error, never a silently disabled mask.
+    """
+    raw = cfg.paths.get("label_mask_csv")
+    if not raw:
+        return set()
+    path = Path(raw)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"paths.label_mask_csv={raw} does not exist. Copy the file there, or set the key to an empty value."
+        )
+    ids = set(read_id_csv(path)[STUDY_ID].dropna().astype(str))
+    if not ids:
+        raise ValueError(f"paths.label_mask_csv={raw} lists no StudyInstanceUID")
+    return ids
+
+
+def apply_label_mask(table: LabelTable, masked: set[str], source: str = "") -> LabelTable:
+    """Turn every target of the listed studies into UNKNOWN with weight 0, in place.
+
+    For studies whose label cannot be tied to the images, e.g. a report describing both
+    knees while the series show one. Weight 0 keeps them out of the loss and out of every
+    reference derived from the table; the images still load, so the run's study set and
+    splits do not change.
+    """
+    rows = [i for i, sid in enumerate(table.study_ids) if str(sid) in masked]
+    if rows:
+        table.targets[rows] = 0.0
+        table.weights[rows] = 0.0
+        table.kinds[rows] = KIND_UNKNOWN
+        LOG.info("Label mask %s: all targets of %d studies set to unknown (weight 0)", source, len(rows))
+    table.policy["label_mask_csv"] = source or None
+    table.policy["n_label_masked_studies"] = len(rows)
     return table
 
 

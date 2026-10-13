@@ -1124,6 +1124,46 @@ def check_frozen_reference_roundtrip(tmp_dir) -> str:
     return "frozen reference reloads key-aligned and refuses unknown studies"
 
 
+def check_label_mask(tmp_dir) -> str:
+    """paths.label_mask_csv: every target of a listed study is unknown/weight 0, also in a frozen reference."""
+    from pathlib import Path
+
+    from .labels import KIND_UNKNOWN, apply_label_mask, build_from_wide_numeric, load_label_mask_ids
+    from .train import EvaluationReference
+
+    cfg = load_config(resolve=False)
+    ids = ["s0", "s1", "s2"]
+    frame = pd.DataFrame(np.ones((len(ids), len(TARGETS))), columns=TARGETS)
+    frame.insert(0, STUDY_ID, ids)
+    frozen = Path(tmp_dir) / "mask" / "frozen.csv"
+    frozen.parent.mkdir(parents=True, exist_ok=True)
+    EvaluationReference.from_table(build_from_wide_numeric(frame, ids, cfg, source="unit-test"), ids).save(frozen)
+
+    mask_csv = Path(tmp_dir) / "mask" / "mask.csv"
+    pd.DataFrame({STUDY_ID: ["s1", "not_in_table"], "reason": ["both knees", "x"]}).to_csv(mask_csv, index=False)
+    cfg.paths.label_mask_csv = str(mask_csv)
+    assert load_label_mask_ids(cfg) == {"s1", "not_in_table"}
+    table = apply_label_mask(build_from_wide_numeric(frame, ids, cfg, source="unit-test"), load_label_mask_ids(cfg))
+    assert (table.weights[1] == 0).all() and (table.kinds[1] == KIND_UNKNOWN).all() and (table.targets[1] == 0).all()
+    assert (table.weights[[0, 2]] == 1).all() and table.policy["n_label_masked_studies"] == 1
+    assert not EvaluationReference.from_table(table, ids).valid[1].any()
+
+    cfg.paths.frozen_reference_csv = str(frozen)  # written before the mask: still all valid on disk
+    reference = EvaluationReference.for_run(cfg, table, ["s2", "s1"])
+    assert reference.valid[0].all() and not reference.valid[1].any(), "the frozen file must honour the mask too"
+
+    cfg.paths.label_mask_csv = str(Path(tmp_dir) / "mask" / "missing.csv")
+    try:
+        load_label_mask_ids(cfg)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("a configured but missing label mask must be an error")
+    cfg.paths.label_mask_csv = None
+    assert load_label_mask_ids(cfg) == set()
+    return "listed studies -> all targets unknown at weight 0, in the table and in a frozen reference; missing file refused"
+
+
 def check_soft_auc_matches_roc_auc() -> str:
     """On a binary reference the soft ROC-AUC is exactly sklearn's ROC-AUC, ties included."""
     from sklearn.metrics import roc_auc_score
@@ -2275,6 +2315,94 @@ def check_filtered_slot_selection(cfg: Config, tmp_dir) -> str:
             continue
         raise AssertionError(f"series_slots {bad} was accepted")
     return "coronal_t1 = best non-FS spin-echo T1 besides the coronal volume; missing/odd headers refused; plane slots unchanged"
+
+
+def check_knee_consistent_selection(cfg: Config, tmp_dir) -> str:
+    """A study holding both knees takes every slot from the knee of its best sagittal volume."""
+    from .manifest import select_series
+
+    def volume(study, vid, plane, x, res=0.4):  # a coarser in-plane resolution scores lower
+        return {STUDY_ID: study, SERIES_ID: f"{study}.{vid}", "volume_id": f"{study}.{vid}#g0", "volume_key": "g0",
+                "path": f"/{study}/{vid}", "plane": plane, "series_description": vid, "echo_time": 35,
+                "repetition_time": 3000, "scanning_sequence": "SE", "scan_options": "", "n_slices": 24,
+                "row_spacing_mm": res, "col_spacing_mm": res, "plane_angle_deg": 1.0, "quality_flags": "",
+                "usable": True, "center_x_mm": x}
+
+    rows = [
+        # a: both knees; the best sagittal is the right one, the best axial the left one
+        volume("a", "sag_r", "sagittal", -105.0), volume("a", "sag_l", "sagittal", 110.0, res=0.8),
+        volume("a", "cor_r", "coronal", -108.0), volume("a", "cor_l", "coronal", 112.0),
+        volume("a", "ax_r", "axial", -104.0, res=0.8), volume("a", "ax_l", "axial", 104.0),
+        # b: both knees, but the kept (left) knee has no axial series -> the axial slot stays empty
+        volume("b", "sag_l", "sagittal", 100.0), volume("b", "sag_r", "sagittal", -100.0, res=0.8),
+        volume("b", "cor_l", "coronal", 98.0), volume("b", "ax_r", "axial", -101.0),
+        # c: one knee whose series spread 100 mm, all on the right: untouched
+        volume("c", "sag", "sagittal", -152.0), volume("c", "cor", "coronal", -80.0), volume("c", "ax_far", "axial", -52.0),
+        # d: one knee near the midline, series on both sides but only 60 mm apart: untouched
+        volume("d", "sag", "sagittal", -30.0), volume("d", "cor", "coronal", 30.0), volume("d", "ax", "axial", 25.0),
+    ]
+    manifest = pd.DataFrame(rows)
+    three = cfg.copy()
+    three.data.series_slots = ["sagittal", "coronal", "axial"]
+
+    def chosen(selection):
+        return {(r[STUDY_ID], r["slot"]): (r["volume_id"] if r["selected"] else None) for _, r in selection.iterrows()}
+
+    on = chosen(select_series(three, manifest, None, out_path=Path(tmp_dir) / "selection_knee_on.csv"))
+    assert (on[("a", "sagittal")], on[("a", "coronal")], on[("a", "axial")]) == ("a.sag_r#g0", "a.cor_r#g0", "a.ax_r#g0"), on
+    assert on[("b", "sagittal")] == "b.sag_l#g0" and on[("b", "coronal")] == "b.cor_l#g0" and on[("b", "axial")] is None, on
+    assert on[("c", "axial")] == "c.ax_far#g0" and on[("d", "coronal")] == "d.cor#g0" and on[("d", "axial")] == "d.ax#g0", on
+
+    off_cfg = three.copy()
+    off_cfg.selection.knee_consistency = False
+    off = chosen(select_series(off_cfg, manifest, None, out_path=Path(tmp_dir) / "selection_knee_off.csv"))
+    assert off[("a", "axial")] == "a.ax_l#g0" and off[("b", "axial")] == "b.ax_r#g0", "switched off: the old per-slot choice"
+    no_column = chosen(select_series(three, manifest.drop(columns="center_x_mm"), None, out_path=Path(tmp_dir) / "selection_knee_nocol.csv"))
+    assert no_column == off, "without center_x_mm the selection falls back to the per-slot choice"
+    return "both knees -> every slot from the best sagittal's knee (a missing plane stays empty); one knee, spread or midline, untouched"
+
+
+def check_non_knee_selection(cfg: Config, tmp_dir) -> str:
+    """Ankle-coil / ankle-described series are never selected; knee-foot coils and empty coils stay."""
+    from .manifest import select_series
+
+    def volume(study, vid, plane, coil, desc=None, res=0.4):  # a coarser in-plane resolution scores lower
+        return {STUDY_ID: study, SERIES_ID: f"{study}.{vid}", "volume_id": f"{study}.{vid}#g0", "volume_key": "g0",
+                "path": f"/{study}/{vid}", "plane": plane, "series_description": desc or vid, "echo_time": 35,
+                "repetition_time": 3000, "scanning_sequence": "SE", "scan_options": "", "n_slices": 24,
+                "row_spacing_mm": res, "col_spacing_mm": res, "plane_angle_deg": 1.0, "quality_flags": "",
+                "usable": True, "center_x_mm": -100.0, "coil_name": coil}
+
+    rows = [
+        # a: knee + ankle exam in one study (the train case): the sharper ankle series lose every slot
+        volume("a", "sag_ak", "sagittal", "SENSE_ANKLE_8_AC", res=0.25), volume("a", "sag_knee", "sagittal", "SENSE_KNEE_16_AC"),
+        volume("a", "ax_ak", "axial", "SENSE_ANKLE_8_AC", res=0.25), volume("a", "ax_knee", "axial", "SENSE_KNEE_16_AC"),
+        # b: knee-foot coil and an empty coil name are knee; an ankle description is not
+        volume("b", "sag", "sagittal", "QD Knee Foot"), volume("b", "ax", "axial", ""),
+        volume("b", "cor_ak", "coronal", "", desc="COR T2 TOBILLO", res=0.25), volume("b", "cor", "coronal", ""),
+        # c: only ankle series in a plane: the slot stays empty
+        volume("c", "sag", "sagittal", "KNEE_FOOT"), volume("c", "ax_ak", "axial", "Foot_Ankle_8ch"),
+    ]
+    manifest = pd.DataFrame(rows)
+    three = cfg.copy()
+    three.data.series_slots = ["sagittal", "coronal", "axial"]
+
+    def chosen(selection):
+        return {(r[STUDY_ID], r["slot"]): (r["volume_id"] if r["selected"] else None) for _, r in selection.iterrows()}
+
+    on = chosen(select_series(three, manifest, None, out_path=Path(tmp_dir) / "selection_nonknee_on.csv"))
+    assert on[("a", "sagittal")] == "a.sag_knee#g0" and on[("a", "axial")] == "a.ax_knee#g0", on
+    assert (on[("b", "sagittal")], on[("b", "coronal")], on[("b", "axial")]) == ("b.sag#g0", "b.cor#g0", "b.ax#g0"), on
+    assert on[("c", "sagittal")] == "c.sag#g0" and on[("c", "axial")] is None, on
+
+    off_cfg = three.copy()
+    off_cfg.selection.non_knee_patterns = []
+    off = chosen(select_series(off_cfg, manifest, None, out_path=Path(tmp_dir) / "selection_nonknee_off.csv"))
+    assert off[("a", "sagittal")] == "a.sag_ak#g0" and off[("c", "axial")] == "c.ax_ak#g0", "switched off: the old choice"
+    no_column = chosen(select_series(three, manifest.drop(columns="coil_name"), None, out_path=Path(tmp_dir) / "selection_nonknee_nocol.csv"))
+    assert no_column[("a", "sagittal")] == "a.sag_ak#g0" and no_column[("b", "coronal")] == "b.cor#g0", (
+        "without coil_name only the description filters")
+    return "ankle coil / ankle description never selected (a plane with only those stays empty); knee-foot and empty coils kept"
 
 
 def check_nonfs_slot_selection(cfg: Config, tmp_dir) -> str:
@@ -4297,6 +4425,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("statuses_all_targets", lambda: check_statuses_all_targets(tmp_dir)),
             ("details_missing_values", lambda: check_details_missing_values(tmp_dir)),
             ("frozen_reference_roundtrip", lambda: check_frozen_reference_roundtrip(tmp_dir)),
+            ("label_mask", lambda: check_label_mask(tmp_dir)),
             ("freeze_reference_from_csv", lambda: check_freeze_reference_from_csv(tmp_dir)),
             ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
@@ -4309,6 +4438,8 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("override_keys", check_override_keys),
             ("filtered_slot_selection", lambda: check_filtered_slot_selection(small, tmp_dir)),
             ("nonfs_slot_selection", lambda: check_nonfs_slot_selection(small, tmp_dir)),
+            ("knee_consistent_selection", lambda: check_knee_consistent_selection(small, tmp_dir)),
+            ("non_knee_selection", lambda: check_non_knee_selection(small, tmp_dir)),
             ("sagittal_own_normal", lambda: check_sagittal_own_normal(small, tmp_dir)),
             ("unselected_cache_removed", lambda: check_unselected_cache_removed(small, tmp_dir)),
             ("dataset_rejects_stale_cache", lambda: check_dataset_rejects_stale_cache(small, tmp_dir)),

@@ -42,7 +42,7 @@ from .dataset import (
     normalization_stats,
     resolve_augment_device,
 )
-from .labels import LabelTable, build_label_table, check_training_readiness, load_reference_table
+from .labels import LabelTable, build_label_table, check_training_readiness, load_label_mask_ids, load_reference_table
 from .loss import (
     GlobalNormalizer,
     LossAccumulator,
@@ -163,10 +163,17 @@ class EvaluationReference:
 
     @classmethod
     def for_run(cls, cfg: Config, table: LabelTable, study_ids: Sequence[str]) -> "EvaluationReference":
-        """The frozen file when configured, otherwise the reference derived from the label table."""
+        """The frozen file when configured, otherwise the reference derived from the label table.
+
+        A frozen file predates paths.label_mask_csv, so the masked studies are dropped from it
+        here; the table-derived reference already has them at weight 0.
+        """
         frozen = cfg.paths.get("frozen_reference_csv")
         if frozen:
-            return cls.from_csv(frozen, study_ids)
+            reference = cls.from_csv(frozen, study_ids)
+            mask_ids = load_label_mask_ids(cfg)
+            reference.valid[[i for i, sid in enumerate(reference.study_ids) if str(sid) in mask_ids]] = False
+            return reference
         return cls.from_table(table, study_ids)
 
     def save(self, path: str | Path) -> Path:

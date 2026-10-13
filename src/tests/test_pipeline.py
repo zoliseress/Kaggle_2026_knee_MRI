@@ -78,6 +78,18 @@ def test_frozen_reference_roundtrip(tmp_path):
     selftest.check_frozen_reference_roundtrip(tmp_path)
 
 
+def test_label_mask(tmp_path):
+    selftest.check_label_mask(tmp_path)
+
+
+def test_knee_consistent_selection(cfg, tmp_path):
+    selftest.check_knee_consistent_selection(cfg, tmp_path)
+
+
+def test_non_knee_selection(cfg, tmp_path):
+    selftest.check_non_knee_selection(cfg, tmp_path)
+
+
 def test_soft_auc_matches_roc_auc():
     selftest.check_soft_auc_matches_roc_auc()
 

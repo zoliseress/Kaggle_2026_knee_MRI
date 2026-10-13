@@ -30,6 +30,11 @@ paths:
   # for students trained on teacher pseudo-labels, so every teacher must leave it out too.
   # Empty value = no check, e.g. to resume a legacy run trained on the 4407-study CV split.
   exclude_from_training_csv: "notebooks/train_labeled_208_reference.csv"
+  # Studies whose labels are masked (all 12 targets unknown, weight 0) in training and in
+  # validation; their images still load. Now: the 7 studies holding both knees, where the report
+  # label cannot be tied to the selected knee, and 1 study whose leg was scanned rotated 90 deg
+  # (planes swapped, report and radiologist disagree). Empty value = no mask.
+  label_mask_csv: "notebooks/label_mask_studies.csv"
   # Validation reference frozen once by `freeze-reference` (from train_v1.csv). Every
   # training-label experiment is scored against this same file; null = derive it from
   # the current label table, which then moves with the label policy.
@@ -60,7 +65,15 @@ selection:
   # Among fluid-sensitive candidates: "t2" ranks T2-like TE >= 60 ms above PD-like 25-60 ms
   # (original); "pd" prefers PDFS (radiologists). A new selection: use its own selection csv + cache_dir.
   fluid_te_preference: "t2"
+  # A study holding both knees (candidates on both sides of the midline, centres >= this far
+  # apart) chooses every slot from one knee: the knee of the best sagittal candidate. Needs the
+  # manifest center_x_mm column (select-series backfills an older manifest once).
+  knee_consistency: true
+  bilateral_min_separation_mm: 150.0
   localizer_patterns: ["localiz", "localis", "scout", "survey", "loc_", "3-pl", "3pl", "plan"]
+  # Series whose coil name or description holds one of these (and not "knee": knee-foot coils
+  # stay) are not knee and never selected, e.g. an ankle exam in the same study. [] = off.
+  non_knee_patterns: ["ankle", "foot", "tobillo", "cheville", "tornozelo", "sprungg", "achill"]
   weights:
     fluid_sensitive: 3.0
     fat_suppression: 0.5

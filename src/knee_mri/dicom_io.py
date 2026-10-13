@@ -79,6 +79,7 @@ class SeriesHeader:
     patient_id: str = ""
     laterality: str = ""
     body_part: str = ""
+    coil_name: str = ""  # receive / transmit coil names, "/"-joined: the anatomy the coil was made for
     photometric: str = "MONOCHROME2"
     transfer_syntax: str = ""
     modality: str = ""
@@ -119,6 +120,12 @@ class VolumeCandidate:
     def usable(self, min_slices: int) -> bool:
         blocking = {"decode_failed", "no_geometry", "multiframe_unsupported", "inconsistent_orientation", "empty"}
         return self.n_slices >= min_slices and not (blocking & set(self.flags))
+
+
+def coil_name(ds: Any) -> str:
+    """ReceiveCoilName and TransmitCoilName, "/"-joined without empties or repeats."""
+    names = [_as_str(getattr(ds, key, "")).strip() for key in ("ReceiveCoilName", "TransmitCoilName")]
+    return "/".join(dict.fromkeys(n for n in names if n))
 
 
 def _float_tuple(value: Any, length: int, default: tuple | None = None) -> tuple | None:
@@ -253,6 +260,7 @@ def read_series_slices(series_dir: Path) -> tuple[list[SliceRef], SeriesHeader, 
                 getattr(ds, "ImageLaterality", "")
             )
             header.body_part = _as_str(getattr(ds, "BodyPartExamined", ""))
+            header.coil_name = coil_name(ds)
             header.photometric = _as_str(getattr(ds, "PhotometricInterpretation", "MONOCHROME2"))
             header.modality = _as_str(getattr(ds, "Modality", ""))
             meta = getattr(ds, "file_meta", None)

@@ -99,11 +99,26 @@ def cmd_build_manifest(args: argparse.Namespace) -> int:
 
 
 def cmd_select_series(args: argparse.Namespace) -> int:
-    from .manifest import load_manifest, select_series
+    from .manifest import add_center_x, add_coil_name, load_manifest, select_series
     from .schema import read_id_csv
+    from .utils import atomic_write_dataframe
 
     cfg = _load(args)
     manifest = load_manifest(cfg)
+    if bool(cfg.selection.get("knee_consistency", True)) and "center_x_mm" not in manifest.columns:
+        # A manifest from before the column: backfill it once (one header per series) and keep it.
+        LOG.info("Manifest has no center_x_mm (needed by selection.knee_consistency): reading one header per series")
+        manifest = add_center_x(manifest, workers=16)
+        path = Path(cfg.paths.work_dir) / "manifest" / "manifest.csv"
+        atomic_write_dataframe(manifest, path)
+        LOG.info("center_x_mm added to %s", path)
+    if "coil_name" not in manifest.columns:
+        # A manifest from before the column: backfill it once (one header per series) and keep it.
+        LOG.info("Manifest has no coil_name (needed to drop ankle-coil series): reading one header per series")
+        manifest = add_coil_name(manifest, workers=16)
+        path = Path(cfg.paths.work_dir) / "manifest" / "manifest.csv"
+        atomic_write_dataframe(manifest, path)
+        LOG.info("coil_name added to %s", path)
     series_meta = read_id_csv(cfg.paths.train_series_csv) if Path(cfg.paths.train_series_csv).exists() else None
     select_series(cfg, manifest, series_meta)
     return 0

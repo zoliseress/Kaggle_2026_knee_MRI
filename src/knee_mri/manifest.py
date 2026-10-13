@@ -47,6 +47,7 @@ MANIFEST_COLUMNS = [
     "normal_x",
     "normal_y",
     "normal_z",
+    "center_x_mm",
     "series_description",
     "scanning_sequence",
     "sequence_variant",
@@ -59,6 +60,7 @@ MANIFEST_COLUMNS = [
     "patient_id",
     "laterality",
     "body_part",
+    "coil_name",
     "photometric",
     "transfer_syntax",
     "modality",
@@ -67,6 +69,61 @@ MANIFEST_COLUMNS = [
     "quality_flags",
     "usable",
 ]
+
+
+def volume_center_x(volume: VolumeCandidate) -> float:
+    """Mean image-centre x (LPS mm) over the volume's slices: which side of the midline the volume lies on."""
+    from .laterality import image_center_x
+
+    centers = [image_center_x(s.ipp, s.iop, s.pixel_spacing, s.rows, s.cols) for s in volume.slices]
+    return float(np.mean(centers)) if centers else float("nan")
+
+
+def add_center_x(manifest: pd.DataFrame, workers: int = 16) -> pd.DataFrame:
+    """Backfill `center_x_mm` for a manifest built before the column existed.
+
+    Reads one DICOM header per series directory (the first readable file), so a sagittal
+    volume gets one slice's x instead of the slab mean - still on the right side of the
+    midline, which is all the knee grouping needs.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .laterality import _series_center_x
+
+    paths = manifest["path"].astype(str)
+    unique = sorted(set(paths))
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        centers = dict(zip(unique, pool.map(_series_center_x, unique)))
+    out = manifest.copy()
+    out["center_x_mm"] = paths.map(centers).round(2)
+    return out
+
+
+def _series_coil_name(series_dir: str) -> str:
+    """Coil name of the first readable DICOM file in a series directory (header only)."""
+    import pydicom
+
+    from .dicom_io import coil_name
+
+    for path in sorted(p for p in Path(series_dir).iterdir() if p.is_file()):
+        try:
+            return coil_name(pydicom.dcmread(str(path), stop_before_pixels=True, force=True))
+        except Exception:  # a broken file: try the next one
+            continue
+    return ""
+
+
+def add_coil_name(manifest: pd.DataFrame, workers: int = 16) -> pd.DataFrame:
+    """Backfill `coil_name` for a manifest built before the column existed (one header per series)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    paths = manifest["path"].astype(str)
+    unique = sorted(set(paths))
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        names = dict(zip(unique, pool.map(_series_coil_name, unique)))
+    out = manifest.copy()
+    out["coil_name"] = paths.map(names)
+    return out
 
 
 def _volume_row(volume: VolumeCandidate, min_slices: int, decode_probe: bool, monochrome1_policy: str) -> dict:
@@ -101,6 +158,7 @@ def _volume_row(volume: VolumeCandidate, min_slices: int, decode_probe: bool, mo
         "normal_x": round(float(volume.normal[0]), 5),
         "normal_y": round(float(volume.normal[1]), 5),
         "normal_z": round(float(volume.normal[2]), 5),
+        "center_x_mm": round(volume_center_x(volume), 2),
         "series_description": header.series_description,
         "scanning_sequence": header.scanning_sequence,
         "sequence_variant": header.sequence_variant,
@@ -113,6 +171,7 @@ def _volume_row(volume: VolumeCandidate, min_slices: int, decode_probe: bool, mo
         "patient_id": header.patient_id,
         "laterality": header.laterality,
         "body_part": header.body_part,
+        "coil_name": header.coil_name,
         "photometric": header.photometric,
         "transfer_syntax": header.transfer_syntax,
         "modality": header.modality,
@@ -295,6 +354,17 @@ def _is_localizer(description: str, patterns: list[str]) -> bool:
     return any(pattern in text for pattern in patterns)
 
 
+# Body parts other than the knee, matched in the coil name and the series description.
+# BodyPartExamined is not used: in train 16 knee studies say ANKLE and the one real ankle says KNEE.
+DEFAULT_NON_KNEE_PATTERNS = ["ankle", "foot", "tobillo", "cheville", "tornozelo", "sprungg", "achill"]
+
+
+def _is_non_knee(text, patterns: list[str]) -> bool:
+    """A non-knee pattern in `text` with no "knee" in it (knee-foot coils are knee coils)."""
+    text = "" if pd.isna(text) else str(text).lower()
+    return "knee" not in text and any(pattern in text for pattern in patterns)
+
+
 TE_PREFERENCES = ("t2", "pd")
 
 
@@ -419,6 +489,10 @@ def score_candidates(manifest: pd.DataFrame, series_meta: pd.DataFrame | None, c
     df = manifest.copy()
 
     df["is_localizer"] = df["series_description"].fillna("").map(lambda d: _is_localizer(d, patterns))
+    non_knee = [p.lower() for p in cfg.selection.get("non_knee_patterns", DEFAULT_NON_KNEE_PATTERNS)]
+    df["is_non_knee"] = df["series_description"].map(lambda d: _is_non_knee(d, non_knee))
+    if "coil_name" in df.columns:
+        df["is_non_knee"] |= df["coil_name"].map(lambda c: _is_non_knee(c, non_knee))
     # meta_* keep the series csv as given (NaN = unknown) for the slot filters; the score
     # columns read unknown as 0 and may be switched off without touching the filters.
     df["meta_fluid_sensitive"] = np.nan
@@ -468,6 +542,39 @@ def score_candidates(manifest: pd.DataFrame, series_meta: pd.DataFrame | None, c
     return df
 
 
+def restrict_to_one_knee(
+    study_rows: pd.DataFrame,
+    plane_slots: list[str],
+    min_offset_mm: float,
+    min_separation_mm: float,
+) -> tuple[pd.DataFrame, str]:
+    """Keep only one knee's candidates when a study holds both knees.
+
+    A study holds both knees when it has candidates at least `min_offset_mm` on both sides of
+    the midline and its candidate centres span at least `min_separation_mm` (two knees lie
+    ~200 mm apart; one knee's series spread at most ~100 mm). The knee is the one of the best
+    candidate of the first plane slot that has candidates (the sagittal one by default), so
+    every slot then comes from that knee. Returns the rows to choose from and a note ('' when
+    the study holds one knee).
+    """
+    x = pd.to_numeric(study_rows.get("center_x_mm"), errors="coerce")
+    if x is None or not ((x <= -min_offset_mm).any() and (x >= min_offset_mm).any()):
+        return study_rows, ""
+    if float(x.max() - x.min()) < min_separation_mm:
+        return study_rows, ""
+    for slot in plane_slots:
+        candidates = study_rows[(study_rows["plane"] == slot_plane(slot)) & x.notna()]
+        if len(candidates):
+            best = candidates.sort_values(["score", SERIES_ID, "volume_key"], ascending=[False, True, True], kind="stable")
+            left = bool(x[best.index[0]] > 0)
+            break
+    else:
+        return study_rows, ""
+    keep = (x > 0) if left else (x < 0)
+    side = "L" if left else "R"
+    return study_rows[keep], f"both knees in the study: kept the {side} knee ({int(keep.sum())}/{len(study_rows)} candidates)"
+
+
 def select_series(
     cfg: Config,
     manifest: pd.DataFrame,
@@ -479,10 +586,28 @@ def select_series(
     A plane slot ("coronal") takes the best-scoring volume of its plane. A filtered slot
     ("coronal_t1") takes the best-scoring volume of its plane that passes the filter and is
     not the volume already chosen for the plane slot, so the two slots never duplicate.
+    With `selection.knee_consistency`, a study holding both knees first drops the other
+    knee's candidates (`restrict_to_one_knee`), so the slots never mix the two knees; a slot
+    the kept knee lacks stays empty. It needs the manifest's `center_x_mm` column.
     """
     slots = list(cfg.data.series_slots)
     scored = score_candidates(manifest, series_meta, cfg)
-    usable = scored[scored["usable"].fillna(False).astype(bool) & ~scored["is_localizer"]]
+    usable = scored[scored["usable"].fillna(False).astype(bool) & ~scored["is_localizer"] & ~scored["is_non_knee"]]
+    if "coil_name" not in scored.columns:
+        LOG.warning("The manifest has no coil_name column: non-knee series (ankle coil) are only caught by their "
+                    "description (backfill with manifest.add_coil_name).")
+    n_non_knee = int(scored["is_non_knee"].sum())
+    if n_non_knee:
+        LOG.info("Excluded %d non-knee volume candidates in %d studies (coil name / description)",
+                 n_non_knee, scored.loc[scored["is_non_knee"], STUDY_ID].nunique())
+    knee_consistency = bool(cfg.selection.get("knee_consistency", True))
+    if knee_consistency and "center_x_mm" not in usable.columns:
+        LOG.warning("selection.knee_consistency is on but the manifest has no center_x_mm column: "
+                    "slots may mix the two knees of a bilateral study (backfill with manifest.add_center_x).")
+        knee_consistency = False
+    min_offset = float(cfg.data.get("laterality_min_offset_mm", 20.0))
+    min_separation = float(cfg.selection.get("bilateral_min_separation_mm", 150.0))
+    plane_slots = [s for s in slots if slot_filter(s) is None]
     filter_names = {slot_filter(s) for s in slots} - {None}
     filter_masks = {f: passes_slot_filter(usable, f) for f in filter_names}
     priority_by_filter = {f: slot_filter_priority(usable, f) for f in filter_names}
@@ -493,6 +618,9 @@ def select_series(
     all_studies = sorted(set(manifest[STUDY_ID].dropna().astype(str)))
     for study in all_studies:
         study_rows = usable[usable[STUDY_ID] == study]
+        knee_note = ""
+        if knee_consistency:
+            study_rows, knee_note = restrict_to_one_knee(study_rows, plane_slots, min_offset, min_separation)
         by_slot: dict[str, dict] = {}
         for slot in resolution_order:
             plane, filter_name = slot_plane(slot), slot_filter(slot)
@@ -513,7 +641,11 @@ def select_series(
                     n_unusable = int(
                         ((scored[STUDY_ID] == study) & (scored["plane"] == plane) & ~scored["usable"].fillna(False)).sum()
                     )
-                    reason = f"no usable candidate (localizers={n_localizers}, unusable={n_unusable})"
+                    n_non_knee_plane = int(
+                        ((scored[STUDY_ID] == study) & (scored["plane"] == plane) & scored["is_non_knee"]).sum()
+                    )
+                    reason = (f"no usable candidate (localizers={n_localizers}, unusable={n_unusable}, "
+                              f"non_knee={n_non_knee_plane})")
                 by_slot[slot] = {
                     STUDY_ID: study,
                     "slot": slot,
@@ -522,7 +654,8 @@ def select_series(
                     "selected": False,
                     "score": np.nan,
                     "n_candidates": 0,
-                    "reason": reason,
+                    "reason": reason + (f"; {knee_note}" if knee_note else ""),
+                    "knee_filter": knee_note,
                     "quality_flags": "",
                     "n_slices": 0,
                 }
@@ -553,7 +686,9 @@ def select_series(
                     f"fluid_sensitive={best['fluid_sensitive']:.0f} te={best['echo_time']} "
                     f"slices={best['n_slices']} res={best['row_spacing_mm']:.2f}x{best['col_spacing_mm']:.2f}mm "
                     f"plane_angle={best['plane_angle_deg']:.1f}deg penalties={best['n_penalty_flags']}"
+                    + (f"; {knee_note}" if knee_note else "")
                 ),
+                "knee_filter": knee_note,
                 "series_description": best["series_description"],
                 "filter_priority": int(best["filter_priority"]),
                 "normal_x": float(best["normal_x"]) if "normal_x" in best and pd.notna(best["normal_x"]) else np.nan,
@@ -574,6 +709,7 @@ def select_series(
         "studies_with_all_slots": int((per_study == len(slots)).sum()),
         "studies_with_no_slot": int(len(all_studies) - per_study.gt(0).sum()),
         "selected_per_slot": present.groupby("slot").size().to_dict() if len(present) else {},
+        "studies_with_both_knees": int(selection.loc[selection["knee_filter"].fillna("") != "", STUDY_ID].nunique()),
     }
     atomic_write_json(out_path.with_name("series_selection_summary.json"), coverage)
     LOG.info("Series selection written: %s | coverage: %s", out_path, coverage)
