@@ -26,6 +26,8 @@ import pandas as pd
 
 from .constants import N_TARGETS, TARGETS
 
+BCE_EPS = 1e-7
+
 
 @dataclass
 class ClassMetrics:
@@ -42,6 +44,7 @@ class ClassMetrics:
     soft_auc: float
     spearman: float
     brier: float
+    bce: float  # mean BCE of the score against the reference over the valid cells
     average_precision: float
     prevalence: float
     ap_degenerate: bool
@@ -148,6 +151,9 @@ def class_metrics(
     soft_auc = soft_roc_auc(y_all, s_all, min_support=min_support)
     spearman = _spearman(y_all, s_all)
     brier = float(np.mean((s_all - y_all) ** 2)) if y_all.size else float("nan")
+    # Scores are fp32 sigmoids and saturate at 0/1; clip so a confident miss costs ~16, not inf.
+    p_all = np.clip(s_all, BCE_EPS, 1.0 - BCE_EPS)
+    bce = float(np.mean(-(y_all * np.log(p_all) + (1.0 - y_all) * np.log(1.0 - p_all)))) if y_all.size else float("nan")
 
     auc = float("nan")
     if n_pos >= min_support and n_neg >= min_support:
@@ -183,6 +189,7 @@ def class_metrics(
         soft_auc=soft_auc,
         spearman=spearman,
         brier=brier,
+        bce=bce,
         average_precision=ap,
         prevalence=prevalence,
         ap_degenerate=bool(degenerate),
@@ -233,6 +240,7 @@ def evaluate_predictions(
         "n_soft_auc_targets": int(len(defined_soft)),
         "macro_spearman": float(table["spearman"].dropna().mean()) if table["spearman"].notna().any() else float("nan"),
         "macro_brier": float(table["brier"].dropna().mean()) if table["brier"].notna().any() else float("nan"),
+        "macro_bce": float(table["bce"].dropna().mean()) if table["bce"].notna().any() else float("nan"),
         "n_soft_cells": int(table["n_soft"].sum()),
         "n_targets": N_TARGETS,
         "defined_fraction": f"{len(defined_auc)}/{N_TARGETS}",

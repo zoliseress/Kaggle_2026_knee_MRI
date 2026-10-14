@@ -232,6 +232,10 @@ RESUME_CONFIG_KEYS = (
 RESUME_IGNORED_MODEL_KEYS = ("weights", "encoder_chunk_size", "grad_checkpointing")
 
 
+def _fmt(value: float) -> str:
+    return f"{value:.4f}" if value is not None and np.isfinite(value) else "NA"
+
+
 def _dotted(tree: dict, key: str) -> Any:
     for part in key.split("."):
         tree = tree.get(part) if isinstance(tree, dict) else None
@@ -727,7 +731,14 @@ class Trainer:
         return self.ema.module if self.ema is not None else self.model
 
     @torch.inference_mode()
-    def predict(self, loader: DataLoader, model: torch.nn.Module | None = None) -> tuple[list[str], np.ndarray]:
+    def predict(
+        self,
+        loader: DataLoader,
+        model: torch.nn.Module | None = None,
+        loss: LossAccumulator | None = None,
+    ) -> tuple[list[str], np.ndarray]:
+        """Sigmoid scores per study. With `loss`, also accumulate the training-label BCE of the
+        batches (the train_loss quantity: weighted class means over the label weights)."""
         model = self.selected_model if model is None else model
         model.eval()
         study_ids: list[str] = []
@@ -738,6 +749,13 @@ class Trainer:
             present = batch["series_present_mask"].to(self.device_spec.device, non_blocking=True)
             with autocast_ctx(self.device_spec):
                 logits = model(images, slice_valid, present)
+            if loss is not None:
+                output = masked_class_normalized_bce(
+                    logits.float(),
+                    batch["targets"].to(self.device_spec.device),
+                    batch["label_weights"].to(self.device_spec.device),
+                )
+                loss.update(output, n_studies=int(logits.shape[0]))
             scores.append(torch.sigmoid(logits.float()).cpu().numpy())
             study_ids.extend(batch["study_ids"])
         stacked = np.concatenate(scores, axis=0) if scores else np.zeros((0, len(TARGETS)), dtype=np.float32)
@@ -753,13 +771,16 @@ class Trainer:
         return table, summary, predictions
 
     def _score(self, model: torch.nn.Module, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
-        study_ids, scores = self.predict(self.val_loader, model)
+        label_loss = LossAccumulator()
+        study_ids, scores = self.predict(self.val_loader, model, loss=label_loss)
         if self.world_size > 1:
             # Every rank scored its shard; all of them get the full set, so the metrics - and the
             # best-epoch and early-stopping decisions taken from them - are identical everywhere.
             parts = dist_utils.all_gather_object((study_ids, scores))
             study_ids = [sid for ids, _ in parts for sid in ids]
             scores = np.concatenate([part for _, part in parts], axis=0)
+            totals = dist_utils.all_reduce_sum(np.concatenate([label_loss.numerators, label_loss.denominators]))
+            label_loss.numerators, label_loss.denominators = totals[: len(TARGETS)], totals[len(TARGETS) :]
         order = {sid: i for i, sid in enumerate(study_ids)}
         missing = [s for s in self.reference.study_ids if s not in order]
         if missing:
@@ -777,6 +798,9 @@ class Trainer:
             min_support=int(self.cfg.eval.min_class_support),
         )
         summary["epoch"] = epoch
+        # The train_loss quantity on the validation studies' training labels. NaN when they carry
+        # none (holdout on a radiologist reference): macro_bce against the reference is then the loss.
+        summary["label_loss"] = label_loss.macro
         predictions = self._prediction_frame(aligned, epoch)
         return table, summary, predictions
 
@@ -1032,6 +1056,11 @@ class Trainer:
                 "peak_gpu_gb": train_summary["peak_gpu_gb"],
                 # The early-stopping score (eval.selection_metric); the named macros are logged beside it.
                 "val_selection_score": score,
+                # Same quantity as train_loss, on the validation studies' training labels (NaN if none).
+                "val_loss": val_summary["label_loss"],
+                # BCE / Brier of the scores against the evaluation reference, macro over the targets.
+                "val_ref_bce": val_summary["macro_bce"],
+                "val_macro_brier": val_summary["macro_brier"],
                 "val_macro_roc_auc": val_summary["macro_roc_auc"],
                 "val_macro_soft_auc": val_summary["macro_soft_auc"],
                 "val_macro_spearman": val_summary["macro_spearman"],
@@ -1053,9 +1082,13 @@ class Trainer:
             if main:
                 atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
             LOG.info(
-                "epoch %d | train loss %.4f | val %s %s | macro ROC-AUC %s (%s defined) | AP %s",
+                "epoch %d | train loss %.4f | val loss %s | val ref BCE %s | val Brier %s | val %s %s | "
+                "macro ROC-AUC %s (%s defined) | AP %s",
                 epoch,
                 record["train_loss"],
+                _fmt(record["val_loss"]),
+                _fmt(record["val_ref_bce"]),
+                _fmt(record["val_macro_brier"]),
                 self.selection_name,
                 f"{score:.4f}" if np.isfinite(score) else "NA",
                 f"{val_summary['macro_roc_auc']:.4f}" if np.isfinite(val_summary["macro_roc_auc"]) else "NA",

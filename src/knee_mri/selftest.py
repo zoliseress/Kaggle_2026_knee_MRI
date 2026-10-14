@@ -756,6 +756,9 @@ def check_global_training_step(cfg: Config) -> str:
             remove_file_logging(tmp)
     assert history["train_objective"].notna().all() and np.isfinite(history["train_objective"]).all()
     assert int(history["optimizer_steps"].iloc[0]) <= 3
+    # Synthetic validation labels are the reference itself (unit weights): the training-label loss
+    # through the logits and the reference BCE through the clipped sigmoids are the same number.
+    assert np.allclose(history["val_loss"], history["val_ref_bce"], atol=1e-4), history[["val_loss", "val_ref_bce"]]
     return f"synthetic run with the global policy: {len(history)} epochs, objective {history['train_objective'].round(4).tolist()}"
 
 
