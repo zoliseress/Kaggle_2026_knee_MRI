@@ -1172,8 +1172,20 @@ class Trainer:
             summary["reference_note"] = self.reference.note
         if dist_utils.is_main():
             atomic_write_json(self.run_dir / "run_summary.json", summary)
+            self._write_report()
         LOG.info("Run summary: %s", json.dumps(summary, indent=2, default=str))
         return summary
+
+    def _write_report(self) -> None:
+        """Metric plots and report.html from the files the run just wrote. A failure here
+        only warns: the checkpoints and metrics are already on disk, and `cli report`
+        can rebuild the report later."""
+        from .report import build_run_report
+
+        try:
+            build_run_report(self.cfg, self.run_dir)
+        except Exception:
+            LOG.warning("Could not build the run report/plots in %s", self.run_dir, exc_info=True)
 
 
 # --------------------------------------------------------------------------------------

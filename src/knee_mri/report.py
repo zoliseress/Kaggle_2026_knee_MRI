@@ -28,34 +28,83 @@ def _matplotlib():
     return plt
 
 
-def plot_learning_curves(history: pd.DataFrame, out_path: Path) -> Path:
+def _best_epoch(history: pd.DataFrame, summary: dict) -> int | None:
+    if summary.get("best_epoch") is not None and int(summary["best_epoch"]) >= 0:
+        return int(summary["best_epoch"])
+    column = "val_selection_score" if "val_selection_score" in history else "val_macro_roc_auc"
+    if column not in history:
+        return None
+    values = pd.to_numeric(history[column], errors="coerce")
+    return int(history.loc[values.idxmax(), "epoch"]) if values.notna().any() else None
+
+
+def _plot_series(ax, history: pd.DataFrame, column: str, label: str, **style: Any) -> bool:
+    """One history column against epoch; absent (older runs) or all-NaN columns are skipped."""
+    if column not in history:
+        return False
+    values = pd.to_numeric(history[column], errors="coerce")
+    finite = np.isfinite(values.to_numpy(dtype=float))
+    if not finite.any():
+        return False
+    ax.plot(history["epoch"][finite], values[finite], label=label, **style)
+    return True
+
+
+def plot_learning_curves(history: pd.DataFrame, out_path: Path, summary: dict | None = None) -> Path:
     plt = _matplotlib()
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(history["epoch"], history["train_loss"], marker="o")
-    axes[0].set_title("Training loss (class-normalised)")
-    axes[0].set_xlabel("epoch")
-    axes[0].grid(alpha=0.3)
+    summary = summary or {}
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    ax_loss, ax_rank, ax_ap, ax_calib, ax_lr, ax_speed = axes.ravel()
+
+    _plot_series(ax_loss, history, "train_loss", "train loss", marker="o")
+    _plot_series(ax_loss, history, "val_loss", "val loss (training labels)", marker="s")
+    _plot_series(ax_loss, history, "val_ref_bce", "val BCE (reference)", marker="^")
+    ax_loss.set_title("Loss (class-normalised BCE)")
 
     # Older runs have no val_selection_score column; their selection score was macro ROC-AUC.
-    column = "val_selection_score" if "val_selection_score" in history else "val_macro_roc_auc"
-    finite = history[np.isfinite(history[column])]
-    axes[1].plot(finite["epoch"], finite[column], marker="o", color="tab:green", label="selection score")
-    if column != "val_macro_roc_auc":
-        hard = history[np.isfinite(history["val_macro_roc_auc"])]
-        axes[1].plot(hard["epoch"], hard["val_macro_roc_auc"], marker="s", color="tab:blue", label="ROC-AUC (0/1 cells)")
-        axes[1].legend()
-    axes[1].axhline(0.5, ls="--", c="grey", lw=1)
-    axes[1].set_title("Validation macro score (evaluable targets)")
-    axes[1].set_xlabel("epoch")
-    axes[1].grid(alpha=0.3)
+    selection = summary.get("selection_metric", "selection score")
+    _plot_series(ax_rank, history, "val_selection_score", f"selection ({selection})", marker="o", lw=2.5, color="tab:green")
+    _plot_series(ax_rank, history, "val_selection_score_raw", "selection, raw (no EMA)", ls="--", color="tab:green", alpha=0.6)
+    _plot_series(ax_rank, history, "val_macro_roc_auc", "ROC-AUC (0/1 cells)", marker="s", color="tab:blue")
+    _plot_series(ax_rank, history, "val_macro_soft_auc", "soft ROC-AUC", marker="^", color="tab:purple")
+    ax_rank.set_title("Validation macro ranking metrics")
 
-    axes[2].plot(history["epoch"], history["encoder_lr"], marker="o", label="encoder")
-    axes[2].plot(history["epoch"], history["head_lr"], marker="s", label="head")
-    axes[2].set_title("Learning rate")
-    axes[2].set_xlabel("epoch")
-    axes[2].legend()
-    axes[2].grid(alpha=0.3)
+    _plot_series(ax_ap, history, "val_macro_ap", "AP", marker="o", color="tab:orange")
+    _plot_series(ax_ap, history, "val_macro_f1", "F1 @ threshold", marker="s", color="tab:red")
+    ax_ap.set_title("Validation macro AP / F1")
 
+    _plot_series(ax_calib, history, "val_macro_brier", "Brier (lower is better)", marker="o", color="tab:brown")
+    _plot_series(ax_calib, history, "val_macro_spearman", "Spearman", marker="s", color="tab:cyan")
+    ax_calib.set_title("Validation calibration / correlation")
+
+    # Linear: the cosine schedule ends at exactly 0, which a log axis cannot show.
+    _plot_series(ax_lr, history, "encoder_lr", "encoder", marker="o")
+    _plot_series(ax_lr, history, "head_lr", "head", marker="s")
+    ax_lr.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax_lr.set_title("Learning rate (end of epoch)")
+
+    _plot_series(ax_speed, history, "studies_per_second", "train studies/s", marker="o", color="tab:gray")
+    twin = ax_speed.twinx()
+    if _plot_series(twin, history, "peak_gpu_gb", "peak GPU GB", marker="s", color="tab:olive"):
+        twin.set_ylabel("GB")
+        twin.set_ylim(0, twin.get_ylim()[1] * 1.1)
+        twin.legend(loc="lower right", fontsize=8)
+    ax_speed.set_ylim(0, ax_speed.get_ylim()[1] * 1.1)  # from 0: run-to-run jitter must not look like a trend
+    ax_speed.set_title("Throughput / memory")
+
+    from matplotlib.ticker import MaxNLocator
+
+    best = _best_epoch(history, summary)
+    for ax in axes.ravel():
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if best is not None:
+            ax.axvline(best, ls=":", c="k", lw=1, label=f"best epoch {best}")
+        ax.set_xlabel("epoch")
+        ax.grid(alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
+
+    fig.suptitle(summary.get("run_dir", out_path.parent.name).replace("\\", "/").rsplit("/", 1)[-1])
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=100)
@@ -109,6 +158,17 @@ def _table_html(df: pd.DataFrame, float_format: str = "{:.4f}") -> str:
     return df.to_html(index=False, float_format=lambda v: float_format.format(v), na_rep="NA", border=0)
 
 
+def _backbone(run_dir: Path) -> str:
+    """The run's encoder from its saved config.yaml; a neutral label when unreadable."""
+    try:
+        import yaml
+
+        cfg = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
+        return str(cfg["model"]["backbone"])
+    except Exception:
+        return "encoder"
+
+
 def build_html_report(
     run_dir: str | Path,
     qc_dir: str | Path | None = None,
@@ -128,7 +188,7 @@ def build_html_report(
 
     figures: list[tuple[str, Path]] = []
     if len(history):
-        figures.append(("Learning curves", plot_learning_curves(history, run_dir / "learning_curves.png")))
+        figures.append(("Learning curves", plot_learning_curves(history, run_dir / "learning_curves.png", summary)))
     if len(metrics):
         figures.append(("Per-class metrics", plot_per_class_metrics(metrics, run_dir / "per_class_metrics.png")))
 
@@ -193,7 +253,7 @@ def build_html_report(
  figure {{ margin: 1rem 0; }}
 </style></head>
 <body>
-<h1>Knee MRI - EfficientNet-B0 2.5D MIL</h1>
+<h1>Knee MRI - {html.escape(_backbone(run_dir))} 2.5D MIL</h1>
 <p>Run directory: <code>{html.escape(str(run_dir))}</code></p>
 {warning_block}
 {''.join(sections)}
@@ -203,3 +263,12 @@ def build_html_report(
     atomic_write_text(out_path, document)
     LOG.info("HTML report written: %s", out_path)
     return out_path
+
+
+def build_run_report(cfg: Any, run_dir: str | Path, qc_dir: str | Path | None = None) -> Path:
+    """`build_html_report` with the project's label counts and QC gallery: the `report`
+    command and the end of every training run share it."""
+    counts_path = Path(cfg.paths.work_dir) / "schema" / "labels_counts.csv"
+    counts = pd.read_csv(counts_path) if counts_path.exists() else None
+    qc_dir = qc_dir or Path(cfg.paths.work_dir) / "qc"
+    return build_html_report(run_dir, qc_dir=qc_dir, label_counts=counts)

@@ -800,7 +800,10 @@ Runs are grouped by training table: `paths.output_dir` defaults to
 `config.yaml`, `run.log`, `best.pt`, `last.pt`, learning-curve and per-class plots, and an
 offline `report.html` linking the QC gallery, label counts, metrics and high-confidence
 disagreements. Disagreement review is a development aid and is kept out of any locked final
-evaluation.
+evaluation. The plots (`learning_curves.png`: losses, ranking metrics, AP/F1, Brier/Spearman,
+learning rate, throughput, with the best epoch marked; `per_class_metrics.png`) and
+`report.html` are written automatically when training ends (also on early stop);
+`python -m knee_mri.cli report <run_dir>` rebuilds them, e.g. for older runs.
 
 Checkpoints store model/optimizer/scheduler/scaler state, epoch, best score, RNG state,
 target order, config and the label/split/preprocessing versions. Resume is exact **at epoch

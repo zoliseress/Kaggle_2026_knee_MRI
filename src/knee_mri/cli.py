@@ -380,13 +380,9 @@ def cmd_merge_oof(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    from .report import build_html_report
+    from .report import build_run_report
 
-    cfg = _load(args)
-    counts_path = Path(cfg.paths.work_dir) / "schema" / "labels_counts.csv"
-    counts = pd.read_csv(counts_path) if counts_path.exists() else None
-    qc_dir = args.qc_dir or Path(cfg.paths.work_dir) / "qc"
-    path = build_html_report(args.run_dir, qc_dir=qc_dir, label_counts=counts)
+    path = build_run_report(_load(args), args.run_dir, qc_dir=args.qc_dir)
     print(str(path))
     return 0
 
