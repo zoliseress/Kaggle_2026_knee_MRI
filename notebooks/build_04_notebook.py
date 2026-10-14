@@ -79,7 +79,9 @@ CACHE_WORKERS      = None   # None = os.cpu_count() capped at 8; DICOM decoding 
 MP_START_METHOD    = "spawn"  # "fork" starts faster but can deadlock after CUDA init
 DATALOADER_WORKERS = 2      # cache readers feeding the GPU (0 on Windows)
 EVAL_BATCH_STUDIES = 2      # studies per forward pass; lower it if the GPU runs out
+GPUS               = None   # None = every GPU of cuda:0's model (Kaggle T4 x2 -> 2); 1 = cuda:0 only
 AMP                = "auto" # auto|bf16|fp16|fp32
+{{CENTERS}}
 
 REQUIRE_PREP_MATCH = True   # abort if a checkpoint was trained on other pixels
 TIME_BUDGET_HOURS  = 8.0    # stop early and still write a submission before the limit
@@ -100,14 +102,17 @@ onnan jönnek. Egy modellel futtatáshoz szűkítsd a `CHECKPOINT_GLOB`-ot egyet
 """)
 
 code(r"""
+import copy
 import gc
 import glob
 import json
 import logging
 import multiprocessing
 import os
+import queue
 import shutil
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -233,6 +238,12 @@ cfg.set_dotted("train.num_workers", int(DATALOADER_WORKERS))
 cfg.set_dotted("train.prefetch_factor", None)
 cfg.set_dotted("train.eval_batch_studies", int(EVAL_BATCH_STUDIES))
 cfg.set_dotted("train.amp", AMP)
+# Slice windows per series: the checkpoints were trained with cfg.data.centers_per_series;
+# another value is an explicit, logged inference override (see load_checkpoint_for_inference).
+CENTERS_OVERRIDE = ()
+if CENTERS_PER_SERIES is not None and int(CENTERS_PER_SERIES) != int(cfg.data.centers_per_series):
+    cfg.set_dotted("data.centers_per_series", int(CENTERS_PER_SERIES))
+    CENTERS_OVERRIDE = ("data.centers_per_series",)
 
 resolve_paths(cfg)
 validate_config(cfg)
@@ -259,8 +270,21 @@ amit itt előállítunk — ez alapértelmezetten hiba, nem figyelmeztetés.
 """)
 
 code(r"""
-device_spec = select_device(cfg.train.amp)
-print(device_spec.describe())
+# One replica of every model per GPU: each GPU takes the next batch as soon as it is free
+# and runs the whole ensemble on it (data parallel), so unequal model costs need no balancing.
+# GPUS=None skips a different, smaller card next to the main one (e.g. a display GPU).
+if GPUS:
+    GPU_INDICES = list(range(min(torch.cuda.device_count(), int(GPUS))))
+else:
+    GPU_INDICES = [i for i in range(torch.cuda.device_count())
+                   if torch.cuda.get_device_name(i) == torch.cuda.get_device_name(0)]
+DEVICE_SPECS = (
+    [select_device(cfg.train.amp, "cuda:{}".format(i)) for i in GPU_INDICES]
+    if GPU_INDICES
+    else [select_device(cfg.train.amp)]
+)
+for spec in DEVICE_SPECS:
+    print(spec.describe())
 
 models = []
 ckpt_rows = []
@@ -280,7 +304,7 @@ for path in CHECKPOINTS:
     model_cfg.set_dotted("data.laterality_canonical", canonical)
     model_cfg.set_dotted("data.encoder_normalization", normalization)
     model_cfg.set_dotted("data.series_slots", list(slots))
-    model, payload = load_checkpoint_for_inference(model_cfg, path)
+    model, payload = load_checkpoint_for_inference(model_cfg, path, allow_data_overrides=CENTERS_OVERRIDE)
     stored_prep = str(payload.get("versions", {}).get("prep_hash", ""))
     if stored_prep and stored_prep != PREP_HASH:
         message = (
@@ -290,9 +314,11 @@ for path in CHECKPOINTS:
         if REQUIRE_PREP_MATCH:
             raise RuntimeError(message + " Set REQUIRE_PREP_MATCH=False to override.")
         LOG.warning(message)
-    model = model.to(device_spec.device).eval()
-    models.append(model)
-    MODEL_GROUPS.setdefault((canonical, normalization, slots), []).append(model)
+    # The checkpoint loads on the CPU; one copy per device, indexed like DEVICE_SPECS.
+    replicas = tuple(copy.deepcopy(model).to(spec.device).eval() for spec in DEVICE_SPECS)
+    del model
+    models.append(replicas)
+    MODEL_GROUPS.setdefault((canonical, normalization, slots), []).append(replicas)
     ckpt_rows.append(
         {
             "checkpoint": str(path),
@@ -309,7 +335,7 @@ for path in CHECKPOINTS:
     del payload
 
 print("\n{} checkpoint(s) loaded on {}; probabilities are averaged over them.".format(
-    len(models), device_spec.device))
+    len(models), ", ".join(str(spec.device) for spec in DEVICE_SPECS)))
 print(pd.DataFrame(ckpt_rows)[["checkpoint", "best_epoch", "best_score", "prep_hash", "laterality_canonical",
                                "encoder_normalization", "series_slots"]]
       .to_string(index=False))
@@ -396,13 +422,76 @@ csoport a saját encoderének normalizálásával olvas.
 """)
 
 code(r"""
-@torch.inference_mode()
-def predict_studies_ensemble(cfg, model_groups, study_ids, device_spec):
+def predict_batch(batch, spec, models):
+    '''Sum of the sigmoids of `models` (all on spec.device) for one batch.'''
+    # inference_mode and autocast are thread-local: entered here, inside the GPU's own thread.
+    with torch.inference_mode():
+        images = batch["images"].to(spec.device, non_blocking=True)
+        slice_valid = batch["slice_valid_mask"].to(spec.device, non_blocking=True)
+        present = batch["series_present_mask"].to(spec.device, non_blocking=True)
+        total = None
+        for model in models:
+            with autocast_ctx(spec):
+                logits = model(images, slice_valid, present)
+            probs = torch.sigmoid(logits.float())
+            total = probs if total is None else total + probs
+        return batch["study_ids"], total.cpu().numpy(), batch["meta"]
+
+
+def predict_on_devices(loader, device_specs, group):
+    '''Run every batch of `loader` through the group's models, one thread per GPU.
+
+    Each thread pulls the next batch as soon as its GPU is free. A study sits in exactly
+    one batch, so which GPU took it does not change its scores.
+    '''
+    if len(device_specs) == 1:
+        models = [replicas[0] for replicas in group]
+        return [predict_batch(batch, device_specs[0], models) for batch in loader]
+
+    inbox = queue.Queue(maxsize=len(device_specs))
+    results, errors = [], []
+
+    def worker(index):
+        spec = device_specs[index]
+        models = [replicas[index] for replicas in group]
+        torch.cuda.set_device(spec.device)
+        while True:
+            batch = inbox.get()
+            if batch is None:
+                return
+            if errors:          # keep draining so the feeder never blocks
+                continue
+            try:
+                results.append(predict_batch(batch, spec, models))
+            except BaseException as exc:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
+               for i in range(len(device_specs))]
+    for thread in threads:
+        thread.start()
+    try:
+        for batch in loader:
+            if errors:
+                break
+            inbox.put(batch)
+    finally:
+        for _ in threads:
+            inbox.put(None)
+        for thread in threads:
+            thread.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
+def predict_studies_ensemble(cfg, model_groups, study_ids, device_specs):
     '''Deterministic inference over one chunk; mean of the per-checkpoint sigmoids.
 
     `model_groups` maps (data.laterality_canonical, data.encoder_normalization, data.series_slots)
-    -> models: each group reads its own bags (plain or in the canonical medial/lateral frame, with
-    its encoder's normalisation and its slots), the mean runs over every model.
+    -> per-checkpoint replica tuples (one model per entry of `device_specs`): each group reads its
+    own bags (plain or in the canonical medial/lateral frame, with its encoder's normalisation and
+    its slots), the mean runs over every checkpoint.
     '''
     from torch.utils.data import DataLoader
 
@@ -423,19 +512,10 @@ def predict_studies_ensemble(cfg, model_groups, study_ids, device_spec):
             shuffle=False,
             num_workers=int(cfg.train.num_workers),
             collate_fn=collate_studies,
-            pin_memory=device_spec.device.type == "cuda",
+            pin_memory=device_specs[0].device.type == "cuda",
         )
-        for batch in loader:
-            images = batch["images"].to(device_spec.device, non_blocking=True)
-            slice_valid = batch["slice_valid_mask"].to(device_spec.device, non_blocking=True)
-            present = batch["series_present_mask"].to(device_spec.device, non_blocking=True)
-            total = None
-            for model in group:
-                with autocast_ctx(device_spec):
-                    logits = model(images, slice_valid, present)
-                probs = torch.sigmoid(logits.float())
-                total = probs if total is None else total + probs
-            for study, row, meta in zip(batch["study_ids"], total.cpu().numpy(), batch["meta"]):
+        for batch_ids, batch_probs, batch_meta in predict_on_devices(loader, device_specs, group):
+            for study, row, meta in zip(batch_ids, batch_probs, batch_meta):
                 totals[study] = totals.get(study, 0.0) + row
                 slots_present[study] = int(meta["n_present_slots"])
     ids = [s for s in order if s in totals]
@@ -452,7 +532,7 @@ def stage(prefix, name, detail, seconds):
     print("{}   {:<9} {:<44} {:6.1f} s".format(prefix, name, detail, seconds), flush=True)
 
 
-def process_chunk(cfg, model_groups, chunk_ids, series_meta, device_spec, chunk_dir, prefix=""):
+def process_chunk(cfg, model_groups, chunk_ids, series_meta, device_specs, chunk_dir, prefix=""):
     '''Manifest -> selection -> cache -> prediction for one chunk of studies.'''
     chunk_dir.mkdir(parents=True, exist_ok=True)
     models = [model for group in model_groups.values() for model in group]
@@ -492,7 +572,7 @@ def process_chunk(cfg, model_groups, chunk_ids, series_meta, device_spec, chunk_
           time.time() - started)
 
     if NEEDS_LATERALITY:
-        # Right/left knee per study (DICOM tag, else geometry) for the canonical-frame models.
+        # Right/left knee per study (geometry, else the DICOM tag vote of the selected series) for the canonical-frame models.
         started = time.time()
         cfg.set_dotted("paths.laterality_csv", str(chunk_dir / "laterality.csv"))
         sides = build_laterality(cfg, manifest, selection, workers=CACHE_WORKERS)
@@ -501,10 +581,10 @@ def process_chunk(cfg, model_groups, chunk_ids, series_meta, device_spec, chunk_
               time.time() - started)
 
     started = time.time()
-    ids, scores, slots_present = predict_studies_ensemble(cfg, model_groups, chunk_ids, device_spec)
+    ids, scores, slots_present = predict_studies_ensemble(cfg, model_groups, chunk_ids, device_specs)
     stage(prefix, "predict",
-          "{} {} x {} model(s)".format(
-              len(ids), "study" if len(ids) == 1 else "studies", len(models)),
+          "{} {} x {} model(s) on {} GPU(s)".format(
+              len(ids), "study" if len(ids) == 1 else "studies", len(models), len(device_specs)),
           time.time() - started)
     coverage = (
         selection[selected].groupby(STUDY_ID)["slot"].apply(list).to_dict()
@@ -575,7 +655,7 @@ for index, chunk_ids in enumerate(CHUNKS, 1):
         prefix, first, first + len(chunk_ids) - 1, len(study_ids)), flush=True)
     try:
         ids, scores, slots_present, coverage = process_chunk(
-            cfg, MODEL_GROUPS, chunk_ids, series_meta, device_spec,
+            cfg, MODEL_GROUPS, chunk_ids, series_meta, DEVICE_SPECS,
             WORK_DIR / "chunks" / "{:05d}".format(index), prefix,
         )
         pred_ids.extend(ids)
@@ -692,7 +772,8 @@ run_meta = {
     "chunk_failures": failures,
     "checkpoints": ckpt_rows,
     "preprocess_hash": PREP_HASH,
-    "device": device_spec.describe(),
+    "centers_per_series": int(cfg.data.centers_per_series),
+    "devices": [spec.describe() for spec in DEVICE_SPECS],
     "smoke_test_studies": SMOKE_TEST_STUDIES,
     "submission": str(out_path),
     "slot_coverage": (
@@ -719,7 +800,8 @@ md(r"""
 **Mennyi ideig fut?** A szűk keresztmetszet a DICOM dekódolás és a preprocessing, nem a
 GPU. A futás közben kiírt `studies/min` az első chunk után már reális — ebből látszik, hogy
 belefér-e az időkeretbe. Ha nem: `CHUNK_STUDIES` növelése nem segít, viszont a
-`data.centers_per_series` csökkentése (pl. 24 → 16) közel arányosan gyorsít a GPU oldalon,
+`CENTERS_PER_SERIES` csökkentése (pl. 48 → 24, a tanításkori érték) közel arányosan gyorsít a GPU oldalon
+(a 24 alá menés lokálisan már ront: 16-nál H3 −0.001),
 a `CHECKPOINT_GLOB` szűkítése (pl. csak az egyik család 3 foldja) pedig arányosan
 csökkenti a forward időt; a V2S forwardja kb. 3×, az R50-é szintén jóval drágább a B0-énál.
 {{FALLBACK}}
@@ -741,8 +823,18 @@ kiválasztva egy sorozat.
 Ha a rejtett teszt tömörített, a manifest hangosan elhasal — ilyenkor a `pylibjpeg`
 (vagy `gdcm`) wheel-eket dataset-ként kell csatolni, mert internet nincs.
 
-**GPU memória.** Alapértelmezetten `EVAL_BATCH_STUDIES=2`, ami studynként
-3 × 24 = 72 tripletet jelent, 320 × 320-on. Kevesebb memóriához vedd 1-re.
+**GPU memória.** Alapértelmezetten `EVAL_BATCH_STUDIES=2`, ami studynként legfeljebb
+3 × `CENTERS_PER_SERIES` (24-nél 72, 48-nál 144) tripletet jelent, 320 × 320-on; az encoder csak a
+valódi (nem kitöltő) ablakokon fut. Kevesebb memóriához vedd 1-re.
+
+**Több GPU (Kaggle T4 × 2).** `GPUS=None` mellett minden, a `cuda:0`-val azonos típusú GPU
+dolgozik (T4 × 2 esetén kettő). Minden GPU-n az összes modell egy-egy példánya van. Egy chunk
+batchein GPU-nként egy szál osztozik: amelyik GPU végzett, az veszi a következő batchet, és
+a teljes ensemble-t lefuttatja rajta. Egy study pontosan egy batchbe kerül, ezért az
+eredményt nem befolyásolja, melyik GPU számolta. Ez csak a `predict` szakaszt gyorsítja (ideális
+esetben kb. 2×). A manifest és a cache CPU-n fut, arra nincs hatással. Ha a `predict` sor nem
+rövidül, valószínűleg a betöltés a szűk keresztmetszet: ilyenkor a `DATALOADER_WORKERS`-t
+vedd 3–4-re. `GPUS=1` mellett a régi, egy GPU-s út fut.
 """)
 
 
@@ -830,6 +922,107 @@ pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és keret
 **V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga.""",
         "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
     },
+    "holdout4_v8_c0": {
+        "members": [
+            ("train_v8/B0_E3_img320_trainv8_holdout208_20261006_220251", "knee-b0-holdout-v8", SINGLE),
+            ("train_v8/R50_E3_img320_trainv8_holdout208_20261007_003442", "knee-r50-holdout-v8", SINGLE),
+            ("train_v8/V2S_E3_img320_trainv8_holdout208_20261007_053337", "knee-v2s-holdout-v8", SINGLE),
+            ("train_v8/C0_E3_img320_trainv8_s2_holdout208_20261010_153116", "knee-c0-holdout-v8", SINGLE),
+        ],
+        "desc": """A beküldött ensemble négy, foldok nélkül, a train_v8 címkén
+(a train_v6 Lixin blend a 208 radiológus-study nélkül, 4199 study; a jelentésben nem említett
+eltérések 0.25 helyett 0.07, a Synovitis kivételével) tanított modellből áll: a **holdout3_v8**
+három modellje, **B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret,
+side pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) +
+**V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), kiegészítve a **C0_E3**-mal
+(timm CoAtNet-0, hibrid MBConv + self-attention encoder, ugyanezzel a fejjel és kerettel, seed 2);
+a 4 modell sigmoid-átlaga. Lokálisan (ref208) H3 +0.0024.""",
+        "fallback": """Ha nem fér bele, a holdout3_v8 (a C0 nélkül, 3 modell) a tartalék.""",
+    },
+    "holdout5_v8_cnt12": {
+        "members": [
+            ("train_v8/R50_E3_img320_trainv8_holdout208_20261007_003442", "knee-r50-holdout-v8", SINGLE),
+            ("train_v8/V2S_E3_img320_trainv8_holdout208_20261007_053337", "knee-v2s-holdout-v8", SINGLE),
+            ("train_v8/C0_E3_img320_trainv8_s2_holdout208_20261010_153116", "knee-c0-holdout-v8", SINGLE),
+            ("train_v8/CNT12_lr4e-5_E3_img320_trainv8_holdout208_20261012_133340", "knee-cnt12-holdout-v8", SINGLE),
+            ("train_v8/CNT12_lr4e-5_E3_img320_trainv8_s2_holdout208_20261012_122058", "knee-cnt12s2-holdout-v8",
+             SINGLE),
+        ],
+        "desc": """A beküldött ensemble öt, foldok nélkül, a train_v8 címkén
+(a train_v6 Lixin blend a 208 radiológus-study nélkül, 4199 study; a jelentésben nem említett
+eltérések 0.25 helyett 0.07, a Synovitis kivételével) tanított modellből áll: a **holdout4_v8_c0**
+a B0 nélkül, **R50_E3** (RadImageNet ResNet-50, target attention, kanonikus mediális/laterális
+keret, side pooling, EMA) + **V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel) +
+**C0_E3** (timm CoAtNet-0, ugyanezzel a fejjel és kerettel, seed 2), a B0 helyén két
+**CNT12_E3**-mal (timm ConvNeXt-T, ImageNet-12k előtanítás, encoder lr 4e-5, ugyanezzel a fejjel
+és kerettel; seed 42 és seed 2); az 5 modell sigmoid-átlaga. Lokálisan (ref208) a holdout4_v8_c0-hoz
+képest +0.0016, a new-100-on +0.0034.""",
+        "fallback": """Ha nem fér bele, a holdout4_v8_c0 (4 modell) a tartalék.""",
+    },
+    "holdout4_v10_cnt12": {
+        "members": [
+            ("train_v10/CNT12_lr4e-5_E3_img320_trainv10_holdout220_20261013_180539", "knee-cnt12-holdout-v10", SINGLE),
+            ("train_v10/CNT12_lr4e-5_E3_img320_trainv10_s2_holdout220_20261013_215639", "knee-cnt12s2-holdout-v10",
+             SINGLE),
+            ("train_v10/V2S_E3_img320_trainv10_s2_holdout220_20261014_090914", "knee-v2s-holdout-v10", SINGLE),
+            ("train_v10/C0_E3_img320_trainv10_s2_holdout220_20261013_230729", "knee-c0-holdout-v10", SINGLE),
+        ],
+        "desc": """A beküldött ensemble négy, foldok nélkül, a train_v10 címkén
+(a train_v8 a 404 radiológus-study nélkül + 184 study radiológus-címkével, 4187 study; a 220-as
+kiegyensúlyozott radiológus-holdout nélkül) tanított modellből áll: két **CNT12_E3** (timm
+ConvNeXt-T, ImageNet-12k előtanítás, encoder lr 4e-5, target attention, kanonikus
+mediális/laterális keret, side pooling, EMA; seed 42 és seed 2) + **V2S_E3** (EfficientNetV2-S,
+ugyanezzel a fejjel és kerettel, seed 2) + **C0_E3** (timm CoAtNet-0, ugyanezzel a fejjel és
+kerettel, seed 2); a 4 modell sigmoid-átlaga (a CNT12 súlya így 1/2). A B0 és a R50 kimarad.
+Lokálisan a ref220-on 0.9094; a tiszta 114-es részen a holdout4_v8_c0-hoz képest +0.0036.""",
+        "fallback": """Ha nem fér bele, az egyik CNT12 elhagyása (3 modell) a tartalék.""",
+    },
+    "holdout3_v8_c48": {
+        "members": [
+            ("train_v8/B0_E3_img320_trainv8_holdout208_20261006_220251", "knee-b0-holdout-v8", SINGLE),
+            ("train_v8/R50_E3_img320_trainv8_holdout208_20261007_003442", "knee-r50-holdout-v8", SINGLE),
+            ("train_v8/V2S_E3_img320_trainv8_holdout208_20261007_053337", "knee-v2s-holdout-v8", SINGLE),
+        ],
+        "centers": 48,
+        "desc": """A beküldött ensemble a **holdout3_v8** három modellje, változatlan
+checkpointokkal, de sűrűbb szeletmintavétellel: sorozatonként **48** szeletablak a tanításkori 24
+helyett (48 szeletig ez minden szeletet jelent). A három modell, mind a train_v8 címkén (a train_v6
+Lixin blend a 208 radiológus-study nélkül, 4199 study), foldok nélkül tanítva: **B0_E3**
+(EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side pooling, EMA) +
+**R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) + **V2S_E3** (EfficientNetV2-S,
+ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga. Lokálisan (ref208) H3 +0.0008
+(nem szignifikáns, `doc/slice_coverage_check.md`).""",
+        "fallback": """A 48 ablak kb. 1.5× GPU-idő a 24-hez képest; ha nem fér bele,
+`CENTERS_PER_SERIES = None` (a tanításkori 24) a tartalék.""",
+    },
+    "holdout3_v9": {
+        "members": [
+            ("train_v9/B0_E3_img320_trainv9_holdout208_20261008_230157", "knee-b0-holdout-v9", SINGLE),
+            ("train_v9/R50_E3_img320_trainv9_holdout208_20261009_063915", "knee-r50-holdout-v9", SINGLE),
+            ("train_v9/V2S_E3_img320_trainv9_holdout208_20261009_082540", "knee-v2s-holdout-v9", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül, a train_v9 címkén
+(self-distillation: 0.7 · train_v8 + 0.3 · a V2S teacher 3-fold OOF predikciója, a 208
+radiológus-study nélkül, 4199 study) tanított modellből áll:
+**B0_E3** (EfficientNet-B0, target attention, kanonikus mediális/laterális keret, side
+pooling, EMA) + **R50_E3** (RadImageNet ResNet-50, ugyanezzel a fejjel és kerettel) +
+**V2S_E3** (EfficientNetV2-S, ugyanezzel a fejjel és kerettel), a 3 modell sigmoid-átlaga.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
+    "holdout3_v9_v2sv8": {
+        "members": [
+            ("train_v9/B0_E3_img320_trainv9_holdout208_20261008_230157", "knee-b0-holdout-v9", SINGLE),
+            ("train_v9/R50_E3_img320_trainv9_holdout208_20261009_063915", "knee-r50-holdout-v9", SINGLE),
+            ("train_v8/V2S_E3_img320_trainv8_holdout208_20261007_053337", "knee-v2s-holdout-v8", SINGLE),
+        ],
+        "desc": """A beküldött ensemble három, foldok nélkül tanított modellből áll
+(a 208 radiológus-study nélkül, 4199 study): **B0_E3** (EfficientNet-B0, target attention,
+kanonikus mediális/laterális keret, side pooling, EMA) és **R50_E3** (RadImageNet ResNet-50,
+ugyanezzel a fejjel és kerettel) a train_v9 címkén (self-distillation: 0.7 · train_v8 + 0.3 ·
+a V2S teacher 3-fold OOF predikciója), valamint **V2S_E3** (EfficientNetV2-S, ugyanezzel a
+fejjel és kerettel) a train_v8 címkén; a 3 modell sigmoid-átlaga.""",
+        "fallback": """Ez a legkisebb beküldött együttes (3 modell), időkeret-gond nem várható.""",
+    },
     "holdout3_v6_r50t1": {
         "members": [
             ("train_v6/B0_E3_img320_trainv6_holdout158_20261003_223313", "knee-b0-holdout-v6", SINGLE),
@@ -893,7 +1086,14 @@ def make_variants(ensemble: dict) -> dict:
         "{}  best.pt, config.yaml  ({})".format("{}/{}/".format(KAGGLE_DATASETS, ds).ljust(61), name)
         for ds, name in online_dirs
     )
-    shared = {"ENSEMBLE_DESC": ensemble["desc"], "FALLBACK": ensemble["fallback"]}
+    centers = ensemble.get("centers")
+    shared = {
+        "ENSEMBLE_DESC": ensemble["desc"],
+        "FALLBACK": ensemble["fallback"],
+        "CENTERS": "CENTERS_PER_SERIES = {:<7}# slice windows per series; None = as trained (24)".format(
+            str(centers)
+        ),
+    }
     return {
         "local": {
             "notebook": REPO / "notebooks" / "04_kaggle_test_local.ipynb",
@@ -954,6 +1154,7 @@ def render(source: str, variant: dict) -> str:
         .replace("{{LAYOUT}}", variant["layout"])
         .replace("{{ENSEMBLE_DESC}}", variant["ENSEMBLE_DESC"])
         .replace("{{FALLBACK}}", variant["FALLBACK"])
+        .replace("{{CENTERS}}", variant["CENTERS"])
     )
     return text.replace("knee_mri", variant["package"])
 
