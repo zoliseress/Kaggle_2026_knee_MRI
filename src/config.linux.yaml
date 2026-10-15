@@ -187,7 +187,7 @@ train:
   loss_normalization: "global"
   max_epochs: 25
   warmup_epochs: 2
-  early_stopping_patience: 5
+  early_stopping_patience: 3
   # Weight EMA per optimizer step (0 = off). The EMA weights are validated, selected and saved
   # as best.pt "model"; the raw weights are scored too (history *_raw). 0.999 ~ 1000 steps.
   ema_decay: 0.0
