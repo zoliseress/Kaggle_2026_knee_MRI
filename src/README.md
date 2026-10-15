@@ -346,7 +346,12 @@ difference of 1.0e-3 (mean 2.9e-5), i.e. bf16 autocast noise.
    * `coronal_t1` — non fat-suppressed spin-echo T1 (0 < TR < 1000 ms, 0 < TE < 30 ms, no
      GR/IR, no inversion time; missing headers never pass);
    * `sagittal_nonfs` (any `<plane>_nonfs`) — non fat-suppressed, non fluid-sensitive
-     spin-echo, ranked PD > T1 > T2 before the score; any other weighting is refused.
+     spin-echo, ranked PD > T1 > T2 before the score; any other weighting is refused;
+   * `sagittal_second` / `coronal_second` (any `<plane>_second`) — the plane's second series
+     (the public Raptor 5-slot layout, soft): another series than the plane slot's, ranked
+     nonfs PD > T1 > T2 > series csv `Fluid_Sensitive == 0` > anything else (fallback), so it
+     stays empty only when the plane has a single series. The 5-slot layout is
+     `[sagittal, sagittal_second, coronal, coronal_second, axial]`.
 
    A changed slot list needs its own selection csv and cache directory.
 3. **Preprocessing** (one versioned deterministic path, used for train and validation):

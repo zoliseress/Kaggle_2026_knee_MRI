@@ -33,7 +33,10 @@ PLANES = ["sagittal", "coronal", "axial"]
 #           inversion time; FS and fluid-sensitive flags known to be 0), ranked PD (TR >= 1000,
 #           TE < 60) > T1 (as t1) > T2 (TR >= 1000, TE >= 60) before the score
 #           (manifest.slot_filter_priority); any other weighting is refused.
-SLOT_FILTERS = ("t1", "nonfs")
+#   second - the plane's second series (soft, after the public Raptor 5-slot layout): any usable
+#           volume of another series than the plane slot's, ranked nonfs PD > T1 > T2 > series
+#           csv Fluid_Sensitive == 0 > anything else (fluid-sensitive / FS fallback).
+SLOT_FILTERS = ("t1", "nonfs", "second")
 
 
 def slot_plane(slot: str) -> str:

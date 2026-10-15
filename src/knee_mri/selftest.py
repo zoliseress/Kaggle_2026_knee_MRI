@@ -2207,7 +2207,7 @@ def check_laterality_rules() -> str:
 
 
 def check_laterality_derivation() -> str:
-    """Geometry first, the tag vote of the selected series second, unresolved otherwise; normal_x from the selected sagittal volume."""
+    """Geometry first, the plane slots' tag vote second, unresolved otherwise; normal_x from the selected sagittal volume."""
     from .laterality import derive_laterality
 
     manifest = pd.DataFrame(
@@ -2241,7 +2241,16 @@ def check_laterality_derivation() -> str:
     assert table.loc["e", "side"] == "R" and table.loc["e", "side_source"] == "tag", "2 R : 1 L among the selected series"
     assert table.loc["f", "side"] == "" and table.loc["f", "tag_side"] == "", "selected L : R is a tie; the unselected R must not vote"
     assert table.loc["a", "sagittal_normal_x"] == -1.0 and np.isnan(table.loc["c", "sagittal_normal_x"])
-    return "geometry wins, the selected series' tag vote fills in (ties and unselected series ignored), sagittal normal from the selected volume"
+
+    # An extra slot (5-slot layout) neither votes nor locates: f's R tag and far-right centre must not decide.
+    extra = pd.concat([selection, pd.DataFrame({STUDY_ID: ["f"], "slot": ["coronal_second"], "volume_id": ["f_other"],
+                                                "selected": [True], "path": ["f_other"]})], ignore_index=True)
+    centre_x["f_other"] = -80.0
+    with_extra = derive_laterality(manifest, extra, min_offset_mm=20.0, workers=1, center_x_reader=centre_x.get).set_index(STUDY_ID)
+    assert with_extra.loc["f", "side"] == "" and with_extra.loc["f", "tag_side"] == "", "an extra slot changed the side"
+    assert with_extra.equals(table), "extra slots changed the table"
+    return ("geometry wins, the plane slots' tag vote fills in (ties, unselected series and extra slots ignored), "
+            "sagittal normal from the selected volume")
 
 
 def check_override_keys() -> str:
@@ -2502,6 +2511,68 @@ def check_nonfs_slot_selection(cfg: Config, tmp_dir) -> str:
     else:
         raise AssertionError("fluid_te_preference=t1 was accepted")
     return "sagittal_nonfs = non-FS spin echo, PD > T1 > T2, FS/fluid/GRE/IR/missing headers or csv refused (also without the fluid bonus), no duplicate; te preference pd -> PDFS"
+
+
+def check_second_slot_selection(cfg: Config, tmp_dir) -> str:
+    """<plane>_second (Raptor 5-slot layout): nonfs PD > T1 > T2 > csv non-fluid > fluid fallback, another series."""
+    from .manifest import select_series
+
+    def volume(study, vid, plane, tr, te, seq="SE", fluid=0, fat=0, key="g0"):
+        return {STUDY_ID: study, SERIES_ID: f"{study}.{vid}", "volume_id": f"{study}.{vid}#{key}", "volume_key": key,
+                "path": f"/{study}/{vid}", "plane": plane, "series_description": vid, "echo_time": te,
+                "repetition_time": tr, "scanning_sequence": seq, "scan_options": "", "n_slices": 24,
+                "row_spacing_mm": 0.4, "col_spacing_mm": 0.4, "plane_angle_deg": 1.0, "quality_flags": "",
+                "usable": True, "normal_x": -1.0, "_fluid": fluid, "_fat": fat}
+
+    def pdfs(study, plane="sagittal"):
+        return volume(study, f"{plane[:3]}_pdfs", plane, 3000, 35, fluid=1, fat=1)
+
+    rows = [
+        # a: non-FS PD beats T1 and T2 (and the T2's better TE score); coronal_second takes the coronal PD
+        pdfs("a"), volume("a", "sag_t2", "sagittal", 4000, 80), volume("a", "sag_t1", "sagittal", 600, 10),
+        volume("a", "sag_pd", "sagittal", 3000, 30), pdfs("a", "coronal"), volume("a", "cor_pd", "coronal", 3000, 30),
+        pdfs("a", "axial"),
+        # b: no strict nonfs candidate - a csv non-fluid GRE beats a fluid-sensitive T2 FS
+        pdfs("b"), volume("b", "sag_gre", "sagittal", 500, 5, seq="GR"),
+        volume("b", "sag_t2fs", "sagittal", 4000, 80, fluid=1, fat=1),
+        # c: only fluid-sensitive series left - the soft fallback still fills the slot
+        pdfs("c"), volume("c", "sag_stir", "sagittal", 4000, 40, seq="['IR', 'SE']", fluid=1, fat=1),
+        # d: a single sagittal series - nothing to add
+        pdfs("d"),
+        # e: one series split into two volumes - its second stack is not a second series
+        pdfs("e"), volume("e", "sag_pdfs", "sagittal", 3000, 35, fluid=1, fat=1, key="g1"),
+    ]
+    manifest = pd.DataFrame(rows)
+    meta = pd.DataFrame({SERIES_ID: manifest[SERIES_ID], "Fluid_Sensitive": manifest["_fluid"],
+                         "Fat_Suppression": manifest["_fat"]}).drop_duplicates(SERIES_ID)
+    manifest = manifest.drop(columns=["_fluid", "_fat"])
+
+    five = cfg.copy()
+    five.data.series_slots = ["sagittal", "sagittal_second", "coronal", "coronal_second", "axial"]
+    validate_config(five)
+    selection = select_series(five, manifest, meta, out_path=Path(tmp_dir) / "selection_second.csv")
+    chosen = {(r[STUDY_ID], r["slot"]): (r["volume_id"] if r["selected"] else None) for _, r in selection.iterrows()}
+    priority = {(r[STUDY_ID], r["slot"]): r.get("filter_priority") for _, r in selection.iterrows()}
+    assert chosen[("a", "sagittal")] == "a.sag_pdfs#g0", chosen
+    assert chosen[("a", "sagittal_second")] == "a.sag_pd#g0" and priority[("a", "sagittal_second")] == 4, chosen
+    assert chosen[("a", "coronal_second")] == "a.cor_pd#g0", chosen
+    assert chosen[("b", "sagittal_second")] == "b.sag_gre#g0" and priority[("b", "sagittal_second")] == 1, chosen
+    assert {chosen[("c", "sagittal")], chosen[("c", "sagittal_second")]} == {"c.sag_pdfs#g0", "c.sag_stir#g0"}, chosen
+    assert priority[("c", "sagittal_second")] == 0, priority
+    assert chosen[("d", "sagittal_second")] is None, chosen
+    assert chosen[("e", "sagittal_second")] is None, f"another stack of the same series: {chosen[('e', 'sagittal_second')]}"
+    assert list(selection[selection[STUDY_ID] == "a"]["slot"]) == list(five.data.series_slots), "rows must follow the slot order"
+
+    three = cfg.copy()
+    three.data.series_slots = ["sagittal", "coronal", "axial"]
+    base = select_series(three, manifest, meta, out_path=Path(tmp_dir) / "selection_second_base.csv")
+    same = selection[selection["slot"].isin(three.data.series_slots)].reset_index(drop=True)
+    base = base.set_index([STUDY_ID, "slot"]).loc[list(zip(same[STUDY_ID], same["slot"]))].reset_index()
+    assert same[["slot", "volume_id", "selected"]].equals(base[["slot", "volume_id", "selected"]]), "plane slots changed"
+
+    model = _tiny_model(five)
+    assert model.slot_sides == ("zones", "zones", "halves", "halves", "halves"), model.slot_sides
+    return "second = another series of the plane, nonfs PD > T1 > T2 > csv non-fluid > fluid fallback; plane slots unchanged; sagittal_second pools by depth zone"
 
 
 def check_unselected_cache_removed(cfg: Config, tmp_dir) -> str:
@@ -4441,6 +4512,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("override_keys", check_override_keys),
             ("filtered_slot_selection", lambda: check_filtered_slot_selection(small, tmp_dir)),
             ("nonfs_slot_selection", lambda: check_nonfs_slot_selection(small, tmp_dir)),
+            ("second_slot_selection", lambda: check_second_slot_selection(small, tmp_dir)),
             ("knee_consistent_selection", lambda: check_knee_consistent_selection(small, tmp_dir)),
             ("non_knee_selection", lambda: check_non_knee_selection(small, tmp_dir)),
             ("sagittal_own_normal", lambda: check_sagittal_own_normal(small, tmp_dir)),

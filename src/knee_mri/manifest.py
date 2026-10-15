@@ -426,6 +426,9 @@ def passes_slot_filter(df: pd.DataFrame, slot_filter_name: str) -> pd.Series:
         known = (h["tr"] > 0) & (h["te"] > 0)
         base = h["spin_echo"] & known & ~h["inversion"] & ~h["fat_suppressed"] & h["meta_not_fs_not_fluid"]
         return base & (slot_filter_priority(df, "nonfs") >= 0)
+    if slot_filter_name == "second":
+        # Soft: every usable volume may fill it; slot_filter_priority holds the preference.
+        return pd.Series(True, index=df.index, dtype=bool)
     raise ValueError(f"unknown slot filter {slot_filter_name!r}")
 
 
@@ -434,8 +437,17 @@ def slot_filter_priority(df: pd.DataFrame, slot_filter_name: str) -> pd.Series:
 
     nonfs: PD 2 > T1 1 > T2 0 (the radiologists' meniscus/cartilage preference for non-FS PD,
     T1 next for fracture lines and marrow); -1 = none of them, which the nonfs filter refuses.
+    second: a strict nonfs candidate 4/3/2 (PD/T1/T2) > series csv Fluid_Sensitive == 0 1 >
+    anything else 0 (the soft fallback; the second filter refuses nothing).
     Other filters: 0.
     """
+    if slot_filter_name == "second":
+        fluid = df["meta_fluid_sensitive"] if "meta_fluid_sensitive" in df.columns else pd.Series(np.nan, index=df.index)
+        priority = pd.Series(0, index=df.index, dtype=int)
+        priority[pd.to_numeric(fluid, errors="coerce") == 0] = 1
+        strict = passes_slot_filter(df, "nonfs")
+        priority[strict] = 2 + slot_filter_priority(df, "nonfs")[strict]
+        return priority
     if slot_filter_name != "nonfs":
         return pd.Series(0, index=df.index, dtype=int)
     h = _sequence_headers(df)
@@ -630,6 +642,9 @@ def select_series(
                 taken = by_slot.get(plane, {}).get("volume_id")
                 if taken is not None and not pd.isna(taken):
                     candidates = candidates[candidates["volume_id"].astype(str) != str(taken)]
+                    if filter_name == "second":
+                        # A second series, not another volume (stack) of the plane slot's series.
+                        candidates = candidates[candidates[SERIES_ID].astype(str) != str(by_slot[plane][SERIES_ID])]
             n_candidates = int(len(candidates))
             if not n_candidates:
                 if filter_name is not None:
@@ -711,7 +726,8 @@ def select_series(
         "selected_per_slot": present.groupby("slot").size().to_dict() if len(present) else {},
         "studies_with_both_knees": int(selection.loc[selection["knee_filter"].fillna("") != "", STUDY_ID].nunique()),
     }
-    atomic_write_json(out_path.with_name("series_selection_summary.json"), coverage)
+    # Named after the table, so a separate selection csv does not overwrite the default's summary.
+    atomic_write_json(out_path.with_name(f"{out_path.stem}_summary.json"), coverage)
     LOG.info("Series selection written: %s | coverage: %s", out_path, coverage)
     return selection
 

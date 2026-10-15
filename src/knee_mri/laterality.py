@@ -11,7 +11,9 @@ Side of the knee, in this order:
      coordinates. The knee lies off the midline, x < 0 is the patient's right. Within
      `min_offset_mm` of the midline geometry gives no side;
   2. otherwise the DICOM `Laterality` / `ImageLaterality` tag, majority vote over the
-     SELECTED series only (a tie gives no side);
+     series SELECTED for the plane slots only (sagittal/coronal/axial; a tie gives no side).
+     Filtered extra slots (`coronal_t1`, `sagittal_second`, ...) do not vote, so the side
+     does not depend on the slot list: 3- and 5-slot models get the same frame;
   3. unresolved studies are left as they are (no flip).
 Geometry comes first because the tag is typed in at the scanner and is wrong more often:
 on the 2134 training studies with both, they disagree in 31; a radiologist review of the 29
@@ -37,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
-from .constants import STUDY_ID
+from .constants import STUDY_ID, slot_filter
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
 LATERALITY_COLUMNS = [
@@ -119,7 +121,9 @@ def derive_laterality(
 
     tags: pd.Series | dict = {}
     if "laterality" in manifest:
-        selected_tags = selected[[STUDY_ID, "volume_id"]].merge(
+        # Plane slots only: an extra slot's series must not change the side (module docstring).
+        voters = selected[selected["slot"].map(lambda s: slot_filter(s) is None)]
+        selected_tags = voters[[STUDY_ID, "volume_id"]].merge(
             manifest[[STUDY_ID, "volume_id", "laterality"]].drop_duplicates([STUDY_ID, "volume_id"]),
             on=[STUDY_ID, "volume_id"],
             how="left",

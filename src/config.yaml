@@ -86,7 +86,7 @@ selection:
 data:
   image_size: 224
   fov_mm: 150.0
-  # optional extra slots (constants.SLOT_FILTERS): "coronal_t1" (non-FS T1), "sagittal_nonfs" (non-FS PD > T1 > T2)
+  # optional extra slots (constants.SLOT_FILTERS): "coronal_t1" (non-FS T1), "sagittal_nonfs" (non-FS PD > T1 > T2), "<plane>_second" (soft 2nd series, non-fluid first)
   series_slots: ["sagittal", "coronal", "axial"]
   centers_per_series: 24
   adjacent_slices: 3
