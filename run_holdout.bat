@@ -2,32 +2,39 @@
 setlocal enabledelayedexpansion
 REM ======================================================================
 REM  Fix train/val felosztas, egyetlen futas (nincs fold-ciklus, nincs OOF):
-REM     tanitas  : train_v8.csv            (4199 study)
-REM     validacio: train_labeled_208_reference.csv  (208 radiologus-cimkezett study)
-REM  Az early stopping es a best.pt is a 208-on mert macro_soft_auc alapjan
+REM     tanitas  : train_v11.csv           (3957 study = train_v8 - a 242 uj referencia)
+REM     validacio: train_labeled_450_reference.csv  (450 radiologus-cimkezett study
+REM                = eredeti 208 + 242 uj; rsna_reference_450_package.zip)
+REM  Az early stopping es a best.pt is a 450-en mert macro_soft_auc alapjan
 REM  valaszt, ezert az ott mert ertek enyhen optimista.
+REM  A run vegi riport (report.html, subset_summary.csv, subset_metrics_per_class.csv)
+REM  kulon is kiadja a full_450, original_208 es new_242 eredmenyt
+REM  (paths.reference_subsets_csv = notebooks/reference_450_manifest.csv).
 REM  A 3-fold CV (run_cv.bat) ettol fuggetlen, valtozatlanul hasznalhato.
 REM
 REM  Hasznalat:
 REM     run_holdout.bat
 REM     run_holdout.bat E3_img320 --set data.image_size=320
 REM  Ha az elso argumentum nem "-"-vel kezdodik, az a run nevenek elotagja:
-REM     E3_img320_holdout208_<idobelyeg>
+REM     E3_img320_holdout450_<idobelyeg>
 REM
 REM  Folytatas (--resume <run nev>, csak elso argumentumkent): egy megszakadt
 REM  run a last.pt-bol folytatodik ugyanabban a mappaban (train.resume,
 REM  epochhatarrol; a felbehagyott epoch elveszik):
-REM     run_holdout.bat --resume E3_img320_holdout208_20261005_143722 --set data.image_size=320
+REM     run_holdout.bat --resume E3_img320_holdout450_20261015_143722 --set data.image_size=320
 REM  Az extra argumentumok es a kornyezeti valtozok ugyanazok legyenek, mint az
 REM  eredeti inditasnal; az elteres a resume-ellenorzesen elakad.
 REM
 REM  Az elso futas elokesziti (ha meg nincsenek meg):
-REM     SPLITS     - make-fixed-split (train_v8 = fold 1, 208 = fold 0)
-REM     FROZEN_REF - freeze-reference --from-csv a 208-as CSV-bol
+REM     SPLITS     - make-fixed-split (train_v11 = fold 1, 450 = fold 0)
+REM     FROZEN_REF - freeze-reference --from-csv a 450-es CSV-bol
 REM  DATA_ROOT, TRAIN_CSV, VAL_CSV, SPLITS, FROZEN_REF kornyezeti
 REM  valtozokkal felulirhato.
-REM  HOLDOUT (alap: 208 = 158 + Andrew 50) valasztja a referenciahalmazt;
+REM  HOLDOUT (alap: 450 = eredeti 208 + 242 uj) valasztja a referenciahalmazt;
 REM  VAL_CSV, SPLITS, FROZEN_REF es a run neve (holdout<HOLDOUT>) ebbol kepzodik.
+REM  Regi 208-as holdout (train_v8-hoz, a korabbi runokkal osszevetheto):
+REM     set HOLDOUT=208
+REM     set TRAIN_CSV=F:\Kaggle\data\train_v8.csv
 REM  Regi 158-as holdout (train_v4/v6-hoz):
 REM     set HOLDOUT=158
 REM     set TRAIN_CSV=F:\Kaggle\data\train_v6.csv
@@ -38,8 +45,8 @@ set "ROOT=%~dp0"
 set "CONDA_ENV=kaggle_2026"
 set "CONDA_ROOT=%LOCALAPPDATA%\miniconda3"
 if not defined DATA_ROOT set "DATA_ROOT=F:\Kaggle\data"
-if not defined TRAIN_CSV set "TRAIN_CSV=%DATA_ROOT%\train_v8.csv"
-if not defined HOLDOUT set "HOLDOUT=208"
+if not defined TRAIN_CSV set "TRAIN_CSV=%DATA_ROOT%\train_v11.csv"
+if not defined HOLDOUT set "HOLDOUT=450"
 if not defined VAL_CSV set "VAL_CSV=%DATA_ROOT%\train_labeled_%HOLDOUT%_reference.csv"
 if not defined SPLITS set "SPLITS=%ROOT%work\splits\holdout%HOLDOUT%\splits.csv"
 if not defined FROZEN_REF set "FROZEN_REF=%ROOT%work\labels\frozen_reference_ref%HOLDOUT%.csv"
@@ -57,7 +64,7 @@ goto :parsed
 
 :parse_resume
 if "%~2"=="" (
-    echo [HIBA] A --resume utan meg kell adni a run nevet, pl. B0_E3_img320_holdout208_20261005_143722
+    echo [HIBA] A --resume utan meg kell adni a run nevet, pl. B0_E3_img320_holdout450_20261015_143722
     exit /b 1
 )
 set "RESUME=%~2"

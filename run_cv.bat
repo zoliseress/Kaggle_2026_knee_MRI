@@ -29,9 +29,13 @@ REM     SPLITS     (alap: work\splits\cv<NFOLDS>_<train_csv stem>\splits.csv)
 REM  Ha a SPLITS meg nincs meg, a script legyartja (make-splits a TRAIN_CSV
 REM  studyjaibol, NFOLDS folddal), majd minden inditasnal ellenorzi
 REM  (check-splits): a fold-szam, a TRAIN_CSV es a kizarasi lista
-REM  (paths.exclude_from_training_csv, alap: a ref208) egyezzen.
-REM  Teacher CV (3 fold = alap, ref208 nelkul, a train_v8.csv-bol):
+REM  (paths.exclude_from_training_csv, alap: a ref450) egyezzen.
+REM  Teacher CV (3 fold = alap, ref450 nelkul, a train_v11.csv-bol, cv3_train_v11 split):
 REM     run_cv.bat B0_teacher --set data.image_size=320
+REM  Regi, train_v8-as (cv3_train_v8) run-group folytatasa (a 242 uj referencia
+REM  abban tanitott, ezert a kizaras a ref208 marad):
+REM     set TRAIN_CSV=F:\Kaggle\data\train_v8.csv
+REM     run_cv.bat --resume ... --set paths.exclude_from_training_csv=notebooks/train_labeled_208_reference.csv
 REM  Regi, 4407 studys work\splits\splits.csv-vel indult run-group folytatasa
 REM  (a ref208 abban tanitott, ezert a kizarast is ki kell kapcsolni):
 REM     set SPLITS=%~dp0work\splits\splits.csv
