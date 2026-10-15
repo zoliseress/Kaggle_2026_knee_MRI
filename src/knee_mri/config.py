@@ -143,6 +143,7 @@ def resolve_paths(cfg: Config) -> Config:
         "reference_csv",
         "frozen_reference_csv",
         "exclude_from_training_csv",
+        "reference_subsets_csv",
         "label_mask_csv",
         "laterality_csv",
         "series_selection_csv",

@@ -15,7 +15,8 @@ paths:
   # train_csv: "F:/Kaggle/data/train_v1.csv"   # binary labels (default: <data_root>/train.csv)
   # train_csv: "F:/Kaggle/data/train_v2.csv"     # soft labels
   # train_csv: "F:/Kaggle/data/train_v7.csv"     # soft labels (train_v6 Lixin blend without the 208 reference studies)
-  train_csv: "F:/Kaggle/data/train_v8.csv"     # soft labels (train_v7 with not-mentioned findings 0.25 -> 0.07, Synovitis kept)
+  # train_csv: "F:/Kaggle/data/train_v8.csv"     # soft labels (train_v7 with not-mentioned findings 0.25 -> 0.07, Synovitis kept)
+  train_csv: "F:/Kaggle/data/train_v11.csv"    # soft labels (train_v8 without the 242 new reference studies)
   train_series_csv: null           # default: <data_root>/train_series.csv
 
   # Report-extraction exports (optional; see README "Label adapters").
@@ -27,10 +28,14 @@ paths:
   # held out from image training only with split.holdout_reference=true (default false).
   reference_csv: "notebooks/train_labeled_158_reference.csv"
   # Studies that must never be training studies (train.py stops when the splits.csv in use puts
-  # one of them in the training pool). The 208 radiologist reference is the evaluation set, also
-  # for students trained on teacher pseudo-labels, so every teacher must leave it out too.
+  # one of them in the training pool). The 450 radiologist reference (original 208 + 242 new) is
+  # the evaluation set, also for students trained on teacher pseudo-labels, so every teacher must
+  # leave it out too. Legacy runs on train_v8 splits: notebooks/train_labeled_208_reference.csv.
   # Empty value = no check, e.g. to resume a legacy run trained on the 4407-study CV split.
-  exclude_from_training_csv: "notebooks/train_labeled_208_reference.csv"
+  exclude_from_training_csv: "notebooks/train_labeled_450_reference.csv"
+  # StudyInstanceUID -> subset (original_208 | new_242): the run report adds per-subset
+  # validation metrics next to the full set (subset_summary.csv). Empty value = full set only.
+  reference_subsets_csv: "notebooks/reference_450_manifest.csv"
   # Studies whose labels are masked (all 12 targets unknown, weight 0) in training and in
   # validation; their images still load. Now: the 7 studies holding both knees, where the report
   # label cannot be tied to the selected knee, and 1 study whose leg was scanned rotated 90 deg

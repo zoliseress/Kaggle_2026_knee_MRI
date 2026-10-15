@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .constants import N_TARGETS, TARGETS
+from .constants import N_TARGETS, STUDY_ID, TARGETS
 
 BCE_EPS = 1e-7
 
@@ -257,6 +257,62 @@ def evaluate_predictions(
         ),
     }
     return table, summary
+
+
+SUBSET_COLUMNS = ("n_pos", "n_neg", "n_soft", "roc_auc", "soft_auc")
+
+
+def subset_metrics(
+    predictions: pd.DataFrame,
+    subsets: pd.DataFrame | None,
+    threshold: float = 0.5,
+    min_support: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Validation metrics on the whole prediction set and on each reference subset.
+
+    `predictions` is the long per-(study, target) frame of `validation_predictions.csv`;
+    `subsets` maps STUDY_ID -> `subset` (e.g. the reference_450 manifest). The first slice,
+    `full_<N>`, is computed directly from every prediction - never averaged from the subsets -
+    and each subset reuses the same per-cell validity, so a masked cell stays masked everywhere.
+    Subsets without any validation study are left out. Returns the per-target long table
+    (subset, target, n_pos, n_neg, n_soft, roc_auc, soft_auc) and one summary row per slice.
+    """
+    wide = {
+        column: predictions.pivot(index=STUDY_ID, columns="target", values=column)[list(TARGETS)]
+        for column in ("score", "reference", "reference_valid")
+    }
+    ids = wide["score"].index.astype(str)
+    slices = [(f"full_{len(ids)}", np.ones(len(ids), dtype=bool))]
+    if subsets is not None and len(subsets):
+        membership = subsets.assign(**{STUDY_ID: subsets[STUDY_ID].astype(str)}).set_index(STUDY_ID)["subset"]
+        for name in pd.unique(membership):
+            mask = ids.isin(membership.index[membership == name])
+            if mask.any():
+                slices.append((str(name), np.asarray(mask)))
+
+    tables, rows = [], []
+    for name, mask in slices:
+        table, summary = evaluate_predictions(
+            wide["score"].to_numpy(float)[mask],
+            wide["reference"].to_numpy(float)[mask],
+            wide["reference_valid"].to_numpy(bool)[mask],
+            threshold=threshold,
+            min_support=min_support,
+        )
+        tables.append(table[["target", *SUBSET_COLUMNS]].assign(subset=name))
+        rows.append(
+            {
+                "subset": name,
+                "n_studies": summary["n_studies"],
+                "n_evaluable_studies": int(wide["reference_valid"].to_numpy(bool)[mask].any(axis=1).sum()),
+                "macro_soft_auc": summary["macro_soft_auc"],
+                "macro_roc_auc": summary["macro_roc_auc"],
+                "n_defined_targets": summary["n_defined_targets"],
+                "undefined_targets": ",".join(summary["undefined_targets"]),
+            }
+        )
+    per_class = pd.concat(tables, ignore_index=True)[["subset", "target", *SUBSET_COLUMNS]]
+    return per_class, pd.DataFrame(rows)
 
 
 def soft_target_warning(kinds: np.ndarray) -> str | None:

@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 
 from .constants import STUDY_ID, TARGETS
-from .utils import LOG, atomic_write_text
+from .metrics import subset_metrics
+from .utils import LOG, atomic_write_dataframe, atomic_write_text
 
 
 def _matplotlib():
@@ -158,6 +159,44 @@ def _table_html(df: pd.DataFrame, float_format: str = "{:.4f}") -> str:
     return df.to_html(index=False, float_format=lambda v: float_format.format(v), na_rep="NA", border=0)
 
 
+def write_subset_metrics(
+    run_dir: Path,
+    predictions: pd.DataFrame,
+    subsets: pd.DataFrame | None,
+    threshold: float = 0.5,
+    min_support: int = 1,
+) -> str:
+    """`subset_summary.csv` + `subset_metrics_per_class.csv` in the run dir; returns the HTML section.
+
+    Without a subset table there is only the full slice, which `metrics_per_class.csv` already
+    covers, so nothing is written.
+    """
+    if subsets is None or not len(predictions):
+        return ""
+    per_class, summary = subset_metrics(predictions, subsets, threshold=threshold, min_support=min_support)
+    atomic_write_dataframe(per_class, run_dir / "subset_metrics_per_class.csv")
+    atomic_write_dataframe(summary, run_dir / "subset_summary.csv")
+
+    names = list(summary["subset"])
+    wide = pd.DataFrame({"target": list(TARGETS)})
+    for name in names:
+        part = per_class[per_class["subset"] == name].set_index("target").loc[list(TARGETS)]
+        wide[f"{name} AUC"] = part["soft_auc"].to_numpy(float)
+        wide[f"{name} pos/neg"] = [f"{p}/{n}" for p, n in zip(part["n_pos"], part["n_neg"])]
+    macro = {"target": "macro (soft AUC)"}
+    for name, row in summary.set_index("subset").iterrows():
+        macro[f"{name} AUC"] = row["macro_soft_auc"]
+        macro[f"{name} pos/neg"] = f"{row['n_evaluable_studies']}/{row['n_studies']} studies"
+    wide = pd.concat([pd.DataFrame([macro]), wide], ignore_index=True)
+    return (
+        "<h2>Validation metrics by reference subset</h2><p>Same best-checkpoint predictions and per-cell "
+        f"mask in every column. <code>{html.escape(names[0])}</code> is computed directly from all "
+        "predictions, not averaged from the subsets. AUC = soft ROC-AUC (equals ROC-AUC on a binary "
+        "reference); pos/neg = hard reference cells; the macro row shows evaluable/all studies.</p>"
+        + _table_html(wide)
+    )
+
+
 def _backbone(run_dir: Path) -> str:
     """The run's encoder from its saved config.yaml; a neutral label when unreadable."""
     try:
@@ -174,8 +213,14 @@ def build_html_report(
     qc_dir: str | Path | None = None,
     label_counts: pd.DataFrame | None = None,
     out_name: str = "report.html",
+    subsets: pd.DataFrame | None = None,
+    threshold: float = 0.5,
+    min_support: int = 1,
 ) -> Path:
-    """Assemble one offline HTML file from the artefacts a run already wrote."""
+    """Assemble one offline HTML file from the artefacts a run already wrote.
+
+    `subsets` (STUDY_ID, subset) adds the per-subset validation breakdown (`write_subset_metrics`).
+    """
     run_dir = Path(run_dir).resolve()
     summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8")) if (run_dir / "run_summary.json").exists() else {}
     history = pd.read_csv(run_dir / "history.csv") if (run_dir / "history.csv").exists() else pd.DataFrame()
@@ -221,6 +266,9 @@ def build_html_report(
         sections.append("<h2>Label counts per target</h2>" + _table_html(label_counts, "{:.3f}"))
     if len(metrics):
         sections.append("<h2>Validation metrics per target</h2>" + _table_html(metrics))
+    subset_section = write_subset_metrics(run_dir, predictions, subsets, threshold, min_support)
+    if subset_section:
+        sections.append(subset_section)
     for title, path in figures:
         sections.append(f"<h2>{title}</h2><img src='{relative(path)}' style='max-width:100%'>")
     if len(history):
@@ -271,4 +319,13 @@ def build_run_report(cfg: Any, run_dir: str | Path, qc_dir: str | Path | None = 
     counts_path = Path(cfg.paths.work_dir) / "schema" / "labels_counts.csv"
     counts = pd.read_csv(counts_path) if counts_path.exists() else None
     qc_dir = qc_dir or Path(cfg.paths.work_dir) / "qc"
-    return build_html_report(run_dir, qc_dir=qc_dir, label_counts=counts)
+    subsets_path = cfg.paths.get("reference_subsets_csv")
+    subsets = pd.read_csv(subsets_path, dtype={STUDY_ID: "string"}, encoding="utf-8-sig") if subsets_path else None
+    return build_html_report(
+        run_dir,
+        qc_dir=qc_dir,
+        label_counts=counts,
+        subsets=subsets,
+        threshold=float(cfg.eval.threshold),
+        min_support=int(cfg.eval.min_class_support),
+    )
