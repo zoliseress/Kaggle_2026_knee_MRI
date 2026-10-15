@@ -1181,6 +1181,64 @@ def check_soft_auc_matches_roc_auc() -> str:
     return "soft ROC-AUC equals ROC-AUC on binary references, NA on a single class"
 
 
+def check_subset_metrics(tmp_dir) -> str:
+    """Per-subset validation report: the full slice is computed directly from every prediction,
+    each subset keeps the same per-cell mask, an absent subset is skipped, a one-class target is NA."""
+    from pathlib import Path
+
+    from .metrics import subset_metrics
+    from .report import build_html_report
+
+    rng = np.random.default_rng(3)
+    n = 40
+    ids = [f"s{i:02d}" for i in range(n)]
+    reference = rng.integers(0, 2, size=(n, N_TARGETS)).astype(float)
+    reference[[0, 20], :] = 0.0
+    reference[[1, 21], :] = 1.0  # both classes in each half for every target ...
+    reference[:20, -1] = 0.0  # ... except the last target, single-class in the first half
+    scores = np.clip(0.6 * reference + 0.4 * rng.random((n, N_TARGETS)), 0.0, 1.0)
+    valid = np.ones((n, N_TARGETS), dtype=bool)
+    valid[39, :] = False  # a label-masked study
+    valid[5, 2] = False  # a single masked cell
+    predictions = pd.DataFrame(
+        {
+            STUDY_ID: np.repeat(ids, N_TARGETS),
+            "target": np.tile(TARGETS, n),
+            "score": scores.ravel(),
+            "reference": reference.ravel(),
+            "reference_valid": valid.ravel(),
+        }
+    )
+    subsets = pd.DataFrame(
+        {STUDY_ID: ids + ["unseen"], "subset": ["first"] * 20 + ["second"] * 20 + ["absent"]}
+    )
+    per_class, summary = subset_metrics(predictions, subsets)
+    assert list(summary["subset"]) == [f"full_{n}", "first", "second"], summary["subset"].tolist()
+    table, direct = evaluate_predictions(scores, reference, valid)
+    full = summary.iloc[0]
+    assert math.isclose(full["macro_soft_auc"], direct["macro_soft_auc"]), "full slice must be computed directly"
+    full_rows = per_class[per_class["subset"] == f"full_{n}"].set_index("target")
+    assert np.allclose(full_rows.loc[list(TARGETS), "soft_auc"], table["soft_auc"], equal_nan=True)
+    for column in ("n_pos", "n_neg"):
+        by_subset = per_class[per_class["subset"] != f"full_{n}"].groupby("target")[column].sum()
+        assert (by_subset.loc[list(TARGETS)].to_numpy() == full_rows.loc[list(TARGETS), column].to_numpy()).all()
+    first = per_class[per_class["subset"] == "first"].set_index("target")
+    assert np.isnan(first.loc[TARGETS[-1], "soft_auc"]), "a single-class target in a subset must be NA"
+    assert first.loc[TARGETS[2], "n_pos"] + first.loc[TARGETS[2], "n_neg"] == 19, "a masked cell must stay masked"
+    second = summary.set_index("subset").loc["second"]
+    assert second["n_studies"] == 20 and second["n_evaluable_studies"] == 19
+
+    run_dir = Path(tmp_dir) / "subset_report_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    predictions.to_csv(run_dir / "validation_predictions.csv", index=False)
+    page = build_html_report(run_dir, subsets=subsets).read_text(encoding="utf-8")
+    assert "Validation metrics by reference subset" in page
+    written = pd.read_csv(run_dir / "subset_summary.csv")
+    assert list(written["subset"]) == list(summary["subset"])
+    assert (run_dir / "subset_metrics_per_class.csv").exists()
+    return "full slice computed directly; subsets share the cell mask; absent subset skipped; one-class subset target NA"
+
+
 def check_soft_auc_bruteforce() -> str:
     """Continuous reference: the O(n log n) formula matches the explicit pair sum."""
     rng = np.random.default_rng(1)
@@ -4503,6 +4561,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("freeze_reference_from_csv", lambda: check_freeze_reference_from_csv(tmp_dir)),
             ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
+            ("subset_metrics", lambda: check_subset_metrics(tmp_dir)),
             ("nonfinite_scores_rejected", check_nonfinite_scores_rejected),
             ("skipped_amp_step", check_skipped_amp_step),
             ("ema_update_formula", check_ema_update_formula),

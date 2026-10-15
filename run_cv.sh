@@ -45,9 +45,13 @@
 #  Ha a SPLITS meg nincs meg, a script legyartja (make-splits a TRAIN_CSV
 #  studyjaibol, NFOLDS folddal), majd minden inditasnal ellenorzi
 #  (check-splits): a fold-szam, a TRAIN_CSV es a kizarasi lista
-#  (paths.exclude_from_training_csv, alap: a ref208) egyezzen.
-#  Teacher CV (3 fold = alap, ref208 nelkul, a train_v8.csv-bol):
+#  (paths.exclude_from_training_csv, alap: a ref450) egyezzen.
+#  Teacher CV (3 fold = alap, ref450 nelkul, a train_v11.csv-bol, cv3_train_v11 split):
 #     ./run_cv.sh --gpu 0 B0_teacher --set data.image_size=320
+#  Regi, train_v8-as (cv3_train_v8) run-group folytatasa (a 242 uj referencia
+#  abban tanitott, ezert a kizaras a ref208 marad):
+#     TRAIN_CSV=/ai-storage/Temp/SZ/kaggle_knee/data/train_v8.csv ./run_cv.sh --resume ... \
+#         --set paths.exclude_from_training_csv=notebooks/train_labeled_208_reference.csv
 #  Regi, 4407 studys work/splits/splits.csv-vel indult run-group folytatasa
 #  (a ref208 abban tanitott, ezert a kizarast is ki kell kapcsolni):
 #     SPLITS=work/splits/splits.csv ./run_cv.sh --resume ... --set paths.exclude_from_training_csv=

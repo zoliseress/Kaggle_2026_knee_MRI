@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ======================================================================
 #  Fix train/val felosztas, egyetlen futas (nincs fold-ciklus, nincs OOF):
-#     tanitas  : train_v8.csv            (4199 study)
-#     validacio: train_labeled_208_reference.csv  (208 radiologus-cimkezett study)
-#  Az early stopping es a best.pt is a 208-on mert macro_soft_auc alapjan
+#     tanitas  : train_v11.csv           (3957 study = train_v8 - a 242 uj referencia)
+#     validacio: train_labeled_450_reference.csv  (450 radiologus-cimkezett study
+#                = eredeti 208 + 242 uj; rsna_reference_450_package.zip)
+#  Az early stopping es a best.pt is a 450-en mert macro_soft_auc alapjan
 #  valaszt, ezert az ott mert ertek enyhen optimista.
+#  A run vegi riport (report.html, subset_summary.csv, subset_metrics_per_class.csv)
+#  kulon is kiadja a full_450, original_208 es new_242 eredmenyt
+#  (paths.reference_subsets_csv = notebooks/reference_450_manifest.csv).
 #  A 3-fold CV (run_cv.sh) ettol fuggetlen, valtozatlanul hasznalhato.
 #
 #  Hasznalat:
@@ -19,32 +23,34 @@
 #
 #  Probafuttatas reszhalmazon (--n-studies N, barhol allhat): a tanitas a
 #  split elso N studyjan fut, a validacio az elso N/2 referencia-studyn
-#  (N >= 416 eseten mind a 208). A szamok igy nem vethetok ossze a teljes
+#  (N >= 900 eseten mind a 450). A szamok igy nem vethetok ossze a teljes
 #  runokkal; folytatasnal ugyanazt az N-t kell megadni.
 #     ./run_holdout.sh --gpu 0,1 --n-studies 600 DDP_smoke --set train.max_epochs=4
 #  Ha az elso (nem --gpu) argumentum nem "-"-vel kezdodik, az a run nevenek
-#  elotagja: E3_img320_holdout208_<idobelyeg>
+#  elotagja: E3_img320_holdout450_<idobelyeg>
 #
 #  Folytatas (--resume <run nev>, a --gpu utan elso argumentumkent): egy
 #  megszakadt run a last.pt-bol folytatodik ugyanabban a mappaban
 #  (train.resume, epochhatarrol; a felbehagyott epoch elveszik):
-#     ./run_holdout.sh --gpu 1 --resume E3_img320_holdout208_20261005_143722 --set data.image_size=320
+#     ./run_holdout.sh --gpu 1 --resume E3_img320_holdout450_20261015_143722 --set data.image_size=320
 #  Az extra argumentumok es a kornyezeti valtozok ugyanazok legyenek, mint az
 #  eredeti inditasnal; az elteres a resume-ellenorzesen elakad.
 #
 #  Az elso futas elokesziti (ha meg nincsenek meg):
-#     $SPLITS     - make-fixed-split (train_v8 = fold 1, 208 = fold 0)
-#     $FROZEN_REF - freeze-reference --from-csv a 208-as CSV-bol
+#     $SPLITS     - make-fixed-split (train_v11 = fold 1, 450 = fold 0)
+#     $FROZEN_REF - freeze-reference --from-csv a 450-es CSV-bol
 #
 #  Kornyezeti valtozokkal felulirhato:
 #     CONFIG     (alap: src/config.linux.yaml)
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
 #     GPU        (alap: ures; a --gpu kapcsolo felulirja)
 #     DATA_ROOT  (alap: /ai-storage/Temp/SZ/kaggle_knee/data - ide kell masolni
-#                 a train_v8.csv-t es a train_labeled_208_reference.csv-t)
+#                 a train_v11.csv-t es a train_labeled_450_reference.csv-t)
 #     TRAIN_CSV, VAL_CSV, SPLITS, FROZEN_REF (lasd lent)
-#     HOLDOUT    (alap: 208 = 158 + Andrew 50) a referenciahalmaz; VAL_CSV,
+#     HOLDOUT    (alap: 450 = eredeti 208 + 242 uj) a referenciahalmaz; VAL_CSV,
 #                SPLITS, FROZEN_REF es a run neve (holdout<HOLDOUT>) ebbol kepzodik.
+#                Regi 208-as holdout (train_v8-hoz, a korabbi runokkal osszevetheto):
+#                HOLDOUT=208 TRAIN_CSV=$DATA_ROOT/train_v8.csv ./run_holdout.sh ...
 #                Regi 158-as holdout (train_v4/v6-hoz):
 #                HOLDOUT=158 TRAIN_CSV=$DATA_ROOT/train_v6.csv ./run_holdout.sh ...
 #                A TRAIN_CSV nem tartalmazhatja a holdout studykat.
@@ -57,8 +63,8 @@ CONDA_ENV="${CONDA_ENV-kaggle_2026}"
 CONFIG="${CONFIG:-$ROOT/src/config.linux.yaml}"
 GPU="${GPU-}"
 DATA_ROOT="${DATA_ROOT:-/ai-storage/Temp/SZ/kaggle_knee/data}"
-TRAIN_CSV="${TRAIN_CSV:-$DATA_ROOT/train_v8.csv}"
-HOLDOUT="${HOLDOUT:-208}"
+TRAIN_CSV="${TRAIN_CSV:-$DATA_ROOT/train_v11.csv}"
+HOLDOUT="${HOLDOUT:-450}"
 VAL_CSV="${VAL_CSV:-$DATA_ROOT/train_labeled_${HOLDOUT}_reference.csv}"
 SPLITS="${SPLITS:-$ROOT/work/splits/holdout${HOLDOUT}/splits.csv}"
 FROZEN_REF="${FROZEN_REF:-$ROOT/work/labels/frozen_reference_ref${HOLDOUT}.csv}"
@@ -109,7 +115,7 @@ PREFIX=""
 RESUME=""
 if [[ $# -gt 0 && "$1" == "--resume" ]]; then
     if [[ $# -lt 2 ]]; then
-        echo "[HIBA] A --resume utan meg kell adni a run nevet, pl. B0_E3_img320_holdout208_20261005_143722"
+        echo "[HIBA] A --resume utan meg kell adni a run nevet, pl. B0_E3_img320_holdout450_20261015_143722"
         exit 1
     fi
     RESUME="$2"

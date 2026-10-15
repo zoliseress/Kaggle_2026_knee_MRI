@@ -56,7 +56,8 @@ labelling (`notebooks/02_label_train_reports_*.ipynb`) and the build scripts:
 | --- | --- | --- |
 | `train_v6.csv` | blend `0.5 · llm_labels_v2 + 0.5 · labels_llm_gpt56sol` | the two LLM label exports |
 | `train_v7.csv` | `notebooks/build_ref208_train_v7.py`: `train_v6` minus the 50 new reference studies | `train_v6.csv`, `train_labeled_158_reference.csv`, `RSNA_Andrew 50.xlsx` |
-| `train_v8.csv` *(default `paths.train_csv`)* | `notebooks/build_train_v8.py`: not-mentioned cells 0.25 → 0.07 | `train_v7.csv`, `F:/Kaggle/llm_labeling/output/labels_lixin_gpt56sol_V2/llm_labels_v2.csv`, `.../labels_lixin_gpt56sol/labels_llm_gpt56sol.csv` |
+| `train_v8.csv` | `notebooks/build_train_v8.py`: not-mentioned cells 0.25 → 0.07 | `train_v7.csv`, `F:/Kaggle/llm_labeling/output/labels_lixin_gpt56sol_V2/llm_labels_v2.csv`, `.../labels_lixin_gpt56sol/labels_llm_gpt56sol.csv` |
+| `train_v11.csv` *(default `paths.train_csv`)* | `notebooks/build_ref450_train_v11.py`: `train_v8` minus the 242 new reference studies (values unchanged) | `train_v8.csv`, `rsna_reference_450_package.zip` |
 
 The build scripts have their paths hard-coded (`D = 'F:/Kaggle/data/'`). Older tables
 (`train_v1`–`train_v5`) are needed only to reproduce old runs.
@@ -66,11 +67,18 @@ The build scripts have their paths hard-coded (`D = 'F:/Kaggle/data/'`). Older t
 | file | where | used by |
 | --- | --- | --- |
 | `train_labeled_158_reference.csv` | `<data>` and `notebooks/` | `paths.reference_csv`; `HOLDOUT=158`; input of the 208 build |
-| `train_labeled_208_reference.csv` | `<data>` and `notebooks/` | `run_holdout.*` (`VAL_CSV`), and `paths.exclude_from_training_csv` — **`train.py` refuses to start when this file is missing** |
+| `train_labeled_208_reference.csv` | `<data>` and `notebooks/` | `HOLDOUT=208` (legacy, `train_v8` runs); subset `original_208` of the 450 |
+| `train_labeled_450_reference.csv` | `<data>` and `notebooks/` | `run_holdout.*` (`VAL_CSV`, `HOLDOUT=450` default), and `paths.exclude_from_training_csv` — **`train.py` refuses to start when this file is missing** |
+| `train_labeled_242_reference.csv` | `<data>` and `notebooks/` | the 242 new studies of the 450 (subset `new_242`) |
+| `reference_450_manifest.csv` | `<data>` and `notebooks/` | `paths.reference_subsets_csv`: StudyInstanceUID → `original_208` / `new_242` for the per-subset report |
 
 `build_ref208_train_v7.py` writes the 208 file to both places (the 158 plus the 0–4 scores of
 `RSNA_Andrew 50.xlsx`, binarised: 0–1 → 0, 3–4 → 1, 2 / X → empty). There is no build script
-for the 158 file in the repository. Setting `--set paths.exclude_from_training_csv=` turns
+for the 158 file in the repository. `build_ref450_train_v11.py` installs the 450, 242 and
+manifest files byte for byte from `rsna_reference_450_package.zip` (whose README documents
+how they were made: the original 208 untouched and authoritative, plus 96 YC + 100 Andrew +
+46 Zoli studies, 0–1 → 0, 3–4 → 1, 2 / X / blank → empty) after checking that its 208 is
+identical to the existing file. Setting `--set paths.exclude_from_training_csv=` turns
 the leakage check off, but only do that when you know the training table holds no
 reference study.
 
@@ -100,7 +108,7 @@ at `work/pretrained/RadImageNet_pytorch/ResNet50.pt` (see *Encoder backbones*).
 | File | Role |
 | --- | --- |
 | `train.csv` | study metadata, report text, and — in this export — the 12 target columns |
-| `train_v<N>.csv` | the same columns with LLM-derived (soft) labels; the one in use is `paths.train_csv` (currently `train_v8.csv`) |
+| `train_v<N>.csv` | the same columns with LLM-derived (soft) labels; the one in use is `paths.train_csv` (currently `train_v11.csv`) |
 | `train_series.csv` | study↔series map plus `Fluid_Sensitive`, `Fat_Suppression`, `Anatomical_Plane` |
 | `train_series/<StudyUID>/<SeriesUID>/*.dcm` | image data |
 | `labels_details.csv` *(optional, preferred)* | one row per (study, target) with `status` and `basis` |
@@ -108,7 +116,9 @@ at `work/pretrained/RadImageNet_pytorch/ResNet50.pt` (see *Encoder backbones*).
 | `labels_predictions.csv` *(optional)* | wide numeric export; empty cell = unresolved |
 | `labels_predictions_exclude_borderline.csv` *(optional)* | same, borderline also emptied |
 | `train_labeled_158_reference.csv` *(optional)* | radiologist reference set (158 studies = the original 58 + 100) — audit only |
-| `train_labeled_208_reference.csv` | the current evaluation set: the 158 plus 50 more radiologist-read studies; never a training study (`paths.exclude_from_training_csv`) |
+| `train_labeled_208_reference.csv` | the previous evaluation set (the 158 plus 50 more radiologist-read studies); now the `original_208` subset of the 450 |
+| `train_labeled_450_reference.csv` | the current evaluation set: the original 208 + 242 new radiologist-read studies; never a training study (`paths.exclude_from_training_csv`) |
+| `reference_450_manifest.csv` | StudyInstanceUID → `subset` (`original_208` / `new_242`) and source workbook; `paths.reference_subsets_csv` |
 
 Identifiers are read as strings, joins are key-based (never positional), and
 `validate-schema` checks unique study ids, unique (study, series) keys, many-to-one
@@ -136,10 +146,11 @@ training by design** and says why. Training therefore runs on the LLM-labelled
 | `train_v1.csv` | binary labels |
 | `train_v2.csv`, `train_v3.csv` | soft labels (QWen; QWen + GPT) |
 | `train_v7.csv` | soft-label blend without the 208 reference studies |
-| `train_v8.csv` *(default)* | `train_v7` with not-mentioned findings at 0.07 instead of 0.25 (Synovitis kept); **4199 studies** = 4407 − 208 |
+| `train_v8.csv` | `train_v7` with not-mentioned findings at 0.07 instead of 0.25 (Synovitis kept); **4199 studies** = 4407 − 208 |
+| `train_v11.csv` *(default)* | `train_v8` without the 242 new reference studies, values unchanged; **3957 studies** = 4407 − 450 |
 
 The generator scripts are under `notebooks/` (`build_ref208_train_v7.py`,
-`build_train_v8.py`). A wide or details export (`paths.labels_details_csv` etc.) can still
+`build_train_v8.py`, `build_ref450_train_v11.py`). A wide or details export (`paths.labels_details_csv` etc.) can still
 replace the training table's own columns.
 
 ## Label policy
@@ -274,9 +285,10 @@ first argument, pass every further argument to `train`, and continue an interrup
 
 All steps have been run on the full export. The cache was built for every selected series
 (13 221 series, 13 219 `ok`; the 2 failures are truncated source DICOM files, see
-[`doc/pipeline_lepesek.md`](../doc/pipeline_lepesek.md)). Training uses `train_v8.csv`, mostly
-as a fixed hold-out against the 208 reference studies, and as a 3-fold CV
-(`work/splits/cv3_train_v8`) for teacher runs. The working image size is **320 px**
+[`doc/pipeline_lepesek.md`](../doc/pipeline_lepesek.md)). Training used `train_v8.csv` against
+the 208 reference studies until 2026-10-15; from then on `train_v11.csv` as a fixed hold-out
+against the 450 reference studies (reported also as `original_208` / `new_242`), and as a
+3-fold CV (`work/splits/cv3_train_v11`) for teacher runs. The working image size is **320 px**
 (`--set data.image_size=320`, with its own cache); `config.yaml` still says 224.
 
 `notebooks/03_knee_mri_efficientnet_walkthrough.ipynb` runs the same functions
@@ -705,20 +717,20 @@ tuning happened on those reports, so they are not an independent gold benchmark.
 
 ### Fixed hold-out instead of CV (`run_holdout.sh` / `run_holdout.bat`)
 
-One run, no folds: `train_v8.csv` (4199 studies) trains, and the 208 radiologist-labelled
-studies of `train_labeled_208_reference.csv` validate (`HOLDOUT=208`, the default; 208 = the
-158 plus 50 more). `train_v8` contains none of those 208 studies. The scripts pass everything
-with `--set`, so the configs and `run_cv.*` stay as they were. On first use the scripts also
-create the two files they need:
+One run, no folds: `train_v11.csv` (3957 studies) trains, and the 450 radiologist-labelled
+studies of `train_labeled_450_reference.csv` validate (`HOLDOUT=450`, the default; 450 = the
+original 208 + 242 new). `train_v11` contains none of those 450 studies. The scripts pass
+everything with `--set`, so the configs and `run_cv.*` stay as they were. On first use the
+scripts also create the two files they need:
 
 ```bash
 # splits.csv schema: validation studies fold 0, training studies fold 1
-python -m knee_mri.cli make-fixed-split --set paths.train_csv=<data>/train_v8.csv \
-    --set paths.splits_csv=work/splits/holdout208/splits.csv \
-    --validation-csv <data>/train_labeled_208_reference.csv
+python -m knee_mri.cli make-fixed-split --set paths.train_csv=<data>/train_v11.csv \
+    --set paths.splits_csv=work/splits/holdout450/splits.csv \
+    --validation-csv <data>/train_labeled_450_reference.csv
 # 0/1 radiologist labels frozen as the validation reference; empty cells are invalid
-python -m knee_mri.cli freeze-reference --from-csv <data>/train_labeled_208_reference.csv \
-    --out work/labels/frozen_reference_ref208.csv
+python -m knee_mri.cli freeze-reference --from-csv <data>/train_labeled_450_reference.csv \
+    --out work/labels/frozen_reference_ref450.csv
 ```
 
 and on every start `check-fixed-split` refuses a split that does not match `TRAIN_CSV` /
@@ -727,8 +739,9 @@ Training then runs with `split.fold=0`, `paths.splits_csv` and `paths.frozen_ref
 pointing at those files, and with `paths.exclude_from_training_csv` set to the validation CSV.
 
 ```powershell
-.\run_holdout.bat E3_img320 --set data.image_size=320          # run E3_img320_holdout208_<timestamp>
-.\run_holdout.bat --resume E3_img320_holdout208_20261005_143722 --set data.image_size=320
+.\run_holdout.bat E3_img320 --set data.image_size=320          # run E3_img320_holdout450_<timestamp>
+.\run_holdout.bat --resume E3_img320_holdout450_20261015_143722 --set data.image_size=320
+$env:HOLDOUT="208"; $env:TRAIN_CSV="F:\Kaggle\data\train_v8.csv"; .\run_holdout.bat   # the old 208 hold-out (also to resume its runs)
 $env:HOLDOUT="158"; $env:TRAIN_CSV="F:\Kaggle\data\train_v6.csv"; .\run_holdout.bat   # the old 158 hold-out
 ```
 
@@ -737,25 +750,39 @@ overrides; `NOPAUSE=1` skips the final key press. The Linux scripts also take `-
 before everything else. A resume needs the same extra arguments and
 environment as the original start — the resume check stops on a difference.
 
-Here the 208 studies **are** the early-stopping and `best.pt` criterion, so the score
-measured on them is slightly optimistic, and with this few positives per target (e.g. MCL)
-the macro AUC is also noisy. The "validation: NO supervision" warning in the label counts
-is expected: the reference studies are not in the training table, and the metric comes
-from the frozen reference.
+Here the 450 studies **are** the early-stopping and `best.pt` criterion (on the full set),
+so the score measured on them is slightly optimistic, and with few positives per target
+(e.g. MCL: 27) the macro AUC is still noisy. The "validation: NO supervision" warning in the
+label counts is expected: the reference studies are not in the training table, and the
+metric comes from the frozen reference.
+
+**Per-subset report.** With `paths.reference_subsets_csv` set (every config:
+`notebooks/reference_450_manifest.csv`) the run report also scores each reference subset
+that overlaps the validation set: `full_<N>` (computed directly from all predictions, never
+averaged from the subsets), `original_208` and `new_242` — macro soft / ROC-AUC, the 12
+per-target AUCs and the positive/negative counts, from the same best-checkpoint predictions
+and the same per-cell mask. Written to `subset_summary.csv` and `subset_metrics_per_class.csv`
+and as a table in `report.html`; `cli report <run_dir>` adds them to older runs (a holdout208
+run shows `full_208` = `original_208`). One label-masked study (leg scanned rotated 90°) is in
+`new_242`, so 449 studies are evaluable and six targets have one positive fewer than the
+package's `label_counts.csv`. Old checkpoints trained on `train_v8` saw the 242 new studies,
+so compare on the 450 only between runs trained with the 450 exclusion.
 
 ### Keeping the reference out of every training run (teachers included)
 
-The 208-study reference (`train_labeled_208_reference.csv`) is the evaluation set. A teacher
+The 450-study reference (`train_labeled_450_reference.csv`) is the evaluation set. A teacher
 that trained on part of it would carry it into the pseudo-labels of its students, so no
 training run may see it, CV teachers included. Three checks enforce this:
 
 * **`paths.exclude_from_training_csv`** (default in every config:
-  `notebooks/train_labeled_208_reference.csv`). `train.py` stops before the first epoch when a
+  `notebooks/train_labeled_450_reference.csv`). `train.py` stops before the first epoch when a
   training study of the fold is on that list, whatever `splits.csv` is in use. A configured but
   missing or empty file is an error. An empty value turns the check off, e.g. to resume a legacy
-  run. `run_holdout.*` sets it to `VAL_CSV`.
+  run; a `train_v8` run (CV or hold-out 208) resumes with
+  `--set paths.exclude_from_training_csv=notebooks/train_labeled_208_reference.csv`.
+  `run_holdout.*` sets it to `VAL_CSV`.
 * **`make-splits` with `split.holdout_reference=true`** refuses to write a split with an empty
-  hold-out (missing `reference_csv`, or none of its studies in `train_csv`). With `train_v8.csv`
+  hold-out (missing `reference_csv`, or none of its studies in `train_csv`). With `train_v11.csv`
   the flag is not needed: the CSV has no reference rows to begin with.
 * **`run_cv.*`** no longer uses the legacy `work/splits/splits.csv` (4407 studies, the reference
   inside the folds). Its default split is `work/splits/cv<NFOLDS>_<train_csv stem>/splits.csv`.
@@ -765,7 +792,7 @@ training run may see it, CV teachers included. Three checks enforce this:
   overrides the path. `merge-oof` gets the same split.
 
 ```powershell
-.\run_cv.bat B0_teacher --set data.image_size=320   # teacher OOF: 3 folds (default), split work/splits/cv3_train_v8, ref208 never trains
+.\run_cv.bat B0_teacher --set data.image_size=320   # teacher OOF: 3 folds (default), split work/splits/cv3_train_v11, ref450 never trains
 .\run_cv.bat --resume B0_teacher_cv3_<timestamp> --set data.image_size=320
 ```
 
@@ -803,8 +830,9 @@ Runs are grouped by training table: `paths.output_dir` defaults to
 `history.csv`, `metrics_per_class.csv`, `validation_predictions.csv`,
 `validation_reference.csv`, `run_summary.json`, `coverage.json`, `environment.json`,
 `config.yaml`, `run.log`, `best.pt`, `last.pt`, learning-curve and per-class plots, and an
-offline `report.html` linking the QC gallery, label counts, metrics and high-confidence
-disagreements. Disagreement review is a development aid and is kept out of any locked final
+offline `report.html` linking the QC gallery, label counts, metrics, the per-subset
+breakdown (`subset_summary.csv`, `subset_metrics_per_class.csv`; see *Fixed hold-out*) and
+high-confidence disagreements. Disagreement review is a development aid and is kept out of any locked final
 evaluation. The plots (`learning_curves.png`: losses, ranking metrics, AP/F1, Brier/Spearman,
 learning rate, throughput, with the best epoch marked; `per_class_metrics.png`) and
 `report.html` are written automatically when training ends (also on early stop);

@@ -94,6 +94,10 @@ def test_soft_auc_matches_roc_auc():
     selftest.check_soft_auc_matches_roc_auc()
 
 
+def test_subset_metrics(tmp_path):
+    selftest.check_subset_metrics(tmp_path)
+
+
 def test_soft_auc_bruteforce():
     selftest.check_soft_auc_bruteforce()
 
