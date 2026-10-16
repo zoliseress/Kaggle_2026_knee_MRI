@@ -3618,6 +3618,59 @@ def check_ema_checkpoint_roundtrip(cfg: Config) -> str:
     return "last.pt 'model' = EMA ('model_raw' kept for resume); inference reproduces the EMA scores; *_raw logged"
 
 
+def check_epoch_subset_history(cfg: Config) -> str:
+    """Every epoch: per-subset macros in history.csv and a predictions file, both from the same scores;
+    a subset without validation studies gets no column; the selection stays on the full set."""
+    import tempfile
+    from pathlib import Path
+
+    from .train import build_synthetic_trainer
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_subsets_") as tmp:
+        try:
+            ids = [f"synthetic-{i:04d}" for i in range(8)]  # SyntheticBagDataset ids of the 8 validation studies
+            subsets_csv = Path(tmp) / "subsets.csv"
+            pd.DataFrame({STUDY_ID: ids + ["elsewhere"], "subset": ["first"] * 4 + ["second"] * 4 + ["absent"]}).to_csv(
+                subsets_csv, index=False
+            )
+            small = cfg.copy()
+            small.train.num_workers = 0
+            small.train.eval_num_workers = 0
+            small.train.accumulation_steps = 2
+            small.train.early_stopping_patience = 10
+            small.train.resume = None
+            small.train.init_weights = None
+            small.paths.output_dir = str(Path(tmp) / "runs")
+            small.paths.reference_subsets_csv = str(subsets_csv)
+            trainer = build_synthetic_trainer(small, n_studies=6, epochs=2, name="subsets")
+            assert trainer.reference.study_ids == ids, "the synthetic validation ids changed"
+            trainer.fit()
+            run = Path(tmp) / "runs" / "subsets"
+            history = pd.read_csv(run / "history.csv")
+            for name in ("first", "second"):
+                assert f"val_{name}_macro_soft_auc" in history and f"val_{name}_macro_roc_auc" in history, name
+            assert not any("absent" in c for c in history.columns), "a subset without studies got a column"
+            for epoch in history["epoch"]:
+                frame = pd.read_csv(run / "epoch_predictions" / f"validation_predictions_ep{epoch:02d}.csv",
+                                    dtype={STUDY_ID: str})
+                assert (frame["epoch"] == epoch).all() and (frame["checkpoint"] == f"epoch_{epoch:02d}").all()
+                wide = {c: frame.pivot(index=STUDY_ID, columns="target", values=c).loc[ids, list(TARGETS)]
+                        for c in ("score", "reference", "reference_valid")}
+                row = history.set_index("epoch").loc[epoch]
+                _, full = evaluate_predictions(wide["score"].to_numpy(float), wide["reference"].to_numpy(float),
+                                               wide["reference_valid"].to_numpy(bool))
+                assert math.isclose(full["macro_soft_auc"], row["val_macro_soft_auc"], rel_tol=1e-6)
+                _, first = evaluate_predictions(wide["score"].to_numpy(float)[:4], wide["reference"].to_numpy(float)[:4],
+                                                wide["reference_valid"].to_numpy(bool)[:4])
+                expected, logged = first["macro_soft_auc"], row["val_first_macro_soft_auc"]
+                assert (np.isnan(expected) and np.isnan(logged)) or math.isclose(expected, logged, rel_tol=1e-6)
+            best = int(history.loc[history["val_selection_score"].idxmax(), "epoch"])
+            assert trainer.state.best_epoch == best, "the selection must stay on the full validation set"
+        finally:
+            remove_file_logging(tmp)
+    return "per-subset macros in history.csv match the per-epoch prediction files; absent subset skipped; selection on the full set"
+
+
 def check_ema_off_is_identity(cfg: Config) -> str:
     """ema_decay = 0 leaves the payload, history and resume signature exactly as before."""
     import tempfile
@@ -4607,6 +4660,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("exact_resume_with_ema", lambda: check_exact_resume_with_ema(small)),
                 ("ema_checkpoint_roundtrip", lambda: check_ema_checkpoint_roundtrip(small)),
                 ("ema_off_is_identity", lambda: check_ema_off_is_identity(small)),
+                ("epoch_subset_history", lambda: check_epoch_subset_history(small)),
                 ("target_attention_starts_as_head", lambda: check_target_attention_starts_as_head(small)),
                 ("target_attention_checkpoints", lambda: check_target_attention_checkpoints(small, tmp_dir)),
                 ("target_attention_training_step", lambda: check_target_attention_training_step(small)),

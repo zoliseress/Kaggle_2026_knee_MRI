@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .constants import STUDY_ID, TARGETS
-from .metrics import subset_metrics
+from .metrics import read_reference_subsets, subset_metrics
 from .utils import LOG, atomic_write_dataframe, atomic_write_text
 
 
@@ -68,6 +68,10 @@ def plot_learning_curves(history: pd.DataFrame, out_path: Path, summary: dict | 
     _plot_series(ax_rank, history, "val_selection_score_raw", "selection, raw (no EMA)", ls="--", color="tab:green", alpha=0.6)
     _plot_series(ax_rank, history, "val_macro_roc_auc", "ROC-AUC (0/1 cells)", marker="s", color="tab:blue")
     _plot_series(ax_rank, history, "val_macro_soft_auc", "soft ROC-AUC", marker="^", color="tab:purple")
+    # Reference subsets (val_<subset>_macro_soft_auc, e.g. original_208 / new_242), same predictions.
+    for column in history.columns:
+        if column.startswith("val_") and column.endswith("_macro_soft_auc") and column != "val_macro_soft_auc":
+            _plot_series(ax_rank, history, column, f"soft ROC-AUC, {column[4:-len('_macro_soft_auc')]}", ls=":", marker=".")
     ax_rank.set_title("Validation macro ranking metrics")
 
     _plot_series(ax_ap, history, "val_macro_ap", "AP", marker="o", color="tab:orange")
@@ -319,8 +323,7 @@ def build_run_report(cfg: Any, run_dir: str | Path, qc_dir: str | Path | None = 
     counts_path = Path(cfg.paths.work_dir) / "schema" / "labels_counts.csv"
     counts = pd.read_csv(counts_path) if counts_path.exists() else None
     qc_dir = qc_dir or Path(cfg.paths.work_dir) / "qc"
-    subsets_path = cfg.paths.get("reference_subsets_csv")
-    subsets = pd.read_csv(subsets_path, dtype={STUDY_ID: "string"}, encoding="utf-8-sig") if subsets_path else None
+    subsets = read_reference_subsets(cfg.paths.get("reference_subsets_csv"))
     return build_html_report(
         run_dir,
         qc_dir=qc_dir,

@@ -262,6 +262,28 @@ def evaluate_predictions(
 SUBSET_COLUMNS = ("n_pos", "n_neg", "n_soft", "roc_auc", "soft_auc")
 
 
+def read_reference_subsets(path) -> pd.DataFrame | None:
+    """The (STUDY_ID, subset) table of `paths.reference_subsets_csv`; None when it is not set."""
+    if not path:
+        return None
+    return pd.read_csv(path, dtype={STUDY_ID: "string"}, encoding="utf-8-sig")
+
+
+def subset_masks(study_ids, subsets: pd.DataFrame | None) -> list[tuple[str, np.ndarray]]:
+    """(subset name, boolean row mask over `study_ids`) for each subset of the (STUDY_ID, subset)
+    table that holds at least one of the studies, in the table's order. Membership is by id."""
+    if subsets is None or not len(subsets):
+        return []
+    ids = pd.Index([str(s) for s in study_ids])
+    membership = subsets.assign(**{STUDY_ID: subsets[STUDY_ID].astype(str)}).set_index(STUDY_ID)["subset"]
+    masks = []
+    for name in pd.unique(membership):
+        mask = np.asarray(ids.isin(membership.index[membership == name]))
+        if mask.any():
+            masks.append((str(name), mask))
+    return masks
+
+
 def subset_metrics(
     predictions: pd.DataFrame,
     subsets: pd.DataFrame | None,
@@ -282,13 +304,7 @@ def subset_metrics(
         for column in ("score", "reference", "reference_valid")
     }
     ids = wide["score"].index.astype(str)
-    slices = [(f"full_{len(ids)}", np.ones(len(ids), dtype=bool))]
-    if subsets is not None and len(subsets):
-        membership = subsets.assign(**{STUDY_ID: subsets[STUDY_ID].astype(str)}).set_index(STUDY_ID)["subset"]
-        for name in pd.unique(membership):
-            mask = ids.isin(membership.index[membership == name])
-            if mask.any():
-                slices.append((str(name), np.asarray(mask)))
+    slices = [(f"full_{len(ids)}", np.ones(len(ids), dtype=bool)), *subset_masks(ids, subsets)]
 
     tables, rows = [], []
     for name, mask in slices:

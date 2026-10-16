@@ -246,6 +246,10 @@ def test_ema_off_is_identity(cfg):
     selftest.check_ema_off_is_identity(cfg)
 
 
+def test_epoch_subset_history(cfg):
+    selftest.check_epoch_subset_history(cfg)
+
+
 def test_exact_resume_with_ema(cfg):
     selftest.check_exact_resume_with_ema(cfg)
 

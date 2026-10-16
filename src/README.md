@@ -777,7 +777,13 @@ averaged from the subsets), `original_208` and `new_242` — macro soft / ROC-AU
 per-target AUCs and the positive/negative counts, from the same best-checkpoint predictions
 and the same per-cell mask. Written to `subset_summary.csv` and `subset_metrics_per_class.csv`
 and as a table in `report.html`; `cli report <run_dir>` adds them to older runs (a holdout208
-run shows `full_208` = `original_208`). One label-masked study (leg scanned rotated 90°) is in
+run shows `full_208` = `original_208`). During training the same subsets are also scored
+**every epoch**: `history.csv` gets `val_<subset>_macro_soft_auc` / `val_<subset>_macro_roc_auc`
+(also logged, and drawn in `learning_curves.png`), so it shows which epoch each subset would
+select, while `best.pt` is still chosen on the full set. With `eval.save_epoch_predictions`
+(default true) every epoch's validation predictions go to
+`epoch_predictions/validation_predictions_ep<NN>.csv` (~0.8 MB per epoch on the 450), for
+epoch-selection and same-epoch ensemble analyses. One label-masked study (leg scanned rotated 90°) is in
 `new_242`, so 449 studies are evaluable and six targets have one positive fewer than the
 package's `label_counts.csv`. Old checkpoints trained on `train_v8` saw the 242 new studies,
 so compare on the 450 only between runs trained with the 450 exclusion.
@@ -841,7 +847,7 @@ Runs are grouped by training table: `paths.output_dir` defaults to
 `run_cv.*` / `run_holdout.*` scripts use it to find the fold runs for the OOF merge.
 `src/tools/migrate_runs_by_dataset.py` sorted the earlier flat `work/runs/<run>` folders.
 
-`history.csv`, `metrics_per_class.csv`, `validation_predictions.csv`,
+`history.csv` (with per-subset macros per epoch), `epoch_predictions/`, `metrics_per_class.csv`, `validation_predictions.csv`,
 `validation_reference.csv`, `run_summary.json`, `coverage.json`, `environment.json`,
 `config.yaml`, `run.log`, `best.pt`, `last.pt`, learning-curve and per-class plots, and an
 offline `report.html` linking the QC gallery, label counts, metrics, the per-subset

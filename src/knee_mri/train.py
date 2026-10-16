@@ -53,7 +53,7 @@ from .loss import (
 )
 from .ema import ModelEMA
 from .encoders import ADAPTER_VERSIONS
-from .metrics import evaluate_predictions, selection_metric, soft_target_warning
+from .metrics import evaluate_predictions, read_reference_subsets, selection_metric, soft_target_warning, subset_masks
 from .model import build_model
 from .preprocess import preprocess_hash
 from .splits import (
@@ -261,6 +261,12 @@ class Trainer:
         self.reference = reference
         self.provenance = provenance or {}
         self.selection_name = str(cfg.eval.get("selection_metric", "macro_soft_auc"))
+        # Reference subsets (paths.reference_subsets_csv, e.g. original_208 / new_242) scored every
+        # epoch from the same predictions as the full set; the checkpoint is still selected on the full set.
+        self.reference_subsets = subset_masks(
+            reference.study_ids, read_reference_subsets(cfg.paths.get("reference_subsets_csv"))
+        )
+        self.save_epoch_predictions = bool(cfg.eval.get("save_epoch_predictions", True))
 
         # Multi-GPU (torchrun): one process per GPU, see distributed.py. `self.model` stays the
         # bare module (state_dict keys, EMA, validation and checkpoints are unchanged); only the
@@ -798,6 +804,21 @@ class Trainer:
             min_support=int(self.cfg.eval.min_class_support),
         )
         summary["epoch"] = epoch
+        summary["subsets"] = {}
+        for name, mask in self.reference_subsets:
+            _, part = evaluate_predictions(
+                aligned[mask],
+                self.reference.values[mask],
+                self.reference.valid[mask],
+                threshold=float(self.cfg.eval.threshold),
+                min_support=int(self.cfg.eval.min_class_support),
+            )
+            summary["subsets"][name] = {
+                "n_studies": part["n_studies"],
+                "macro_soft_auc": part["macro_soft_auc"],
+                "macro_roc_auc": part["macro_roc_auc"],
+                "n_defined_targets": part["n_defined_targets"],
+            }
         # The train_loss quantity on the validation studies' training labels. NaN when they carry
         # none (holdout on a radiologist reference): macro_bce against the reference is then the loss.
         summary["label_loss"] = label_loss.macro
@@ -1068,6 +1089,10 @@ class Trainer:
                 "val_macro_ap": val_summary["macro_average_precision"],
                 "val_macro_f1": val_summary["macro_f1_at_threshold"],
             }
+            # Per reference subset, from the same predictions: which epoch each subset would pick.
+            for name, part in val_summary["subsets"].items():
+                record[f"val_{name}_macro_soft_auc"] = part["macro_soft_auc"]
+                record[f"val_{name}_macro_roc_auc"] = part["macro_roc_auc"]
             if self.ema is not None:
                 record["val_selection_score_raw"] = val_summary["raw_selection_score"]
                 record["val_macro_roc_auc_raw"] = val_summary["raw_macro_roc_auc"]
@@ -1081,6 +1106,22 @@ class Trainer:
             self.state.history.append(record)
             if main:
                 atomic_write_dataframe(pd.DataFrame(self.state.history), history_path)
+                if self.save_epoch_predictions:
+                    # Every epoch's validation predictions (best.pt keeps only the selected one), for
+                    # later epoch-selection and ensemble analyses; the checkpoint column names the epoch.
+                    atomic_write_dataframe(
+                        predictions.assign(checkpoint=f"epoch_{epoch:02d}"),
+                        self.run_dir / "epoch_predictions" / f"validation_predictions_ep{epoch:02d}.csv",
+                    )
+            if val_summary["subsets"]:
+                LOG.info(
+                    "epoch %d | subsets %s",
+                    epoch,
+                    " | ".join(
+                        f"{name} {self.selection_name} {_fmt(selection_metric(part, self.selection_name))}"
+                        for name, part in val_summary["subsets"].items()
+                    ),
+                )
             LOG.info(
                 "epoch %d | train loss %.4f | val loss %s | val ref BCE %s | val Brier %s | val %s %s | "
                 "macro ROC-AUC %s (%s defined) | AP %s",

@@ -218,3 +218,6 @@ eval:
   # Early stopping / checkpoint metric. macro_soft_auc equals macro_roc_auc on a binary
   # reference and also ranks continuous reference values (see metrics.soft_roc_auc).
   selection_metric: "macro_soft_auc"   # macro_soft_auc|macro_roc_auc
+  # Every epoch's validation predictions to <run>/epoch_predictions/ (~0.8 MB per epoch on the 450),
+  # beside the per-subset macros in history.csv; best.pt / validation_predictions.csv keep the selected epoch.
+  save_epoch_predictions: true
