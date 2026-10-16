@@ -323,6 +323,20 @@ and names itself in the error when it is wrong. The `config.yaml` beside the fir
 checkpoint supplies the image parameters, so every run directory must be uploaded with its
 own config.
 
+**Upload slim exports, not the run directories.** Before every submission:
+
+```bash
+python src/tools/export_checkpoints.py --ensemble holdout6_v11 --out work/export_v11
+```
+
+writes `<out>/<Kaggle dataset name>/{best.pt, config.yaml}` for each member of the
+`build_04_notebook.py` ensemble. The exported `best.pt` keeps `model` (the selected weights,
+EMA when it was on) and the metadata inference checks, and drops what only an exact resume
+reads (`model_raw`, `optimizer`, `scheduler`, `scaler`, the RNG states, `train_state`,
+`resume_signature`): about 75 % of the file (holdout6_v11: 2630 MB → 658 MB). Every export is
+reloaded through `load_checkpoint_for_inference` and compared weight by weight with its
+source. An exported checkpoint cannot resume training.
+
 Verified on the three public test studies (all three slots selected for each) and
 cross-checked by re-predicting fold-0 validation studies through the notebook path: the
 scores reproduce the training-time `validation_predictions.csv` to a maximum absolute
