@@ -29,13 +29,8 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
 from knee_mri.config import load_config  # noqa: E402
+from knee_mri.constants import RESUME_ONLY_CHECKPOINT_KEYS as TRAINING_ONLY_KEYS  # noqa: E402
 from knee_mri.evaluate import load_checkpoint_for_inference  # noqa: E402
-
-# Only an exact resume (train.Trainer.load_checkpoint) reads these.
-TRAINING_ONLY_KEYS = (
-    "model_raw", "optimizer", "scheduler", "scaler", "rng_state", "rng_state_by_rank", "train_state",
-    "resume_signature",
-)
 
 
 def ensemble_members(name: str) -> list[tuple[str, str]]:

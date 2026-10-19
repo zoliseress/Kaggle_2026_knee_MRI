@@ -783,7 +783,10 @@ run shows `full_208` = `original_208`). During training the same subsets are als
 select, while `best.pt` is still chosen on the full set. With `eval.save_epoch_predictions`
 (default true) every epoch's validation predictions go to
 `epoch_predictions/validation_predictions_ep<NN>.csv` (~0.8 MB per epoch on the 450), for
-epoch-selection and same-epoch ensemble analyses. One label-masked study (leg scanned rotated 90°) is in
+epoch-selection and same-epoch ensemble analyses. With `eval.save_epoch_checkpoints` (default false in
+code, true in the shipped configs) every epoch's selected (EMA) weights also go to
+`epoch_checkpoints/ep<NN>.pt`, inference-only (no optimizer, raw weights, RNG or history;
+`constants.RESUME_ONLY_CHECKPOINT_KEYS`), loadable like `best.pt` (~100 MB per epoch for v2_s). One label-masked study (leg scanned rotated 90°) is in
 `new_242`, so 449 studies are evaluable and six targets have one positive fewer than the
 package's `label_counts.csv`. Old checkpoints trained on `train_v8` saw the 242 new studies,
 so compare on the 450 only between runs trained with the 450 exclusion.
@@ -847,7 +850,7 @@ Runs are grouped by training table: `paths.output_dir` defaults to
 `run_cv.*` / `run_holdout.*` scripts use it to find the fold runs for the OOF merge.
 `src/tools/migrate_runs_by_dataset.py` sorted the earlier flat `work/runs/<run>` folders.
 
-`history.csv` (with per-subset macros per epoch), `epoch_predictions/`, `metrics_per_class.csv`, `validation_predictions.csv`,
+`history.csv` (with per-subset macros per epoch), `epoch_predictions/`, `epoch_checkpoints/`, `metrics_per_class.csv`, `validation_predictions.csv`,
 `validation_reference.csv`, `run_summary.json`, `coverage.json`, `environment.json`,
 `config.yaml`, `run.log`, `best.pt`, `last.pt`, learning-curve and per-class plots, and an
 offline `report.html` linking the QC gallery, label counts, metrics, the per-subset

@@ -221,3 +221,6 @@ eval:
   # Every epoch's validation predictions to <run>/epoch_predictions/ (~0.8 MB per epoch on the 450),
   # beside the per-subset macros in history.csv; best.pt / validation_predictions.csv keep the selected epoch.
   save_epoch_predictions: true
+  # Every epoch's selected (EMA) weights, inference-only (no optimizer / raw weights / RNG), to
+  # <run>/epoch_checkpoints/epNN.pt; loads like best.pt. ~1/4 of best.pt (v2_s: ~100 MB per epoch).
+  save_epoch_checkpoints: true

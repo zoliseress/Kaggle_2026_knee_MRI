@@ -60,6 +60,12 @@ PREPROCESS_VERSION = "prep_v1"
 LABELS_VERSION = "labels_v1"
 SPLITS_VERSION = "splits_v1"
 CHECKPOINT_VERSION = "ckpt_v1"
+# Checkpoint keys only an exact resume (train.Trainer.load_checkpoint) reads; inference-only
+# checkpoints (epoch_checkpoints/, tools/export_checkpoints.py) drop them.
+RESUME_ONLY_CHECKPOINT_KEYS = (
+    "model_raw", "optimizer", "scheduler", "scaler", "rng_state", "rng_state_by_rank", "train_state",
+    "resume_signature",
+)
 
 # Encoder input normalisation profiles (data.encoder_normalization), applied exactly once to the
 # robust-scaled [0, 1] slices - in the dataset (augment.device=cpu) or in augment_batch (cuda).

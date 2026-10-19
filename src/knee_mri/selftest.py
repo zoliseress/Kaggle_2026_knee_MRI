@@ -3671,6 +3671,55 @@ def check_epoch_subset_history(cfg: Config) -> str:
     return "per-subset macros in history.csv match the per-epoch prediction files; absent subset skipped; selection on the full set"
 
 
+def check_epoch_checkpoints(cfg: Config) -> str:
+    """eval.save_epoch_checkpoints: one inference-only file per epoch (no resume-only keys) that
+    reproduces that epoch's saved validation predictions; the last one matches last.pt's model."""
+    import tempfile
+    from pathlib import Path
+
+    from .constants import RESUME_ONLY_CHECKPOINT_KEYS
+    from .evaluate import load_checkpoint_for_inference
+    from .train import build_synthetic_trainer
+
+    with tempfile.TemporaryDirectory(prefix="knee_mri_epoch_ckpt_") as tmp:
+        try:
+            small = cfg.copy()
+            small.train.num_workers = 0
+            small.train.eval_num_workers = 0
+            small.train.accumulation_steps = 2
+            small.train.early_stopping_patience = 10
+            small.train.ema_decay = 0.9
+            small.train.resume = None
+            small.train.init_weights = None
+            small.paths.output_dir = str(Path(tmp) / "runs")
+            small.eval.save_epoch_predictions = True
+            small.eval.save_epoch_checkpoints = True
+            trainer = build_synthetic_trainer(small, n_studies=6, epochs=2, name="epochs")
+            trainer.fit()
+            run = Path(tmp) / "runs" / "epochs"
+            epochs = list(pd.read_csv(run / "history.csv")["epoch"])
+            files = sorted((run / "epoch_checkpoints").glob("ep*.pt"))
+            assert [f.name for f in files] == [f"ep{e:02d}.pt" for e in epochs], [f.name for f in files]
+            device = trainer.device_spec.device
+            for epoch, path in zip(epochs, files):
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+                assert payload["epoch"] == epoch, (payload["epoch"], epoch)
+                leaked = [k for k in RESUME_ONLY_CHECKPOINT_KEYS if k in payload]
+                assert not leaked, f"{path.name} keeps resume-only keys {leaked}"
+                model, _ = load_checkpoint_for_inference(trainer.cfg, path)
+                ids, scores = trainer.predict(trainer.val_loader, model.to(device))
+                frame = pd.read_csv(run / "epoch_predictions" / f"validation_predictions_ep{epoch:02d}.csv",
+                                    dtype={STUDY_ID: str})
+                saved = frame.pivot(index=STUDY_ID, columns="target", values="score").loc[ids, list(TARGETS)]
+                assert np.allclose(saved.to_numpy(float), scores, atol=1e-5), f"{path.name} does not reproduce its epoch"
+            last = torch.load(run / "last.pt", map_location="cpu", weights_only=False)
+            final = torch.load(files[-1], map_location="cpu", weights_only=False)
+            assert all(torch.equal(last["model"][k], final["model"][k]) for k in last["model"]), "last epoch != last.pt"
+        finally:
+            remove_file_logging(tmp)
+    return f"{len(files)} inference-only epoch checkpoints reproduce their epoch's predictions"
+
+
 def check_ema_off_is_identity(cfg: Config) -> str:
     """ema_decay = 0 leaves the payload, history and resume signature exactly as before."""
     import tempfile
@@ -4661,6 +4710,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("ema_checkpoint_roundtrip", lambda: check_ema_checkpoint_roundtrip(small)),
                 ("ema_off_is_identity", lambda: check_ema_off_is_identity(small)),
                 ("epoch_subset_history", lambda: check_epoch_subset_history(small)),
+                ("epoch_checkpoints", lambda: check_epoch_checkpoints(small)),
                 ("target_attention_starts_as_head", lambda: check_target_attention_starts_as_head(small)),
                 ("target_attention_checkpoints", lambda: check_target_attention_checkpoints(small, tmp_dir)),
                 ("target_attention_training_step", lambda: check_target_attention_training_step(small)),

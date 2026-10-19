@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from . import distributed as dist_utils
 from .config import Config, save_config
 from .constants import (
-    CHECKPOINT_VERSION, DEFAULT_BACKBONE, LABELS_VERSION, PREPROCESS_VERSION, SPLITS_VERSION, STUDY_ID, TARGETS,
+    CHECKPOINT_VERSION, DEFAULT_BACKBONE, LABELS_VERSION, PREPROCESS_VERSION, RESUME_ONLY_CHECKPOINT_KEYS,
+    SPLITS_VERSION, STUDY_ID, TARGETS,
 )
 from .dataset import (
     EpochSampler,
@@ -267,6 +268,7 @@ class Trainer:
             reference.study_ids, read_reference_subsets(cfg.paths.get("reference_subsets_csv"))
         )
         self.save_epoch_predictions = bool(cfg.eval.get("save_epoch_predictions", True))
+        self.save_epoch_checkpoints = bool(cfg.eval.get("save_epoch_checkpoints", False))
 
         # Multi-GPU (torchrun): one process per GPU, see distributed.py. `self.model` stays the
         # bare module (state_dict keys, EMA, validation and checkpoints are unchanged); only the
@@ -930,11 +932,14 @@ class Trainer:
             "normalization": {"profile": str(self.cfg.data.encoder_normalization), "mean": list(mean), "std": list(std)},
         }
 
-    def save_checkpoint(self, name: str, extra: dict | None = None) -> Path:
+    def save_checkpoint(self, name: str, extra: dict | None = None, inference_only: bool = False) -> Path:
         """Under DDP every rank calls this; rank 0 writes the file (atomically: an interrupted
-        save keeps the previous best.pt / last.pt)."""
+        save keeps the previous best.pt / last.pt). `inference_only` drops what only an exact
+        resume reads (optimizer, raw weights, RNG, history): the file loads like best.pt."""
         path = self.run_dir / name
         payload = self.checkpoint_payload(extra)
+        if inference_only:
+            payload = {k: v for k, v in payload.items() if k not in RESUME_ONLY_CHECKPOINT_KEYS}
         if dist_utils.is_main():
             atomic_torch_save(payload, path)
         return path
@@ -1170,6 +1175,9 @@ class Trainer:
                     self.state.epochs_without_improvement += 1
 
             self.save_checkpoint("last.pt")
+            if self.save_epoch_checkpoints:
+                # Every epoch's selected (EMA) weights, inference-only, for epoch-selection / ensembles.
+                self.save_checkpoint(str(Path("epoch_checkpoints") / f"ep{epoch:02d}.pt"), inference_only=True)
             if self.state.epochs_without_improvement >= int(self.cfg.train.early_stopping_patience):
                 LOG.info(
                     "Early stopping: %d epochs without improvement (best %.4f @ epoch %d)",
