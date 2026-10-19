@@ -204,6 +204,12 @@ train:
   log_every: 20
   resume: null                     # path to last.pt: continue the SAME run exactly (checked)
   init_weights: null               # path to a checkpoint: NEW run from its weights (fresh optimizer/best/history)
+  # Category-group specialist: only these targets' labels enter the loss (null = all 12), e.g.
+  # [Medial OA, Lateral OA, PF OA]. The model keeps 12 outputs; use only these as predictions.
+  loss_targets: null
+  # train.init_weights is checked against this run's validation / excluded studies through the
+  # source's recorded training studies; true starts from an older checkpoint without them (unverified).
+  init_weights_unverified: false
 
 eval:
   threshold: 0.5
@@ -211,6 +217,9 @@ eval:
   # Early stopping / checkpoint metric. macro_soft_auc equals macro_roc_auc on a binary
   # reference and also ranks continuous reference values (see metrics.soft_roc_auc).
   selection_metric: "macro_soft_auc"   # macro_soft_auc|macro_roc_auc
+  # Select / early-stop on the mean of that AUC over these targets (null = the macro over all).
+  # Required, and a subset of train.loss_targets, when train.loss_targets is set.
+  selection_targets: null
   # Every epoch's validation predictions to <run>/epoch_predictions/ (~0.8 MB per epoch on the 450),
   # beside the per-subset macros in history.csv; best.pt / validation_predictions.csv keep the selected epoch.
   save_epoch_predictions: true

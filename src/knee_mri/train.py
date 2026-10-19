@@ -27,10 +27,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 
 from . import distributed as dist_utils
-from .config import Config, save_config
+from .config import Config, save_config, target_subset
 from .constants import (
     CHECKPOINT_VERSION, DEFAULT_BACKBONE, LABELS_VERSION, PREPROCESS_VERSION, RESUME_ONLY_CHECKPOINT_KEYS,
-    SPLITS_VERSION, STUDY_ID, TARGETS,
+    SPLITS_VERSION, STUDY_ID, TARGETS, TRAIN_STUDIES_FILE,
 )
 from .dataset import (
     EpochSampler,
@@ -54,7 +54,15 @@ from .loss import (
 )
 from .ema import ModelEMA
 from .encoders import ADAPTER_VERSIONS
-from .metrics import evaluate_predictions, read_reference_subsets, selection_metric, soft_target_warning, subset_masks
+from .metrics import (
+    GROUP_SELECTION_METRICS,
+    evaluate_predictions,
+    group_metrics,
+    read_reference_subsets,
+    selection_metric,
+    soft_target_warning,
+    subset_masks,
+)
 from .model import build_model
 from .preprocess import preprocess_hash
 from .splits import (
@@ -262,6 +270,31 @@ class Trainer:
         self.reference = reference
         self.provenance = provenance or {}
         self.selection_name = str(cfg.eval.get("selection_metric", "macro_soft_auc"))
+        # eval.selection_targets: select on that target group's mean of the same AUC; the macros
+        # are still computed and logged.
+        self.selection_targets = target_subset(cfg.eval.get("selection_targets"), "eval.selection_targets")
+        self.select_on_group = self.selection_targets is not None
+        self.selection_label = (
+            GROUP_SELECTION_METRICS[self.selection_name] if self.select_on_group else self.selection_name
+        )
+        # train.loss_targets (a category-group specialist): only these targets' labels enter the
+        # training loss; the label weights of the others are zeroed on every training batch and in
+        # the global denominators, so every normalisation policy counts the active targets only.
+        # The model keeps its 12 outputs; validation and reports still score all of them.
+        self.loss_targets = target_subset(cfg.train.get("loss_targets"), "train.loss_targets")
+        self.loss_mask: torch.Tensor | None = None
+        if self.loss_targets is not None:
+            self.loss_mask = torch.zeros(len(TARGETS), dtype=torch.float32)
+            self.loss_mask[[TARGETS.index(t) for t in self.loss_targets]] = 1.0
+            LOG.info("Loss targets (train.loss_targets): %s; every other target gets weight 0", self.loss_targets)
+        # Where train.init_weights came from (load_weights), for the checkpoint metadata.
+        self.init_source: dict | None = None
+        # The studies this run trains on, stored in every checkpoint and in run_dir/train_studies.csv,
+        # so a later train.init_weights can prove these weights never saw its validation studies.
+        self.train_study_ids = sorted(str(s) for s in (getattr(train_dataset, "study_ids", None) or []))
+        if dist_utils.is_main() and self.train_study_ids:
+            atomic_write_dataframe(pd.DataFrame({STUDY_ID: self.train_study_ids}), self.run_dir / TRAIN_STUDIES_FILE)
+        self._grad_norms: list[float] = []  # pre-clip gradient norms of the current epoch
         # Reference subsets (paths.reference_subsets_csv, e.g. original_208 / new_242) scored every
         # epoch from the same predictions as the full set; the checkpoint is still selected on the full set.
         self.reference_subsets = subset_masks(
@@ -355,8 +388,11 @@ class Trainer:
         self.loss_normalization = str(cfg.train.get("loss_normalization", "microbatch"))
         self.global_normalizer: GlobalNormalizer | None = None
         if self.loss_normalization == "global":
+            weight_matrix = train_dataset.label_weight_matrix()
+            if self.loss_mask is not None:
+                weight_matrix = weight_matrix * self.loss_mask.numpy()
             self.global_normalizer = GlobalNormalizer.from_training_weights(
-                train_dataset.label_weight_matrix(),
+                weight_matrix,
                 window_studies=int(cfg.train.microbatch_studies) * self.accumulation_steps,
             )
             LOG.info("Global loss denominators D_c (expected weight per window): %s", self.global_normalizer.describe())
@@ -470,6 +506,10 @@ class Trainer:
         # Only when on, so checkpoints from before the key existed still resume.
         if self.ema_decay > 0:
             signature["train.ema_decay"] = self.ema_decay
+        # Likewise the category-group keys (train.loss_targets, eval.selection_targets).
+        for key, attr in (("train.loss_targets", "loss_targets"), ("eval.selection_targets", "selection_targets")):
+            if getattr(self, attr, None) is not None:
+                signature[key] = list(getattr(self, attr))
         # Only under DDP: the shard order and per-rank RNG streams need the same process count.
         world_size = getattr(self, "world_size", 1)
         if world_size > 1:
@@ -510,6 +550,12 @@ class Trainer:
             logits = self.train_model(images, slice_valid, present)
         return logits, targets, weights
 
+    def _mask_loss_targets(self, batch: dict) -> dict:
+        """train.loss_targets: zero the label weights of every other target (training batches only)."""
+        if self.loss_mask is not None:
+            batch["label_weights"] = batch["label_weights"] * self.loss_mask
+        return batch
+
     def _sync_context(self, window_end: bool):
         """DDP: gradients are all-reduced only at the last backward of an accumulation window."""
         if self.world_size > 1 and not window_end:
@@ -532,7 +578,11 @@ class Trainer:
     def _optimizer_step(self) -> None:
         if float(self.cfg.train.grad_clip) > 0:
             self.scaler.unscale_(self.optimizer)  # clip on unscaled gradients
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.cfg.train.grad_clip))
+            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.cfg.train.grad_clip))
+            # Identical on every rank (the gradients are all-reduced by now).
+            norms = getattr(self, "_grad_norms", None)
+            if norms is not None:
+                norms.append(float(norm))
         scale_before = self.scaler.get_scale() if self.scaler.is_enabled() else None
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -574,6 +624,7 @@ class Trainer:
 
         started = time.time()
         self.optimizer.zero_grad(set_to_none=True)
+        self._grad_norms = []
         reset_peak_gpu_memory()
         if self.loss_normalization in ("window", "global"):
             accumulator, n_studies, data_failures, objective = self._train_windows(epoch, started)
@@ -602,9 +653,22 @@ class Trainer:
                 "head_lr": self.optimizer.param_groups[1]["lr"],
                 "peak_gpu_gb": round(peak_gpu_memory_gb(), 3),
                 "studies_without_any_series": data_failures,
+                **self._grad_norm_summary(),
             }
         )
         return summary
+
+    def _grad_norm_summary(self) -> dict:
+        """Median pre-clip gradient norm and the share of optimizer steps train.grad_clip cut.
+
+        The loss scale depends on the number of active targets (train.loss_targets), so with a
+        fixed clip threshold two runs can step with different effective learning rates.
+        """
+        norms = np.asarray([n for n in self._grad_norms if np.isfinite(n)], dtype=np.float64)
+        clip = float(self.cfg.train.grad_clip)
+        if not len(norms) or clip <= 0:
+            return {"grad_norm_median": float("nan"), "grad_clip_fraction": float("nan")}
+        return {"grad_norm_median": float(np.median(norms)), "grad_clip_fraction": float((norms > clip).mean())}
 
     def _reduce_epoch_counts(self, accumulator: LossAccumulator, n_studies: int, data_failures: int) -> tuple[int, int]:
         """DDP: sum the epoch's loss accounting over the ranks, so every rank reports the whole epoch."""
@@ -639,6 +703,7 @@ class Trainer:
         data_failures = 0
 
         for index, batch in enumerate(self.train_loader):
+            batch = self._mask_loss_targets(batch)
             is_window_end = (index + 1) == len(self.train_loader) or ((index + 1) % self.local_accumulation == 0)
             data_failures += int(sum(1 for m in batch["meta"] if m.get("n_present_slots", 0) == 0))
             with self._sync_context(is_window_end):
@@ -688,7 +753,7 @@ class Trainer:
         while remaining > 0:
             size = min(self.local_accumulation, remaining)
             remaining -= size
-            window = [next(iterator) for _ in range(size)]
+            window = [self._mask_loss_targets(next(iterator)) for _ in range(size)]
             window_supervised = any(bool((b["label_weights"] > 0).any()) for b in window)
             if self.global_normalizer is not None:
                 normalizer: WindowNormalizer | GlobalNormalizer = self.global_normalizer
@@ -758,10 +823,12 @@ class Trainer:
             with autocast_ctx(self.device_spec):
                 logits = model(images, slice_valid, present)
             if loss is not None:
+                # The same targets as train_loss: train.loss_targets masks the validation labels too.
+                weights = self._mask_loss_targets({"label_weights": batch["label_weights"]})["label_weights"]
                 output = masked_class_normalized_bce(
                     logits.float(),
                     batch["targets"].to(self.device_spec.device),
-                    batch["label_weights"].to(self.device_spec.device),
+                    weights.to(self.device_spec.device),
                 )
                 loss.update(output, n_studies=int(logits.shape[0]))
             scores.append(torch.sigmoid(logits.float()).cpu().numpy())
@@ -775,7 +842,7 @@ class Trainer:
             # The raw weights on the same studies: a paired, same-seed EMA-vs-raw comparison.
             _, raw_summary, _ = self._score(self.model, epoch)
             summary["raw_macro_roc_auc"] = raw_summary["macro_roc_auc"]
-            summary["raw_selection_score"] = selection_metric(raw_summary, self.selection_name)
+            summary["raw_selection_score"] = selection_metric(raw_summary, self.selection_name, self.select_on_group)
         return table, summary, predictions
 
     def _score(self, model: torch.nn.Module, epoch: int) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
@@ -806,9 +873,16 @@ class Trainer:
             min_support=int(self.cfg.eval.min_class_support),
         )
         summary["epoch"] = epoch
+        if self.select_on_group:
+            summary["selection_targets"] = list(self.selection_targets)
+            summary.update(group_metrics(table, self.selection_targets))
+        if getattr(self, "loss_targets", None) is not None:
+            # Reference BCE over the targets the loss sees: the macro_bce also averages outputs that
+            # get no supervision and drift with the shared backbone.
+            summary["loss_group_ref_bce"] = group_metrics(table, self.loss_targets)["group_bce"]
         summary["subsets"] = {}
         for name, mask in self.reference_subsets:
-            _, part = evaluate_predictions(
+            part_table, part = evaluate_predictions(
                 aligned[mask],
                 self.reference.values[mask],
                 self.reference.valid[mask],
@@ -821,6 +895,8 @@ class Trainer:
                 "macro_roc_auc": part["macro_roc_auc"],
                 "n_defined_targets": part["n_defined_targets"],
             }
+            if self.select_on_group:
+                summary["subsets"][name].update(group_metrics(part_table, self.selection_targets))
         # The train_loss quantity on the validation studies' training labels. NaN when they carry
         # none (holdout on a radiologist reference): macro_bce against the reference is then the loss.
         summary["label_loss"] = label_loss.macro
@@ -883,6 +959,13 @@ class Trainer:
             "best_score": self.state.best_score,
             "best_epoch": self.state.best_epoch,
             "selection_metric": self.selection_name,
+            # Category-group runs: the selection group, the targets the loss saw (in the configured
+            # order; null = all 12) and the train.init_weights source. Only the loss targets'
+            # outputs of a specialist are meant to be used as predictions.
+            "selection_targets": None if self.selection_targets is None else list(self.selection_targets),
+            "loss_targets": None if self.loss_targets is None else list(self.loss_targets),
+            "init_source": self.init_source,
+            "train_study_ids": self.train_study_ids,
             "target_order": list(TARGETS),
             "config": self.cfg.to_dict(),
             "model_description": self.model.describe(),
@@ -959,6 +1042,55 @@ class Trainer:
             )
         return payload
 
+    def _init_leak_check(self, path: Path, payload: dict) -> dict:
+        """train.init_weights must never carry weights that saw this run's validation studies or a
+        paths.exclude_from_training_csv study - a hard gate, like the split checks.
+
+        The source's training studies come from the checkpoint (`train_study_ids`) or, for an older
+        checkpoint, from a train_studies.csv beside it or in its run directory (tools/write_train_studies.py).
+        Without either, the start is refused unless train.init_weights_unverified=true.
+        """
+        source = payload.get("train_study_ids")
+        origin = "checkpoint"
+        if not source:
+            source = None
+            for sidecar in (path.parent / TRAIN_STUDIES_FILE, path.parent.parent / TRAIN_STUDIES_FILE):
+                if sidecar.exists():
+                    source = list(pd.read_csv(sidecar, dtype={STUDY_ID: "string"})[STUDY_ID].dropna().astype(str))
+                    origin = str(sidecar)
+                    break
+        if not source:
+            if not bool(self.cfg.train.get("init_weights_unverified", False)):
+                raise ValueError(
+                    f"train.init_weights={path} does not record its training studies (an older checkpoint), so "
+                    "it cannot be checked against this run's validation studies. Write them with "
+                    "`python tools/write_train_studies.py <its run dir>`, or set train.init_weights_unverified=true "
+                    "if you know it never trained on them (the start is then recorded as unverified)."
+                )
+            LOG.warning(
+                "train.init_weights=%s: its training studies are unknown; NOT checked against the validation "
+                "studies (train.init_weights_unverified=true).",
+                path,
+            )
+            return {"status": "unverified"}
+        trained = set(source)
+        validation = set(str(s) for s in self.reference.study_ids)
+        excluded = load_excluded_training_ids(self.cfg) or set()
+        seen_val, seen_excluded = sorted(trained & validation), sorted(trained & excluded)
+        if seen_val or seen_excluded:
+            raise RuntimeError(
+                f"train.init_weights={path} was trained on {len(seen_val)} of this run's validation studies and "
+                f"{len(seen_excluded)} studies of paths.exclude_from_training_csv (e.g. {(seen_val + seen_excluded)[:3]}). "
+                "Fine-tuning from it leaks the evaluation set into the new run; start from a checkpoint whose "
+                "training excluded them."
+            )
+        LOG.info(
+            "train.init_weights leak check passed: none of its %d training studies (%s) is among the %d validation "
+            "studies or the %d excluded studies.",
+            len(trained), origin, len(validation), len(excluded),
+        )
+        return {"status": "passed", "source": origin, "n_source_studies": len(trained)}
+
     def load_weights(self, path: str | Path) -> None:
         """Fine-tune start (`train.init_weights`): model weights only.
 
@@ -972,9 +1104,21 @@ class Trainer:
                 f"train.init_weights={path} is a {stored_backbone} checkpoint but model.backbone={self.model.backbone}. "
                 "Switching the backbone is a new experiment: start it from the backbone's pretrained weights."
             )
+        leak_check = self._init_leak_check(Path(str(path)), payload)
         self.model.load_state_dict(payload["model"])
         if self.ema is not None:
             self.ema.reset(self.model)
+        self.init_source = {
+            "leak_check": leak_check,
+            "path": str(path),
+            "run": Path(str(path)).parent.name,
+            "epoch": payload.get("epoch"),
+            "best_epoch": payload.get("best_epoch"),
+            "best_score": payload.get("best_score"),
+            "selection_metric": payload.get("selection_metric"),
+            "loss_targets": payload.get("loss_targets"),
+            "train_csv": (((payload.get("config") or {}).get("paths") or {}).get("train_csv")),
+        }
         LOG.info(
             "Initialised the model from %s (epoch %s of that run); optimizer, schedule, best score and "
             "history start fresh.",
@@ -1013,6 +1157,7 @@ class Trainer:
         else:
             self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
+        self.init_source = payload.get("init_source")  # a resumed fine-tune keeps its origin
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         # The stored epoch is the last *completed* one; training continues with the next.
@@ -1064,7 +1209,7 @@ class Trainer:
             self.state.epoch = epoch
             train_summary = self.train_epoch(epoch)
             table, val_summary, predictions = self.validate(epoch)
-            score = selection_metric(val_summary, self.selection_name)
+            score = selection_metric(val_summary, self.selection_name, self.select_on_group)
 
             record = {
                 "epoch": epoch,
@@ -1080,7 +1225,10 @@ class Trainer:
                 "seconds": train_summary["seconds"],
                 "studies_per_second": train_summary["studies_per_second"],
                 "peak_gpu_gb": train_summary["peak_gpu_gb"],
-                # The early-stopping score (eval.selection_metric); the named macros are logged beside it.
+                "grad_norm_median": train_summary["grad_norm_median"],
+                "grad_clip_fraction": train_summary["grad_clip_fraction"],
+                # The early-stopping score (eval.selection_metric, over eval.selection_targets when
+                # set); the named macros are logged beside it.
                 "val_selection_score": score,
                 # Same quantity as train_loss, on the validation studies' training labels (NaN if none).
                 "val_loss": val_summary["label_loss"],
@@ -1094,17 +1242,24 @@ class Trainer:
                 "val_macro_ap": val_summary["macro_average_precision"],
                 "val_macro_f1": val_summary["macro_f1_at_threshold"],
             }
+            if self.select_on_group:
+                record["val_group_soft_auc"] = val_summary["group_soft_auc"]
+                record["val_group_roc_auc"] = val_summary["group_roc_auc"]
+            if self.loss_targets is not None:
+                record["val_loss_group_ref_bce"] = val_summary["loss_group_ref_bce"]
             # Per reference subset, from the same predictions: which epoch each subset would pick.
             for name, part in val_summary["subsets"].items():
                 record[f"val_{name}_macro_soft_auc"] = part["macro_soft_auc"]
                 record[f"val_{name}_macro_roc_auc"] = part["macro_roc_auc"]
+                if self.select_on_group:
+                    record[f"val_{name}_group_soft_auc"] = part["group_soft_auc"]
             if self.ema is not None:
                 record["val_selection_score_raw"] = val_summary["raw_selection_score"]
                 record["val_macro_roc_auc_raw"] = val_summary["raw_macro_roc_auc"]
                 LOG.info(
                     "epoch %d | EMA %s %.4f vs raw %.4f",
                     epoch,
-                    self.selection_name,
+                    self.selection_label,
                     score,
                     val_summary["raw_selection_score"],
                 )
@@ -1123,7 +1278,8 @@ class Trainer:
                     "epoch %d | subsets %s",
                     epoch,
                     " | ".join(
-                        f"{name} {self.selection_name} {_fmt(selection_metric(part, self.selection_name))}"
+                        f"{name} {self.selection_label} "
+                        f"{_fmt(selection_metric(part, self.selection_name, self.select_on_group))}"
                         for name, part in val_summary["subsets"].items()
                     ),
                 )
@@ -1135,7 +1291,7 @@ class Trainer:
                 _fmt(record["val_loss"]),
                 _fmt(record["val_ref_bce"]),
                 _fmt(record["val_macro_brier"]),
-                self.selection_name,
+                self.selection_label,
                 f"{score:.4f}" if np.isfinite(score) else "NA",
                 f"{val_summary['macro_roc_auc']:.4f}" if np.isfinite(val_summary["macro_roc_auc"]) else "NA",
                 val_summary["defined_fraction"],
@@ -1147,10 +1303,11 @@ class Trainer:
             if not np.isfinite(score):
                 no_defined_auc_epochs += 1
                 LOG.error(
-                    "No validation target has a defined %s (ROC-AUC undefined for: %s). The checkpoint "
+                    "%s has no defined %s (ROC-AUC undefined for: %s). The checkpoint "
                     "is NOT selected on a NaN, and the radiologist reference audit must not be used as "
                     "a substitute selection criterion.",
-                    self.selection_name,
+                    f"The selection group {self.selection_targets}" if self.select_on_group else "No validation target",
+                    self.selection_label,
                     val_summary["undefined_targets"],
                 )
                 if no_defined_auc_epochs >= 2:
@@ -1170,7 +1327,7 @@ class Trainer:
                         atomic_write_dataframe(table, self.run_dir / "metrics_per_class.csv")
                         atomic_write_dataframe(predictions, self.run_dir / "validation_predictions.csv")
                         atomic_write_json(self.run_dir / "val_summary.json", val_summary)
-                    LOG.info("New best %s %.4f at epoch %d -> best.pt", self.selection_name, score, epoch)
+                    LOG.info("New best %s %.4f at epoch %d -> best.pt", self.selection_label, score, epoch)
                 else:
                     self.state.epochs_without_improvement += 1
 
@@ -1194,6 +1351,9 @@ class Trainer:
             "mode": self.mode,
             "fold": int(self.cfg.split.fold),
             "selection_metric": self.selection_name,
+            "selection_targets": None if self.selection_targets is None else list(self.selection_targets),
+            "loss_targets": None if self.loss_targets is None else list(self.loss_targets),
+            "init_source": self.init_source,
             "ema_decay": self.ema_decay,
             "best_score": self.state.best_score if np.isfinite(self.state.best_score) else None,
             "best_epoch": self.state.best_epoch,

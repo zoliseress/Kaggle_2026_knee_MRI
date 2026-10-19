@@ -206,6 +206,18 @@ def test_window_training_step(cfg):
     selftest.check_window_training_step(cfg)
 
 
+def test_target_subset_config(cfg):
+    selftest.check_target_subset_config(cfg)
+
+
+def test_specialist_blend():
+    selftest.check_specialist_blend()
+
+
+def test_loss_targets_training(cfg):
+    selftest.check_loss_targets_training(cfg)
+
+
 def test_epoch_reaches_workers(cfg):
     selftest.check_epoch_reaches_workers(cfg)
 

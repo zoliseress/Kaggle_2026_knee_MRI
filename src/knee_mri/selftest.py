@@ -786,6 +786,238 @@ def check_window_training_step(cfg: Config) -> str:
     return f"synthetic run with the window policy: {len(history)} epochs, objective {history['train_objective'].round(4).tolist()}"
 
 
+OA_GROUP = ["Medial OA", "Lateral OA", "PF OA"]
+
+
+def check_target_subset_config(cfg: Config) -> str:
+    """train.loss_targets / eval.selection_targets: names map to TARGETS; bad lists fail loudly."""
+    from .config import target_subset
+    from .metrics import group_metrics, selection_metric
+
+    assert target_subset(None, "k") is None
+    assert target_subset(list(reversed(OA_GROUP)), "k") == list(reversed(OA_GROUP)), "the configured order must be kept"
+    for bad, needle in (
+        (["Medial OA", "Medial OA"], "more than once"),
+        (["Medial OA", "Lateral Menicus"], "unknown"),
+        ([], "empty"),
+        ("Medial OA", "list"),
+    ):
+        try:
+            target_subset(bad, "train.loss_targets")
+        except ValueError as error:
+            assert needle in str(error) and "train.loss_targets" in str(error), error
+        else:
+            raise AssertionError(f"{bad!r} was accepted")
+    wrong = cfg.copy()
+    wrong.train.loss_targets = ["Lateral OA", "Synovits"]
+    try:
+        validate_config(wrong)
+    except ValueError as error:
+        assert "train.loss_targets" in str(error)
+    else:
+        raise AssertionError("validate_config accepted an unknown loss target")
+    # A specialist must select on (a subset of) what it trains; a control may select on a group alone.
+    for selection, needle in ((None, "needs eval.selection_targets"), (["Lateral OA", "ACL"], "does not train")):
+        cross = cfg.copy()
+        cross.train.loss_targets = list(OA_GROUP)
+        cross.eval.selection_targets = selection
+        try:
+            validate_config(cross)
+        except ValueError as error:
+            assert needle in str(error), error
+        else:
+            raise AssertionError(f"loss_targets {OA_GROUP} with selection_targets {selection} was accepted")
+    fine = cfg.copy()
+    fine.train.loss_targets = list(OA_GROUP)
+    fine.eval.selection_targets = ["Lateral OA"]
+    validate_config(fine)
+    fine.train.loss_targets = None
+    fine.eval.selection_targets = list(OA_GROUP)
+    validate_config(fine)
+
+    # The group mean is NA as soon as one group target is undefined, never the mean of the rest.
+    table = pd.DataFrame({"target": TARGETS, "soft_auc": np.linspace(0.6, 0.9, N_TARGETS), "roc_auc": 0.7})
+    group = group_metrics(table, OA_GROUP)
+    expected = float(table.set_index("target").loc[OA_GROUP, "soft_auc"].mean())
+    assert math.isclose(group["group_soft_auc"], expected) and math.isclose(group["group_roc_auc"], 0.7)
+    summary = {"macro_soft_auc": 0.5, **group}
+    assert selection_metric(summary, "macro_soft_auc") == 0.5
+    assert math.isclose(selection_metric(summary, "macro_soft_auc", group=True), expected)
+    table.loc[table["target"] == "PF OA", "soft_auc"] = np.nan
+    assert np.isnan(group_metrics(table, OA_GROUP)["group_soft_auc"]), "an undefined group target must give NA"
+    return ("names keep their order; unknown / duplicate / empty / non-list refused; a specialist selects on a subset "
+            "of its loss targets; group mean NA on an undefined target")
+
+
+def check_specialist_blend() -> str:
+    """The blend moves only the group columns, matches rows by study id, and refuses mismatches."""
+    from .blend import blend_specialist, long_to_wide
+
+    rng = np.random.default_rng(3)
+    ids = [f"s{i}" for i in range(5)]
+    base = pd.DataFrame(rng.random((5, N_TARGETS)), columns=TARGETS).assign(**{STUDY_ID: ids})[[STUDY_ID, *TARGETS]]
+    spec = pd.DataFrame(rng.random((5, N_TARGETS)), columns=TARGETS).assign(**{STUDY_ID: ids})[[STUDY_ID, *TARGETS]]
+    shuffled = spec.iloc[::-1].reset_index(drop=True)[[STUDY_ID, *reversed(TARGETS)]]  # rows and columns reordered
+    out = blend_specialist(base, shuffled, OA_GROUP, alpha=0.5)
+    assert list(out[STUDY_ID]) == ids and list(out.columns) == [STUDY_ID, *TARGETS], "base order must be kept"
+    others = [t for t in TARGETS if t not in OA_GROUP]
+    assert out[others].equals(base[others]), "a non-group target changed"
+    assert np.allclose(out[OA_GROUP].to_numpy(), 0.5 * base[OA_GROUP].to_numpy() + 0.5 * spec[OA_GROUP].to_numpy())
+    assert blend_specialist(base, spec, OA_GROUP, alpha=0.0)[TARGETS].equals(base[TARGETS]), "alpha 0 must be the base"
+    for bad in (spec.iloc[:4], spec.assign(**{STUDY_ID: [*ids[:4], "other"]})):
+        try:
+            blend_specialist(base, bad, OA_GROUP, alpha=0.5)
+        except ValueError as error:
+            assert "different studies" in str(error), error
+        else:
+            raise AssertionError("a specialist over other studies was accepted")
+    try:
+        blend_specialist(base, spec, OA_GROUP, alpha=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("alpha outside [0, 1] was accepted")
+    long = base.melt(id_vars=STUDY_ID, var_name="target", value_name="score").sample(frac=1.0, random_state=0)
+    wide = long_to_wide(long).set_index(STUDY_ID).loc[ids].reset_index()
+    assert np.allclose(wide[TARGETS].to_numpy(), base[TARGETS].to_numpy()), "long -> wide changed a score"
+    return "only the group columns move (by name and study id); alpha 0 = base; other studies / alpha refused"
+
+
+def check_loss_targets_training(cfg: Config) -> str:
+    """train.loss_targets: the loss and its normalisers see only the group; selection on the group mean."""
+    import tempfile
+
+    from .train import build_synthetic_trainer
+
+    small = cfg.copy()
+    small.train.loss_normalization = "global"
+    small.train.accumulation_steps = 2
+    small.train.microbatch_studies = 1
+    small.train.num_workers = 0
+    small.train.eval_num_workers = 0
+    small.train.early_stopping_patience = 10
+    small.train.resume = None
+    small.train.init_weights = None
+    group_idx = [TARGETS.index(t) for t in OA_GROUP]
+    others = [i for i in range(N_TARGETS) if i not in group_idx]
+    with tempfile.TemporaryDirectory(prefix="knee_mri_loss_targets_") as tmp:
+        small.paths.output_dir = str(Path(tmp))
+        try:
+            base = build_synthetic_trainer(small, n_studies=6, epochs=2, name="base")
+            assert base.loss_mask is None and base.global_normalizer.n_active == N_TARGETS
+            batch = next(iter(base.train_loader))
+            before = batch["label_weights"].clone()
+            assert torch.equal(base._mask_loss_targets(batch)["label_weights"], before), "the default must not mask"
+
+            spec_cfg = small.copy()
+            spec_cfg.train.loss_targets = list(OA_GROUP)
+            spec_cfg.eval.selection_targets = list(OA_GROUP)
+            # 32 studies -> 16 validation studies, so every group target has both classes.
+            spec = build_synthetic_trainer(spec_cfg, n_studies=32, epochs=2, name="spec")
+            norm = spec.global_normalizer
+            assert norm.n_active == len(OA_GROUP), f"|C+| = {norm.n_active}, expected {len(OA_GROUP)}"
+            unmasked = GlobalNormalizer.from_training_weights(
+                spec.train_loader.dataset.label_weight_matrix(), window_studies=spec.accumulation_steps
+            )
+            assert torch.equal(norm.denominators[group_idx], unmasked.denominators[group_idx]), "group D_c changed"
+            assert bool((norm.denominators[others] == 0).all()), "a non-group target kept a denominator"
+
+            masked = spec._mask_loss_targets({"label_weights": before.clone()})["label_weights"]
+            assert bool((masked[:, others] == 0).all()) and torch.equal(masked[:, group_idx], before[:, group_idx])
+            window = WindowNormalizer.from_weights(masked)
+            assert window.n_active <= len(OA_GROUP)
+
+            # Gradient reaches the group logits only, scaled by 1/|C+| = 1/3, not 1/12.
+            logits = torch.randn(masked.shape, requires_grad=True)
+            targets = torch.rand(masked.shape)
+            out = global_normalized_bce(logits, targets, masked, norm)
+            out.loss.backward()
+            assert bool((logits.grad[:, others] == 0).all()), "a non-group logit got a gradient"
+            manual = sum(
+                float((masked[:, c] * torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits[:, c].detach(), targets[:, c], reduction="none")).sum() / norm.denominators[c])
+                for c in group_idx
+            ) / len(OA_GROUP)
+            assert math.isclose(float(out.loss.detach()), manual, rel_tol=1e-5), (float(out.loss.detach()), manual)
+
+            # A micro-batch whose only labels are outside the group: finite zero, no supervision.
+            outside = torch.zeros_like(masked)
+            outside[:, others] = 1.0
+            empty = global_normalized_bce(logits, targets, spec._mask_loss_targets({"label_weights": outside})["label_weights"], norm)
+            assert not empty.has_supervision and float(empty.loss.detach()) == 0.0 and torch.isfinite(empty.loss)
+
+            # The validation label loss covers the same targets as train_loss.
+            val_loss = LossAccumulator()
+            spec.predict(spec.val_loader, loss=val_loss)
+            defined = np.flatnonzero(np.isfinite(val_loss.per_class))
+            assert set(defined.tolist()) <= set(group_idx) and len(defined), f"val loss over targets {defined}"
+
+            spec.fit()
+            history = pd.read_csv(Path(tmp) / "spec" / "history.csv")
+            expected_columns = {"val_group_soft_auc", "val_loss_group_ref_bce", "grad_norm_median", "grad_clip_fraction"}
+            assert expected_columns <= set(history.columns)
+            assert np.allclose(history["val_selection_score"], history["val_group_soft_auc"], equal_nan=True)
+            payload = torch.load(str(Path(tmp) / "spec" / "best.pt"), map_location="cpu", weights_only=False)
+            assert payload["loss_targets"] == OA_GROUP and payload["selection_targets"] == OA_GROUP
+            assert payload["resume_signature"]["train.loss_targets"] == OA_GROUP
+            assert "train.loss_targets" not in base.resume_signature, "old checkpoints must still resume"
+            assert payload["train_study_ids"] == sorted(spec.train_loader.dataset.study_ids)
+            sidecar = pd.read_csv(Path(tmp) / "spec" / "train_studies.csv", dtype={STUDY_ID: "string"})
+            assert list(sidecar[STUDY_ID]) == payload["train_study_ids"]
+
+            # A specialist fine-tune from another run's weights records its source and the leak check.
+            tune_cfg = spec_cfg.copy()
+            tune_cfg.train.init_weights = str(Path(tmp) / "spec" / "best.pt")
+            tuned = build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="tuned")  # loads init_weights
+            source = tuned.checkpoint_payload()["init_source"]
+            assert source["run"] == "spec" and source["loss_targets"] == OA_GROUP, source
+            assert source["leak_check"]["status"] == "passed", source
+
+            # Weights that saw a validation study of the new run are refused ...
+            leak_dir = Path(tmp) / "leaky"
+            leak_dir.mkdir()
+            validation_ids = list(tuned.reference.study_ids)
+            leaky = dict(payload, train_study_ids=[*payload["train_study_ids"], validation_ids[0]])
+            torch.save(leaky, str(leak_dir / "best.pt"))
+            tune_cfg.train.init_weights = str(leak_dir / "best.pt")
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="leak")
+            except RuntimeError as error:
+                assert "validation studies" in str(error), error
+            else:
+                raise AssertionError("init_weights from weights that trained on a validation study was accepted")
+
+            # ... an older checkpoint without its studies needs a sidecar or the explicit flag.
+            legacy_dir = Path(tmp) / "legacy_source"  # not a run name: a run writes its own train_studies.csv
+            legacy_dir.mkdir()
+            torch.save({k: v for k, v in payload.items() if k != "train_study_ids"}, str(legacy_dir / "best.pt"))
+            tune_cfg.train.init_weights = str(legacy_dir / "best.pt")
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="legacy")
+            except ValueError as error:
+                assert "init_weights_unverified" in str(error), error
+            else:
+                raise AssertionError("an older checkpoint without its training studies was accepted unchecked")
+            unverified_cfg = tune_cfg.copy()
+            unverified_cfg.train.init_weights_unverified = True
+            unverified = build_synthetic_trainer(unverified_cfg, n_studies=6, epochs=2, name="unverified")
+            assert unverified.init_source["leak_check"]["status"] == "unverified"
+            pd.DataFrame({STUDY_ID: [validation_ids[1]]}).to_csv(legacy_dir / "train_studies.csv", index=False)
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="legacy_leak")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a sidecar naming a validation study was accepted")
+            sidecar.to_csv(legacy_dir / "train_studies.csv", index=False)
+            clean = build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="legacy_clean")
+            assert clean.init_source["leak_check"]["source"].endswith("train_studies.csv")
+        finally:
+            remove_file_logging(tmp)
+    return (f"|C+| = {len(OA_GROUP)}, off-group denominators, gradients and val loss 0, selection = group mean, "
+            "metadata stored; init_weights leak check refuses seen validation studies and unchecked old checkpoints")
+
+
 def check_epoch_loss_accounting() -> str:
     accumulator = LossAccumulator()
     logits = torch.zeros((2, N_TARGETS))
@@ -3628,7 +3860,8 @@ def check_epoch_subset_history(cfg: Config) -> str:
 
     with tempfile.TemporaryDirectory(prefix="knee_mri_subsets_") as tmp:
         try:
-            ids = [f"synthetic-{i:04d}" for i in range(8)]  # SyntheticBagDataset ids of the 8 validation studies
+            # SyntheticBagDataset ids of the 8 validation studies (build_synthetic_trainer: seed + 1)
+            ids = SyntheticBagDataset(cfg, n_studies=8, seed=int(cfg.seed) + 1).study_ids
             subsets_csv = Path(tmp) / "subsets.csv"
             pd.DataFrame({STUDY_ID: ids + ["elsewhere"], "subset": ["first"] * 4 + ["second"] * 4 + ["absent"]}).to_csv(
                 subsets_csv, index=False
@@ -4645,6 +4878,8 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("window_empty_cases", check_window_empty_cases),
             ("global_loss_matches_formula", check_global_loss_matches_formula),
             ("global_no_dilution", check_global_no_dilution),
+            ("target_subset_config", lambda: check_target_subset_config(small)),
+            ("specialist_blend", check_specialist_blend),
             ("eval_loader_budget", lambda: check_eval_loader_budget(cfg)),
             ("explicit_run_selection", check_explicit_run_selection),
             ("attention_pool_starts_as_average", lambda: check_attention_pool_starts_as_average(effnet)),
@@ -4725,6 +4960,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
                 ("epoch_reaches_workers", lambda: check_epoch_reaches_workers(small)),
                 ("window_training_step", lambda: check_window_training_step(small)),
                 ("global_training_step", lambda: check_global_training_step(small)),
+                ("loss_targets_training", lambda: check_loss_targets_training(small)),
                 ("float16_transport", lambda: check_float16_transport(small)),
                 ("spatial_pool_training_step", lambda: check_spatial_pool_training_step(small)),
                 ("legacy_efficientnet_state_keys", lambda: check_legacy_efficientnet_state_keys(small)),

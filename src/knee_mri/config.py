@@ -251,6 +251,21 @@ def validate_config(cfg: Config) -> None:
 
     if str(cfg.eval.get("selection_metric", "macro_soft_auc")) not in ("macro_soft_auc", "macro_roc_auc"):
         raise ValueError("eval.selection_metric must be 'macro_soft_auc' or 'macro_roc_auc'")
+    loss_targets = target_subset(cfg.train.get("loss_targets"), "train.loss_targets")
+    selection_targets = target_subset(cfg.eval.get("selection_targets"), "eval.selection_targets")
+    if loss_targets is not None:
+        # A specialist's other outputs get no supervision and drift: selecting on the 12-target macro,
+        # or on a target outside the loss, would pick its checkpoint by that drift.
+        if selection_targets is None:
+            raise ValueError(
+                f"train.loss_targets={loss_targets} needs eval.selection_targets (usually the same list): "
+                "otherwise the checkpoint is selected on the macro over all 12 targets, most of them unsupervised"
+            )
+        outside = [t for t in selection_targets if t not in loss_targets]
+        if outside:
+            raise ValueError(
+                f"eval.selection_targets names {outside}, which train.loss_targets={loss_targets} does not train"
+            )
     if str(cfg.selection.get("fluid_te_preference", "t2")) not in ("t2", "pd"):
         raise ValueError("selection.fluid_te_preference must be 't2' or 'pd'")
 
@@ -260,6 +275,28 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("split.fold must be in [0, n_folds)")
     if cfg.split.grouping not in ("auto", "patient", "study"):
         raise ValueError("split.grouping must be one of auto|patient|study")
+
+
+def target_subset(value: Any, key: str) -> list[str] | None:
+    """A target-name list setting (train.loss_targets, eval.selection_targets) in the given order.
+
+    null means all 12 targets (the default behaviour). Names map to TARGETS by exact name; an
+    unknown, duplicated or empty list is an error, never a silent fallback to all targets.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key} must be null or a list of target names, got {value!r}")
+    names = [str(v) for v in value]
+    if not names:
+        raise ValueError(f"{key} must not be empty (null = all targets)")
+    unknown = [n for n in names if n not in TARGETS]
+    if unknown:
+        raise ValueError(f"{key} names unknown targets {unknown}; known: {TARGETS}")
+    duplicated = sorted({n for n in names if names.count(n) > 1})
+    if duplicated:
+        raise ValueError(f"{key} lists {duplicated} more than once")
+    return names
 
 
 def validate_encoder_config(cfg: Config) -> None:

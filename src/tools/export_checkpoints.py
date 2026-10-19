@@ -79,7 +79,9 @@ def export_one(run_dir: Path, out_dir: Path) -> tuple[float, float]:
     for key, value in payload["model"].items():
         if value.dtype != state[key].dtype or not torch.equal(value, state[key]):
             raise RuntimeError(f"{target}: weight {key} differs from the source")
-    for key in ("version", "target_order", "config", "model_description", "versions", "best_epoch", "best_score"):
+    for key in (
+        "version", "target_order", "config", "model_description", "versions", "best_epoch", "best_score", "loss_targets",
+    ):
         if reloaded.get(key) != payload.get(key):
             raise RuntimeError(f"{target}: {key} differs from the source")
     return source.stat().st_size / 2**20, target.stat().st_size / 2**20

@@ -20,6 +20,7 @@ Rules enforced here:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -345,11 +346,34 @@ def soft_target_warning(kinds: np.ndarray) -> str | None:
 
 
 SELECTION_METRICS = ("macro_soft_auc", "macro_roc_auc")
+# eval.selection_targets: the same AUC averaged over a target group instead of all targets.
+GROUP_SELECTION_METRICS = {"macro_soft_auc": "group_soft_auc", "macro_roc_auc": "group_roc_auc"}
 
 
-def selection_metric(summary: dict, name: str = "macro_soft_auc") -> float:
-    """The single number early stopping and checkpoint selection may look at."""
+def group_metrics(table: pd.DataFrame, targets: Sequence[str]) -> dict:
+    """Mean soft / ROC AUC and reference BCE over `targets` from an `evaluate_predictions` table.
+
+    NA as soon as one group target is undefined: a group mean over the survivors would
+    compare different target sets between epochs.
+    """
+    by_target = table.set_index("target")
+    out = {}
+    for column, key in (("soft_auc", "group_soft_auc"), ("roc_auc", "group_roc_auc"), ("bce", "group_bce")):
+        if column not in by_target:
+            out[key] = float("nan")
+            continue
+        values = [by_target[column].get(t, np.nan) for t in targets]
+        values = [float(v) if v is not None else np.nan for v in values]
+        out[key] = float(np.mean(values)) if values and all(np.isfinite(values)) else float("nan")
+    return out
+
+
+def selection_metric(summary: dict, name: str = "macro_soft_auc", group: bool = False) -> float:
+    """The single number early stopping and checkpoint selection may look at.
+
+    `group`: the eval.selection_targets mean of the same AUC (`group_metrics`) instead of the macro.
+    """
     if name not in SELECTION_METRICS:
         raise ValueError(f"selection metric must be one of {SELECTION_METRICS}, got {name!r}")
-    value = summary.get(name, float("nan"))
+    value = summary.get(GROUP_SELECTION_METRICS[name] if group else name, float("nan"))
     return float(value) if value is not None else float("nan")

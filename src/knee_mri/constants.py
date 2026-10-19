@@ -52,6 +52,9 @@ def slot_filter(slot: str) -> str | None:
 
 STUDY_ID = "StudyInstanceUID"
 SERIES_ID = "SeriesInstanceUID"
+# The training studies of a run, beside its checkpoints (the checkpoints also store them as
+# `train_study_ids`): what train.init_weights checks against the new run's validation studies.
+TRAIN_STUDIES_FILE = "train_studies.csv"
 
 # Versions. Bump them when the corresponding artefact format or semantics change;
 # they are written into manifests/caches/checkpoints and checked on reload.

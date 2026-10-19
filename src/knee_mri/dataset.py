@@ -685,6 +685,11 @@ class SyntheticBagDataset(Dataset):
     def __len__(self) -> int:
         return self.n_studies
 
+    @property
+    def study_ids(self) -> list[str]:
+        """Per-seed ids, so a training and a validation set drawn with other seeds never share one."""
+        return [f"synthetic-s{self.seed}-{index:04d}" for index in range(self.n_studies)]
+
     def set_epoch(self, epoch: int) -> None:  # API parity with StudyBagDataset
         return None
 
@@ -738,7 +743,7 @@ class SyntheticBagDataset(Dataset):
             "series_present_mask": present,
             "targets": torch.from_numpy(labels),
             "label_weights": torch.from_numpy(weights),
-            "study_id": f"synthetic-{index:04d}",
+            "study_id": f"synthetic-s{self.seed}-{index:04d}",
             "meta": {"n_present_slots": int(present.sum()), "synthetic": True},
         }
 

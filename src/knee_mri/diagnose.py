@@ -26,7 +26,7 @@ import pandas as pd
 
 from .config import Config, load_config
 from .constants import STUDY_ID, TARGETS
-from .metrics import soft_roc_auc
+from .metrics import GROUP_SELECTION_METRICS, soft_roc_auc
 from .schema import read_id_csv
 from .utils import LOG, atomic_write_dataframe, atomic_write_json
 
@@ -205,6 +205,8 @@ def check_best_epoch(checks: Checks, run: Path, payload: dict | None) -> None:
     # Runs from before eval.selection_metric existed logged the selection score as val_macro_roc_auc.
     if "val_selection_score" in history:
         column, key = "val_selection_score", (payload or {}).get("selection_metric", "macro_soft_auc")
+        if (payload or {}).get("selection_targets"):
+            key = GROUP_SELECTION_METRICS[key]  # selected on the eval.selection_targets group mean
     else:
         column, key = "val_macro_roc_auc", "macro_roc_auc"
     best_row = history.loc[history[column].idxmax()]

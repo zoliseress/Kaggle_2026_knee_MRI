@@ -57,13 +57,24 @@ def plot_learning_curves(history: pd.DataFrame, out_path: Path, summary: dict | 
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     ax_loss, ax_rank, ax_ap, ax_calib, ax_lr, ax_speed = axes.ravel()
 
-    _plot_series(ax_loss, history, "train_loss", "train loss", marker="o")
-    _plot_series(ax_loss, history, "val_loss", "val loss (training labels)", marker="s")
-    _plot_series(ax_loss, history, "val_ref_bce", "val BCE (reference)", marker="^")
+    # A category-group specialist (train.loss_targets) trains on its group only: train / val loss and
+    # the group reference BCE cover that group; the 12-target reference BCE also averages the
+    # unsupervised outputs, which drift with the shared backbone, so it is labelled as such.
+    loss_targets = summary.get("loss_targets")
+    scope = f" ({', '.join(loss_targets)})" if loss_targets else ""
+    _plot_series(ax_loss, history, "train_loss", f"train loss{scope}", marker="o")
+    _plot_series(ax_loss, history, "val_loss", f"val loss (training labels){scope}", marker="s")
+    if loss_targets:
+        _plot_series(ax_loss, history, "val_loss_group_ref_bce", f"val BCE (reference){scope}", marker="^")
+        _plot_series(ax_loss, history, "val_ref_bce", "val BCE (reference, all 12 incl. unsupervised)", ls=":", alpha=0.6)
+    else:
+        _plot_series(ax_loss, history, "val_ref_bce", "val BCE (reference)", marker="^")
     ax_loss.set_title("Loss (class-normalised BCE)")
 
     # Older runs have no val_selection_score column; their selection score was macro ROC-AUC.
     selection = summary.get("selection_metric", "selection score")
+    if summary.get("selection_targets"):  # eval.selection_targets: the metric's mean over that group
+        selection = f"{selection} over {', '.join(summary['selection_targets'])}"
     _plot_series(ax_rank, history, "val_selection_score", f"selection ({selection})", marker="o", lw=2.5, color="tab:green")
     _plot_series(ax_rank, history, "val_selection_score_raw", "selection, raw (no EMA)", ls="--", color="tab:green", alpha=0.6)
     _plot_series(ax_rank, history, "val_macro_roc_auc", "ROC-AUC (0/1 cells)", marker="s", color="tab:blue")

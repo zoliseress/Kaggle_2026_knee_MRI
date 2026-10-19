@@ -657,6 +657,42 @@ batch averages. No positive-class weighting or oversampling is used.
   stored signature: backbone, freeze policy, EMA, …). **`train.init_weights`** starts a *new*
   run from a checkpoint's model weights with a fresh optimizer, best score and history.
   Setting both is refused.
+* **Category-group specialist** (`train.loss_targets`, `eval.selection_targets`; both null =
+  all 12). `train.loss_targets: [Medial OA, Lateral OA, PF OA]` zeroes the label weights of
+  every other target on each training batch and in the global denominators. Every
+  normalisation policy then counts only the active targets (`|C+|` = 3, not 12), and a
+  window whose labels all lie outside the group is an empty window: zero loss, the step is
+  skipped, and under DDP the skip is taken on every rank. The model keeps its 12 outputs.
+  Only the loss targets are meant to be used as predictions, because the others drift with
+  the shared backbone. `eval.selection_targets` selects and early-stops on the mean of
+  `eval.selection_metric` over those targets (`group_soft_auc` / `group_roc_auc` in
+  `history.csv`, per subset too). The group mean is NA as soon as one group target is
+  undefined. The macros are still logged. Names map to `TARGETS` by exact name; unknown,
+  duplicate or empty lists are refused. With `train.loss_targets` set,
+  `eval.selection_targets` is required and must be a subset of it: selecting on the
+  12-target macro would pick the specialist's checkpoint by its unsupervised, drifting
+  outputs. A control run (`loss_targets: null` with a selection group) stays allowed.
+  `best.pt` stores `loss_targets`, `selection_targets` and `init_source` (the
+  `train.init_weights` checkpoint, its run, epoch, score and leak check). Both keys are part
+  of the resume signature when set. The validation label loss (`val_loss`) is masked like
+  the training loss, so both cover the same targets. `val_loss_group_ref_bce` is the
+  reference BCE over the loss targets; the 12-target `val_ref_bce` is labelled "all 12 incl.
+  unsupervised" in the report.
+* **`train.init_weights` leak check (failure gate).** Every checkpoint stores its training
+  studies (`train_study_ids`), and every run writes them to `run_dir/train_studies.csv`.
+  A fine-tune start is refused when the source trained on any of the new run's validation
+  studies or any `paths.exclude_from_training_csv` study. Example: the train_v8 checkpoints
+  trained on all of new_242. A checkpoint from before this key has no list. It is checked
+  through a `train_studies.csv` beside it or in its run directory, which
+  `python src/tools/write_train_studies.py <run dir>...` reconstructs from the run's split
+  and verifies against its own validation set. Without either, the start is refused unless
+  `train.init_weights_unverified=true`, which is recorded as `leak_check: unverified`.
+  `history.csv` also logs `grad_norm_median` / `grad_clip_fraction`. A group loss is larger
+  than the 12-target mean, so a fixed `train.grad_clip` cuts more often: compare these
+  columns between a specialist and its control. To blend a specialist into an ensemble
+  (its group columns only, `(1 − α)·base + α·specialist`, matched by study id and target
+  name), use `knee_mri.blend.blend_specialist`. `notebooks/specialist_blend_eval.py` scores
+  base, base+control and base+specialist per subset, with a paired bootstrap.
 
 ### Several GPUs (DDP)
 
@@ -889,7 +925,11 @@ These read finished runs or label exports; none of them trains.
 * a non-group-disjoint fold, a train/validation overlap, or a checkpoint whose target order
   differs from the project order;
 * a training study listed in `paths.exclude_from_training_csv`, or a split that does not
-  match the run (`check-splits`, `check-fixed-split`).
+  match the run (`check-splits`, `check-fixed-split`);
+* a `train.init_weights` checkpoint trained on any validation or excluded study of the new
+  run, or one whose training studies are unknown (unless `train.init_weights_unverified=true`);
+* `train.loss_targets` without `eval.selection_targets`, or a selection target outside the
+  loss targets.
 
 ## Verification status
 
