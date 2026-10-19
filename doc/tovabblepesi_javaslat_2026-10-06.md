@@ -1,13 +1,37 @@
-# Továbblépési javaslat (2026-10-06), a saját memórialogjaim alapján
+# Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-19), a saját memórialogjaim alapján
 
-## Kontextus – hol tartunk
-- **2026-10-15-től új elsődleges validáció: holdout450** (eredeti 208 + 242 új) és **train_v11** (3957 study); a riport külön adja a full_450 / original_208 / new_242 eredményt (13. pont). Az alábbi számok még a holdout208-ra vonatkoznak.
-- **LB legjobb: 0.945** = `holdout5_v8_cnt12` (train_v8, holdout208, E3): R50 + V2S + C0 + CNT12 s42 + CNT12 s2 (lásd 8. pont, „LB-próba”). Előtte `holdout4_v8_c0` 0.943 (H3_v8 + CoAtNet-0, 7. pont), `holdout3_v8` 0.942, H3_v6 0.936.
-- **Lokális baseline: H3_v7** (train_v7 = v6 mínusz Andrew-50; holdout208): 208 0.9341, new-100 0.9384, Andrew50 0.9150. Egyedi modellek: B0 0.9224, R50 0.9194, V2S 0.9278 (208, best ep).
-- **Ami bizonyítottan működött:** címkeminőség. v4→v6 (csak a címkék cseréje) +0.012 LB.
-- **Ami nem működött (lezárva):** per-target modellsúlyozás, logit/rank átlagolás (v8-on és v9-en újramérve, lásd 6. pont), Effusion-oszlop v2-ből, v2/v3 keverése a blenddel, 4. slotként coronal_t1 és sagittal_nonfs, valamint az 5 slotos Raptor-elrendezés (14. pont). Extra slotot többet nem javaslok. Inferálás oldali sűrűbb szeletmintavétel (c48) és slice-offset TTA (4a. pont, LB 0.942 = c24). CoAtNet rmlp_1_rw2 (CR1) ötödik vagy csere-tagként a H4 mellett (7. pont).
-- **Mérési korlát:** egy modell run-to-run zaja kb. ±0.007, a referenciák ~0.008 alatt nem döntenek. Ensemble-szinten és LB-vel kell megerősíteni.
-- **A modellek már jobbak, mint a címkék** (H3 new-100 0.938 vs. v6 blend címke 0.898). A címkezaj a szűk keresztmetszet.
+A dokumentum az 1–14. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
+
+## Kontextus – hol tartunk (2026-10-19)
+- **Validáció:** 2026-10-15-től az elsődleges validáció a **holdout450** (eredeti 208 + 242 új), a tanítóhalmaz a **train_v11** (3957 study). A riport külön adja a full_450, original_208 és new_242 eredményt (13. pont). Az 1–12. és a 14. pont még holdout208-ra (a 9. pont ref220-ra) vonatkozik. A v8-as modellek a 242-n tanultak, ezért velük csak az original_208 vethető össze.
+- **LB legjobb: 0.945** = `holdout5_v8_cnt12` (train_v8, holdout208, E3, régi laterality-vel): R50 + V2S + C0 s2 + CNT12 s42 + CNT12 s2 (lásd 8. pont, „LB-próba”). A korábbiak:
+  - `holdout4_v8_c0` 0.943 (H3_v8 + CoAtNet-0, 7. pont);
+  - `holdout3_v8` 0.942 és `holdout3_v8_c48` 0.942;
+  - `holdout6_v11` 0.941, `holdout4_v10_cnt12` 0.941 (CNT12 × 2 + V2S + C0, train_v10, 2026-10-14) és `holdout3_v9_v2sv8` 0.941;
+  - H3_v6 0.936.- **Lokális viszonyítási pontok:**
+  - **original_208:** H4 0.9417; a H5-höz legközelebbi mért változat (B0 → a két CNT12 seed átlaga) 0.9433.
+  - **full_450 (csak v11):** V2S + C0 + CNT12 minden seeddel (12 checkpoint) 0.9309, a 208-on 0.9414.
+  - **Egyedi archok a full_450-en** (összes seed átlaga): V2S 0.9285, CNT12 0.9251, C0 0.9250, CNT22 0.9233, R50 0.9084.
+- **Ami bizonyítottan működött:**
+  - címkeminőség: v4 → v6 +0.012 LB, v6 → v8 +0.006 LB;
+  - E1–E3 (EMA, oldalkeret, oldalankénti pooling; `doc/E1_E2_E3_architektura.pdf`);
+  - architekturálisan eltérő ensemble-tagok: C0 +0.001, CNT12 +0.002 LB;
+  - több seed átlagolása.
+- **Ami nem működött (lezárva):**
+  - per-target modellsúlyozás, logit/rank átlagolás (6. pont);
+  - v9 self-distillation (2. pont);
+  - Effusion-oszlop v2-ből, v2/v3 keverése a blenddel;
+  - v10 (+184 radiológus-címke, 9. pont);
+  - extra slotok: coronal_t1, sagittal_nonfs, 5 slotos Raptor (14. pont);
+  - inferenciaoldali c48 és slice-offset TTA (4a. pont), tanítás c48-cal (11. pont);
+  - augmentáció nélkül (12. pont);
+  - CoAtNet rmlp_1_rw2 (7. pont);
+  - ConvNeXt fb22k / DINOv3 / regularizált / lehűtés (8. pont);
+  - R50 és CNT22 ötödik tagként a v11-en (13. pont);
+  - label mask kikapcsolása (13. pont, felhasználói döntés).
+- **Mérési korlát:** egy modell seed-szórása a 208-on ~0.002–0.003 (C0, 10 run: 0.9292–0.9380), két run páros különbségének SE-je ~0.0034. Az azonos seed sem reprodukál (~0.003). A full_450-en a C0 seed-szórása csak 0.0004. Lokálisan ~0.008 alatt nem döntünk, ensemble-szinten és LB-vel kell megerősíteni. A H5 LB-nyeresége (+0.002) a +0.003-as lokális szabály alatt jött.
+- **A modellek jobbak, mint a címkék** (208: H3_v8 0.939 vs. a train_v8 címke 0.893). A címkezaj a szűk keresztmetszet.
+- **v11 vs. v8:** a mostani kóddal mérve a 242 study kiesésének ára a C0-nál ~−0.001, seed-zajon belül (13. pont vége). A korábbi −0.004 főleg a régi v8-as C0 s2 szerencsés seedjéből jött. Nyitott, hogy mi magyarázza a holdout6_v11 (0.941) és a H5 (0.945) LB-különbségét; az összetétel is eltér (R50, seedek).
 
 ## Javasolt sorrend
 
@@ -346,7 +370,7 @@ Backbone-támogatás: `convnext_tiny` (`in12k_ft_in1k` / `fb_in22k_ft_in1k` / `d
 **Második kör (2026-10-12): a DDP rendben van, a DINOv3-nál a lr volt a hiba; ensemble-ben zajszintű.** Script: `python notebooks/convnext_compare.py`.
 - **Runok:**
   - `CNT22_DDPcheck_E3_img320_trainv8_holdout208_20261012_064352`: fb22k, Linux 2 GPU DDP, ugyanaz a config és seed (42), mint a CNT22-é; végigfutott (15 epoch, best ep9), 468 s/epoch (a CNT22 637 s-a Windowson);
-  - `CNTD3_lr2e-5_E3_img320_trainv8_holdout208_20261012_064601`: dinov3, Windows 1 GPU, `train.encoder_lr=2e-5`; **még fut**, az alábbi számok az ep10-es (eddigi legjobb) állapotot mutatják.
+  - `CNTD3_lr2e-5_E3_img320_trainv8_holdout208_20261012_064601`: dinov3, Windows 1 GPU, `train.encoder_lr=2e-5`; az alábbi számok az ep10-es állapotot mutatják (a végeredmény lent: best ep10 maradt).
 
 | Modell | 208 | new-100 | 58 | Andrew50 | görbe ep6–10 | ep0 / 1 / 2 | best ep |
 |---|---|---|---|---|---|---|---|
@@ -453,7 +477,7 @@ $CNT = "--set model.backbone=convnext_tiny --set model.weights=in12k_ft_in1k --s
 **CNT12 közbenső eredménye (2026-10-12; az s2 lefutott, az s42 ep6-nál tart): ez a legjobb ConvNeXt, de ensemble-ben még mindig kicsi.**
 - **Runok:**
   - `CNT12_lr4e-5_E3_img320_trainv8_s2_holdout208_20261012_122058`: Linux DDP, 15 epoch; best ep9, **0.9314**, görbe ep6–10 0.9303. A new-100-on **0.9428**, ez az eddigi legjobb egyedi érték (C0 s2: 0.9412).
-  - `CNT12_lr4e-5_E3_img320_trainv8_holdout208_20261012_133340`: Windows, seed 42, még fut; ep6-ban 0.9303 (az s2 ugyanitt 0.9283-on járt).
+  - `CNT12_lr4e-5_E3_img320_trainv8_holdout208_20261012_133340`: Windows, seed 42, akkor még futott (végeredmény lent: best ep9, 0.9347); ep6-ban 0.9303 (az s2 ugyanitt 0.9283-on járt).
 - **Összevetés a fb22k-val:** a négy fb22k-futás átlaga 0.927, a CNT12 s2 0.9314. Az előtanítás és a súlyskálához igazított lr együtt kb. +0.004.
   - A Fracture javult a legtöbbet: 0.952–0.954 a fb22k 0.933–0.946-jához képest. Az ACL 0.97.
   - A Lateral OA (0.853–0.859) és a MCL (s42: 0.861) gyenge maradt.
@@ -504,7 +528,7 @@ $CNT = "--set model.backbone=convnext_tiny --set model.weights=in12k_ft_in1k --s
 Néhány megjegyzés:
 - A beküldés a `build_04_notebook.py` `--ensemble holdout5_v8_cnt12` bejegyzéséből készült. Az öt modell mind a 2026-10-12-i laterality-javítás (2396ed0) előtt tanult, a régi, tag-first kerettel.
 - **A H4-hez (0.943) képest +0.002.** A lokális előrejelzés +0.0016 volt (208), illetve +0.0034 (new-100). A +0.003-as szabályt a 208-on nem érte el, az LB-n mégis nyert. Ezúttal a new-100 jelezte jobban előre az irányt.
-- **A v11-es összetételeket is veri** (holdout6_v11: 0.941). A különbség (−0.004) valószínűleg a 242 tanító study kiesésének ára, ami lokálisan még a seed-zajon belül maradt (13. pont). Az összetétel azonban nem teljesen azonos: a v11-es hatosból hiányzik a R50.
+- **A v11-es összetételeket is veri** (holdout6_v11: 0.941). A különbség (−0.004) okát nem tudjuk. Az összetétel nem azonos (a v11-es hatosból hiányzik a R50, és más a seedek összetétele). A 242 study kiesésének ára a C0-nál a 13. pont végi ablációban csak ~−0.001 lett.
 
 **Lehűtési próba (CNT12cool, 2026-10-12): negatív, a csúcs utáni romlás túltanulás, nem lr-zaj.**
 - **Kérdés (a felhasználó felvetése):** ha a csúcsnál esne az lr, javulna-e még a modell?
@@ -636,7 +660,7 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   - Az LB-próba a B0 → CNT12 cseréjére v8-as és v10-es CNT12-kkel ugyanazt várja; ennek LB-hatását korábban ~0.0005–0.001-re becsültük.
   - Új kísérletnél egy seed nem elég, a 220-on sem: legalább két seed átlaga, vagy ensemble-szintű döntés.
 
-**C0 v10 (2026-10-14, Linux DDP 2 GPU, seed 2): ugyanaz a kép.** A V2S v10 még fut.
+**C0 v10 (2026-10-14, Linux DDP 2 GPU, seed 2): ugyanaz a kép.** A V2S v10 ekkor még futott (eredménye lent).
 - **Run:** `C0_E3_img320_trainv10_s2_holdout220_20261013_230729`; best ep9, **0.8995** a 220-on, ep6–10 átlag 0.8948. A v8-as C0 s2 egy GPU-n futott, a pipeline szerint a DDP ugyanaz a kísérlet (8 study / lépés).
 - **A 114-en:** v10 0.9043, v8 0.9025, **+0.0018** [−0.0081, +0.0119], P>0 = 0.62. Szkript: scratchpad `v10_check3.py`.
 - **Ensemble a 114-en:**
@@ -689,6 +713,7 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   - Ensemble-összetételre a 220 és a 114 egyet mond: CNT12 (két seed) + V2S + C0; a B0 és a R50 kimarad.
   - LB-jelölt: CNT12-átlag + V2S + C0, v10-es vagy v8-as checkpointokkal (a kettő ugyanazt várja). A H4-hez képest lokálisan +0.001–0.003, ez a <0.008-as szabály alatt van, tehát csak LB dönt.
   - **Beküldési notebook kész (2026-10-14):** `python notebooks/build_04_notebook.py --ensemble holdout4_v10_cnt12`. A négy v10-es checkpoint (CNT12 s42, CNT12 s2, V2S s2, C0 s2) egyenlő súllyal megy, így a CNT12 súlya 1/2. A 220-on ez 0.9094, az 1/3-os változat 0.9101, a különbség elhanyagolható. A tiszta 114-en a holdout4_v8_c0-hoz képest +0.0036.
+  - **LB (2026-10-14, 2026-10-19-én rögzítve): `holdout4_v10_cnt12` = 0.941**, a `holdout4_v8_c0` (0.943) alatt. A tiszta 114-en mért +0.0036 nem vitte át magát. A v10 a v8-hoz képest nettó 220 studyval kevesebbet tanít (−404 LLM-címkés, +184 radiológus-címkés).
     - Kaggle-datasetek: `knee-cnt12-holdout-v10`, `knee-cnt12s2-holdout-v10`, `knee-v2s-holdout-v10`, `knee-c0-holdout-v10`. Forrás: `work/export_v10/runs/<run>/` (karcsúsított best.pt, 102–124 MB, bitre azonos súlyok) + config.yaml.
     - A `srcknee2` datasetben a laterality-javítás (2396ed0) és a b92f900 utáni kód kell, mert a v10-modellek ezzel tanultak.
     - Lokális próbafuttatás a 3 publikus teszt-studyn rendben: 4 checkpoint, egyező prep-hash (9b43435e7ac6), a C0 `inception`, a többi `mri_scalar` normalizálással, ahogy tanultak.
@@ -971,6 +996,9 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
     a V2S és a ConvNeXt-ek nem érzik. Több seed ezt az ensemble szintjén kiegyenlíti: a 12-runos v11 V2S + C0 + CNT12
     a 208-on a H4 szintje (−0.0003), így LB-n ~0.942–0.943 várható (a H6 −0.0015-ből −0.002 lett). A +0.003-as
     szabály nem teljesül; LB-próba csak akkor éri meg, ha a 12 checkpoint inferenciaideje belefér.
+    **Kiegészítés (2026-10-19):** azóta a legjobb LB 0.945 (`holdout5_v8_cnt12`), a 208-on kb. a H4 + 0.0016. A 12-runos
+    v11 ehhez képest kb. −0.002, tehát LB-n a 0.945 alatt várható. A „C0 veszteség” értelmezését a lenti ablációs
+    ellenőrzés felülírja: a mostani kóddal a C0 v11 − v8 kb. −0.001.
 - **Epochválasztás 208 vs 450 szerint, minden modellre (2026-10-17;** scratchpad `selection_table.py`). „208-sel."
   = a 208-on legjobb epoch, „450-sel." = best.pt. A 208 szerinti választás csak az `epoch_predictions/`-ös
   (s7/s123) runoknál számolható; a v8-nál a 242 / 450 nem értékelhető (a 242 tanító adat volt).
@@ -1005,9 +1033,85 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
     `paths.label_mask_csv`. A 3 alapslotban a régi (3slot/4slot backup, before_knee_consistency) és a mostani
     `series_selection.csv` csak 2 study 4 slotjában tér el (1 train_v11, 1 new_242, 0 a 208-ban); a maszk 8 study
     (7 train_v11, 1 new_242). A prep hash azonos (9b43435e7ac6). → A v11 − v8 különbség gyakorlatilag csak a 242.
+    **Kiegészítés (2026-10-18):** ebből kimaradt a laterality-javítás (2396ed0). A v8-as C0/R50/B0/V2S runok még a
+    régi, tag-first laterality-vel tanultak, ami 31 train_v8 és 1 ref208 study oldalát fordítja meg (lásd lent).
   - **Tervezett ellenőrzés:** train_v8 (a 242 a régi LLM-címkéivel) a mostani v11-es beállításokkal, holdout208,
     s42/s2: `HOLDOUT=208 TRAIN_CSV=$DATA_ROOT/train_v8.csv ./run_holdout.sh ...` (kódváltozás nem kell). Ugyanaz a seed
     itt sem ad valódi párosítást (a futások nem determinisztikusak, a Linux/Windows „azonos seed" Spearman 0.946).
+- **Elvégzett ellenőrzés: C0 train_v8-on a v11-es beállításokkal + laterality/maszk abláció (Linux, 2026-10-17 – 10-19).**
+  Minden run C0 E3 img320, train_v8, holdout208, 1 GPU, a mostani kóddal. Futtatás a fenti paranccsal
+  (`--set seed=N`, a változatoknál `--set paths.laterality_csv=...`, `paths.label_mask_csv=null`,
+  `train.early_stopping_patience=5`).
+  - **Mi tér el ténylegesen a 10-10-i C0 s2 runtól** (`C0_E3_img320_trainv8_s2_holdout208_20261010_153116`, 0.9358):
+    - sorozatválasztás: a régi `series_selection.csv` (10-04, `/ai-storage/Temp/SZ/kaggle_knee/`) és a mostani között
+      a train_v8-ban 2 study 4 slotja, a 208-ban 0. A `knee_consistency` / `non_knee_patterns` /
+      `bilateral_min_separation_mm` kulcs csak a `select-series` lépésben hat, tanításkor nem (a run a kész táblát olvassa);
+    - label mask: 8 study minden targetje súly 0;
+    - **laterality: 31 train_v8 study oldala fordult meg** (12 R → L, 19 L → R), a 208-ból 1. A régi run logja:
+      train 2173 R / 1955 L / 71 unresolved, val 120 / 84 / 4; a mostani: 2180 / 1948 / 71 és 121 / 83 / 4;
+    - early stopping patience 5 → 3;
+    - kód: a model / dataset / loss / augment 00cebfe (10-11, CoAtNet) óta nem változott, a `train.py` változásai
+      (DDP, riport, val loss, epoch checkpointok) 1 GPU-n ekvivalensek. Az augmentáció (seed, epoch, study, slot)
+      szerint sorsol, a `num_workers` nem hat rá.
+  - **A régi laterality rekonstruálva:** a pre-2396ed0 szabály (az összes series tagjéből az első R/L, utána a
+    geometria) a mostani manifestre → `work/manifest/laterality_pre_yc_fix.csv`. A R/L/unresolved számok
+    **pontosan egyeznek** a régi run logjával (train és val is).
+  - **1. kör: az új config 4 seeddel** (`C0_E3_img320_s{2,42,7,123}_trainv8_v11cfg_holdout208_*`):
+
+| seed | 2 | 42 | 7 | 123 | átlag ± sd | 4-es ensemble |
+|---|---|---|---|---|---|---|
+| 208 (best ep) | 0.9292 (10) | 0.9335 (10) | 0.9301 (10) | 0.9299 (7) | **0.9307 ± 0.0019** | 0.9355 |
+
+  - **2. kör: 2×2 abláció (laterality × maszk), seed 2 és 42, patience 5**
+    (`..._trainv8_oldlat_nomask_p5_*`, `..._oldlat_p5_*`, `..._nomask_p5_*`):
+
+| 208, s2 / s42 → átlag | új laterality | régi laterality | átlag |
+|---|---|---|---|
+| **maszk be** | 0.9292 / 0.9335 → **0.9314** (patience 3) | 0.9309 / 0.9322 → **0.9315** | 0.9315 |
+| **maszk ki** | 0.9338 / 0.9326 → **0.9332** | 0.9324 / 0.9380 → **0.9352** | 0.9342 |
+| **átlag** | 0.9323 | 0.9334 | |
+
+  - **Főhatások:** régi laterality +0.001, maszk nélkül +0.003. Mindkettő zajszintű: a 10 új kódú run
+    (4 + 4 × 2) 0.9322 ± 0.0025 (0.9292 … 0.9380), egy páros különbség bootstrap-SE-je a 208-on 0.0034.
+    A „régi laterality + maszk nélkül” előnyét főleg egyetlen run (oldlat_nomask s42, 0.9380) adja; 3-as
+    türelemmel ez is 0.9369 lett volna, a többi run ugyanaz marad.
+  - **Az azonos seed sem reprodukál:** az oldlat_nomask s2 elvileg ugyanaz a kísérlet, mint a 10-10-i C0 s2, mégis
+    0.9324 vs. 0.9358, és már az ep0-ban eltér (0.806 vs. 0.814). Az azonos seedes run-to-run zaj ~0.003.
+  - **Az 1 átfordított 208-as study** (…12978510157202852202776899910529174803, csak Fracture-pozitív) nélkül
+    újraszámolva egyik run AUC-ja sem változik 0.0002-nél többet.
+  - **Targetenként:** a 10-10-i C0 s2 Lateral OA-ja (0.890) egyik új runban sem jön vissza (mind a 4 cellában
+    0.857–0.860). Ez seed-sajátosság: a 7. pont szerint az s2 már akkor is +0.036-tal jobb volt Lateral OA-n az s42-nél.
+  - **A laterality-javítás helyessége (tanítás nélkül).**
+    - A 31 átfordított train_v8 study mind benne van a YC review-ban (`src/tests/fixtures/laterality_yc_review.csv`):
+      28 egytérdes és 3 kéttérdes; a 3 kéttérdes mind a label maskban van.
+    - A 28 egytérdesből 11-nél nevez meg oldalt a lelet: **9 egyezik a geometriával**, 2 a taggel
+      (…6743784387, görög „ΑΡΙΣΤΕΡΟΥ ΓΟΝΑΤΟΣ”; …7729459197, német „im linken Kniegelenk”: mindkettőnél tag = lelet = L,
+      geometria = R, YC: „All series are on the right”).
+    - **A címkék oldalfüggetlenek:** a medial/lateral targetek anatómiai fogalmak, a lelet szerint helyesek
+      (pl. …7729459197: Innenmeniskus-Lappenriss, mediális chondropathia → Medial Meniscus 0.975, Medial OA 0.94,
+      Lateral Meniscus 0.015). Rossz oldalnál nem a címke, hanem a kép tükröződik: a canonical frame-ben a mediális
+      kompartment a laterális helyére kerül.
+    - **Anatómiai ellenőrzés a canonical frame-ben** (a cache-ből, pontosan úgy, ahogy a modell látja; laterális =
+      a kép jobb oldala). Két kontroll (tag = geometria, egy R és egy L): a fibulafej a LAT oldalon, a vastus
+      medialis disztális tömege a MED oldalon. A két ellentmondó studynál a geometriai oldallal a vastus medialis a
+      MED oldalon van, a …6743784387 Baker-cisztája (címke 0.985) posteromediálisan, ahogy tipikus. A tag szerinti
+      oldallal mindkettő tükrözve lenne.
+    - **Értelmezés:** a két esetben a lelet a valódi oldalt írja, de a DICOM-koordinátarendszer tükrözött (pl.
+      rosszul rögzített betegpozíció). A tükrözésnek a kép tengelyeihez kell igazodnia, és a geometria ugyanabban a
+      (tükrözött) rendszerben van, mint a kép. Ezért a geometry-first szabály a canonical frame-hez akkor is helyes,
+      ha a „valódi” oldal más. **A laterality-javítás helyes, marad.**
+    - Fájlok (scratchpad): `flipped31_table.csv` (régi/új oldal, center_x, YC, lelet szerinti oldal, maszk,
+      12 címke), `flipped31_reports.txt` (a 31 lelet), `render_canonical.py`, `render_axial_ends.py` (képek).
+  - **Mit jelent ez a v11 − v8 különbségre (C0):** a fenti táblában a C0 v11 − v8 = −0.0042 a 208-on. Ennek a
+    v8-as viszonyítási pontja a két régi run (0.9314 / 0.9358), amelyek régi laterality-vel és egy szerencsés seeddel
+    (s2) futottak. A mostani kóddal és beállításokkal a train_v8 C0 a 208-on 0.9307 (4 seed), a train_v11 C0
+    0.9295 (s42 / s2 / s7 / s123: 0.9286 / 0.9296 / 0.9325 / 0.9271). **A 242 study kiesésének ára a C0-nál így
+    ~−0.001**, ami seed-zajon belüli; a korábban mért −0.004 nagyobbik része a régi v8 runok (főleg az s2) felfelé
+    kilógó eredményéből jön, nem a v11-ből.
+  - **Döntés (felhasználó, 2026-10-19):** a label mask marad, kéttérdes studyt címkével nem tanítunk. A v11 + 450-re
+    indított három maszk nélküli run (s2 / s42 / s7) az első epochban leállítva és törölve. Az új (geometry-first)
+    laterality marad. A v11 + 450-en a C0 seed-zaja 0.0004 (4 seed, 0.9190–0.9198, 4-es ensemble 0.9250); további
+    azonos configos seed csak az ensemble-t bővíti.
 
 ### 14. 5 slotos C0 a publikus Raptor-elrendezéssel (train_v8, holdout208, 2026-10-15): rosszabb, lezárva
 - **Kérdés:** segít-e a publikus Raptor-notebook (rsna-versia-7) 5 slotja: Sag fluid, Sag nem-fluid,
@@ -1047,19 +1151,49 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
 - Korábban: elsődleges a new-100, mellette 208/158/58/Andrew50, OOF predikciókból, páros bootstrap, curve mean ep6–10.
 - Egymodelles összehasonlításnál 2 seed vagy ensemble-szintű döntés.
 - <0.008 lokális nyereség csak LB-próba után számít.
+- LB-jelölt előtt a v8-as referencia-ensemble-hez (ma a H5) is mérni kell az original_208-on, nem csak a v11-en belül (13. pont).
 - A ref208-at rangsorolásra használjuk, hangolásra nem. Az 1. lépés 0.07-es értéke az egyetlen kivétel: egy skalár.
 
 ## Kritikus fájlok / meglévő elemek
-- Új: `notebooks/build_train_v8.py` (minta: `notebooks/build_ref208_train_v7.py`)
-- Új: `notebooks/build_ref220_train_v10.py` (ref220 + train_v10, 9. pont)
-- Új: `notebooks/build_ref450_train_v11.py` (ref450 + train_v11, 13. pont)
-- `run_holdout.bat/.sh` (TRAIN_CSV, HOLDOUT=450 alapból; a kimeneti mappát a TRAIN_CSV nevéből képzi)
-- `notebooks/build_04_notebook.py` (LB-próbához ensemble-bejegyzés)
-- Eval: scratchpad `eval_holdout.py`; elemzés: scratchpad `blend_check*.py`
-- A repóban lévő másolat (`doc/tovabblepesi_javaslat_2026-10-06.md`) frissítendő ezzel a verzióval.
+- Címketáblák:
+  - `notebooks/build_train_v8.py` (minta: `notebooks/build_ref208_train_v7.py`);
+  - `notebooks/build_ref220_train_v10.py` (ref220 + train_v10, 9. pont);
+  - `notebooks/build_ref450_train_v11.py` (ref450 + train_v11, 13. pont).
+- `run_holdout.bat/.sh`: TRAIN_CSV, alapból HOLDOUT=450; a kimeneti mappa nevét a TRAIN_CSV-ből képzi.
+- `notebooks/build_04_notebook.py`: LB-próbához ensemble-bejegyzés (`--ensemble <név>`). Feltöltés előtt mindig `src/tools/export_checkpoints.py --ensemble <név> --out work/export_<ver>`.
+- Összevető scriptek: `notebooks/{c0_check,coatnet_compare,convnext_compare,slot5_compare,compare_v8_v9}.py`; a v11-esek és az eval a scratchpadben (`compare_v11*.py`, `eval_holdout.py`).
+- Kapcsolódó dokumentumok:
+  - `doc/E1_E2_E3_architektura.pdf` (a mostani modellkonfiguráció);
+  - `doc/problemas_esetek.md` (adat- és címkehibák);
+  - `doc/coatnet_vs_cnn_trainings.md`, `doc/v8_vs_v9_trainings.md`, `doc/slice_coverage_check.md`.
 
-## Ellenőrzés
-- A `build_train_v8.py` assertjei lefutnak, és a változott cellák száma 9556.
-- A train_v8 címke AUC-ja a 208-on nem rosszabb a v7-nél.
-- A B0 v8 run elindul, a `work/runs/train_v8/` alatt jön létre, és a run.log szerint a train_v8.csv-t olvassa.
-- Az eredményeket a B0/H3 v7 baseline-nal vetjük össze a fenti protokoll szerint.
+## Hol tartunk, mi a következő lépés (2026-10-19)
+- **Beküldésre kész legjobb:** `holdout5_v8_cnt12` (LB 0.945). Minden v11-es összetétel lokálisan ez alatt van (~−0.002 a 208-on).
+- **Nyitott kérdések:**
+  - Mi okozza a H5 (0.945) és a két nem-v8-as beküldés közötti −0.004 LB-különbséget? A két beküldés: `holdout6_v11` 0.941 és `holdout4_v10_cnt12` 0.941. Mindkettő ugyanúgy V2S + C0 + CNT12, R50 nélkül, és mindkettő referencia-studykat vesztett a tanításból (v11: −242, v10: nettó −220). Két, egymást ki nem záró magyarázat van:
+    - **(a) a kiesett tanítóstudyk:** a C0-abláció szerint ez lokálisan csak ~−0.001;
+    - **(b) a R50 hiánya:** lokálisan a R50 a v11-es ensemble-hez csak +0.0002-t ad.
+
+    Eltér a laterality is: a H5 a régi kerettel tanult, a v11 az újjal; a v10-es runok ebből a szempontból nincsenek ellenőrizve.
+  - A saját címkéző pipeline LLM-je és API-ja (3. pont).
+- **Kipróbálatlan, de rögzített ötletek:**
+  - **Lateral OA (és PF OA) LLM-prompt** (3. pont, a terv kész, nem indult el). A címke az eddigi legnagyobb hatású tényező, és a Lateral OA a leggyengébb modell-target.
+  - Self-distillation H3-OOF teacherrel, egyetlen modell helyett (2. pont döntése).
+  - Enyhe intenzitás-TTA (4a. pont).
+  - Bias-field augmentáció / N4 (5. pont, parkolva).
+  - `crop_center=foreground_extent` újrapróbálása 320 px-en (problémás esetek, A7).
+- **Javaslat:** a H5 összetétele v11-es checkpointokkal (R50 + V2S + C0 + CNT12 × 2, a meglévő seedekből). Ez tanítás nélkül összerakható, és egy LB-próbával szétválasztaná, mennyi a H5 előnyéből az összetételé és mennyi a v8-as modelleké. A C0-ablációval együtt ez megmutatja, hogy a v11-es beküldések lemaradása az összetételből vagy a modellekből jön. (A 450 a CLAUDE.md szerint nem kerülhet a tanításba, ezért a v8-as tanítóhalmazhoz nem térünk vissza.)
+  - **Beküldésre kész (2026-10-19): `holdout5_v11`** (`python notebooks/build_04_notebook.py --ensemble holdout5_v11`). Ugyanazok a seedek, mint a H5-ben:
+    - R50 s42 `R50_E3_img320_s42_trainv11_holdout450_20261016_123429`;
+    - V2S s42 `V2S_E3_img320_s42_trainv11_holdout450_20261016_062318`;
+    - C0 s2 `C0_E3_img320_s2_trainv11_holdout450_20261015_linux`;
+    - CNT12 s42 `CNT12_lr4e-5_E3_img320_s42_trainv11_holdout450_20261015_222807`;
+    - CNT12 s2 `CNT12_lr4e-5_E3_img320_s2_trainv11_holdout450_20261016_012610`.
+  - **Lokálisan** (scratchpad `score_h5_v11.py`; a holdout6_v11 0.9303 / 0.9403 / 0.9215-öt pontosan visszaadja): full_450 0.9301, original_208 0.9407, new_242 0.9215. A H6_v11-hez képest a különbség full −0.0002 [−0.0016, +0.0012], 208 +0.0004 [−0.0019, +0.0027]. R50 nélkül 0.9294 / 0.9403 / 0.9200.
+    - Lokálisan tehát nincs mit magyarázni. Ha az LB 0.945 körül lesz, a különbség az összetételből jön, és ezt a lokális mérés nem látja. Ha 0.941 marad, a v8-as modellekből.
+  - **Export:** `work/export_v11/` (`export_checkpoints.py --ensemble holdout5_v11`), 2269 MB → 568 MB, a forrásokkal ellenőrizve.
+    - **Új dataset-névkonvenció (2026-10-19-től):** `<arch>-s<seed>-<fej>-holdout<N>-<train>`, pl. `cnt12-s42-e3-holdout450-v11`.
+    - Az öt dataset: `r50-s42-`, `v2s-s42-`, `c0-s2-`, `cnt12-s42-`, `cnt12-s2-e3-holdout450-v11`. Mind az ötöt (újra) fel kell tölteni.
+    - A `holdout6_v11` bejegyzés a régi (`knee-*-holdout-v11`) dataset-neveken marad, mert úgy vannak fent a Kaggle-ön.
+    - A `work/export_v11/`-ben csak az öt új mappa maradt. A régiek helyben törölve; szükség esetén `export_checkpoints.py --ensemble holdout6_v11` újra előállítja őket a run-mappákból.
+  - **Lokális próba** a 3 publikus teszt studyn: rendben (5 checkpoint, 3 input-csoport, prep hash 9b43435e7ac6, 0.3 perc).
