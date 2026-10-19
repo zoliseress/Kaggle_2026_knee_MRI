@@ -977,7 +977,8 @@ def check_loss_targets_training(cfg: Config) -> str:
             leak_dir = Path(tmp) / "leaky"
             leak_dir.mkdir()
             validation_ids = list(tuned.reference.study_ids)
-            leaky = dict(payload, train_study_ids=[*payload["train_study_ids"], validation_ids[0]])
+            leaky = dict(payload, train_study_ids=[*payload["train_study_ids"], validation_ids[0]],
+                         lineage_study_ids=[*payload["lineage_study_ids"], validation_ids[0]])
             torch.save(leaky, str(leak_dir / "best.pt"))
             tune_cfg.train.init_weights = str(leak_dir / "best.pt")
             try:
@@ -990,7 +991,8 @@ def check_loss_targets_training(cfg: Config) -> str:
             # ... an older checkpoint without its studies needs a sidecar or the explicit flag.
             legacy_dir = Path(tmp) / "legacy_source"  # not a run name: a run writes its own train_studies.csv
             legacy_dir.mkdir()
-            torch.save({k: v for k, v in payload.items() if k != "train_study_ids"}, str(legacy_dir / "best.pt"))
+            legacy_payload = {k: v for k, v in payload.items() if k not in ("train_study_ids", "lineage_study_ids")}
+            torch.save(legacy_payload, str(legacy_dir / "best.pt"))
             tune_cfg.train.init_weights = str(legacy_dir / "best.pt")
             try:
                 build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="legacy")
@@ -1011,7 +1013,43 @@ def check_loss_targets_training(cfg: Config) -> str:
                 raise AssertionError("a sidecar naming a validation study was accepted")
             sidecar.to_csv(legacy_dir / "train_studies.csv", index=False)
             clean = build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="legacy_clean")
-            assert clean.init_source["leak_check"]["source"].endswith("train_studies.csv")
+            assert clean.init_source["leak_check"]["chain"][0]["source"].endswith("train_studies.csv")
+
+            # The whole lineage counts: a fine-tune stores its ancestors' studies ...
+            lineage = set(tuned.checkpoint_payload()["lineage_study_ids"])
+            assert set(payload["train_study_ids"]) | set(tuned.train_study_ids) <= lineage
+            # ... and an older chain is followed link by link: clean parent, leaky grandparent.
+            chain_dir = Path(tmp) / "chain_source"
+            chain_dir.mkdir()
+            grand = dict(legacy_payload, train_study_ids=[validation_ids[2]], init_source=None)
+            torch.save(grand, str(chain_dir / "grand.pt"))
+            parent = dict(legacy_payload, train_study_ids=list(payload["train_study_ids"]),
+                          init_source={"path": str(chain_dir / "grand.pt")})
+            torch.save(parent, str(chain_dir / "parent.pt"))
+            tune_cfg.train.init_weights = str(chain_dir / "parent.pt")
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="chain_leak")
+            except RuntimeError as error:
+                assert "grand.pt" in str(error), error
+            else:
+                raise AssertionError("a leaky grandparent was not caught through a clean parent")
+            # A missing ancestor is an unknown link; an unverified ancestor makes its descendants unverified.
+            torch.save(dict(parent, init_source={"path": str(chain_dir / "gone.pt")}), str(chain_dir / "orphan.pt"))
+            tune_cfg.train.init_weights = str(chain_dir / "orphan.pt")
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="orphan")
+            except ValueError as error:
+                assert "not available" in str(error), error
+            else:
+                raise AssertionError("a lineage with a missing ancestor was accepted unchecked")
+            torch.save(unverified.checkpoint_payload(), str(chain_dir / "child_of_unverified.pt"))
+            tune_cfg.train.init_weights = str(chain_dir / "child_of_unverified.pt")
+            try:
+                build_synthetic_trainer(tune_cfg, n_studies=6, epochs=2, name="grandchild")
+            except ValueError as error:
+                assert "unverified" in str(error), error
+            else:
+                raise AssertionError("a descendant of an unverified start was accepted as verified")
         finally:
             remove_file_logging(tmp)
     return (f"|C+| = {len(OA_GROUP)}, off-group denominators, gradients and val loss 0, selection = group mean, "

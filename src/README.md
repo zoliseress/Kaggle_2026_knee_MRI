@@ -680,8 +680,14 @@ batch averages. No positive-class weighting or oversampling is used.
   unsupervised" in the report.
 * **`train.init_weights` leak check (failure gate).** Every checkpoint stores its training
   studies (`train_study_ids`), and every run writes them to `run_dir/train_studies.csv`.
-  A fine-tune start is refused when the source trained on any of the new run's validation
-  studies or any `paths.exclude_from_training_csv` study. Example: the train_v8 checkpoints
+  It also stores `lineage_study_ids`: its own studies plus every study its starting weights
+  were trained on. The check therefore covers the whole fine-tune chain (A → B → C), not
+  only the direct source. A fine-tune start is refused when any checkpoint of the lineage
+  trained on any of the new run's validation studies or any
+  `paths.exclude_from_training_csv` study. An older checkpoint without `lineage_study_ids`
+  is followed link by link through its `init_source.path` or config `train.init_weights`
+  (`train.checkpoint_lineage`). A missing ancestor, a link with unknown studies, or an
+  ancestor that was itself started unverified counts as unknown. Example: the train_v8 checkpoints
   trained on all of new_242. A checkpoint from before this key has no list. It is checked
   through a `train_studies.csv` beside it or in its run directory, which
   `python src/tools/write_train_studies.py <run dir>...` reconstructs from the run's split
@@ -926,8 +932,9 @@ These read finished runs or label exports; none of them trains.
   differs from the project order;
 * a training study listed in `paths.exclude_from_training_csv`, or a split that does not
   match the run (`check-splits`, `check-fixed-split`);
-* a `train.init_weights` checkpoint trained on any validation or excluded study of the new
-  run, or one whose training studies are unknown (unless `train.init_weights_unverified=true`);
+* a `train.init_weights` checkpoint whose lineage (it and every checkpoint it was fine-tuned
+  from) trained on any validation or excluded study of the new run, or whose lineage is not
+  fully known (unless `train.init_weights_unverified=true`);
 * `train.loss_targets` without `eval.selection_targets`, or a selection target outside the
   loss targets.
 

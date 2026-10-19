@@ -251,6 +251,66 @@ def _dotted(tree: dict, key: str) -> Any:
     return tree
 
 
+def _recorded_train_studies(path: Path, payload: dict) -> tuple[list[str] | None, str]:
+    """A checkpoint's own training studies: stored in it, or a train_studies.csv beside it or in its run directory."""
+    own = payload.get("train_study_ids")
+    if own:
+        return [str(s) for s in own], "checkpoint"
+    for sidecar in (path.parent / TRAIN_STUDIES_FILE, path.parent.parent / TRAIN_STUDIES_FILE):
+        if sidecar.exists():
+            return list(pd.read_csv(sidecar, dtype={STUDY_ID: "string"})[STUDY_ID].dropna().astype(str)), str(sidecar)
+    return None, "unknown"
+
+
+def checkpoint_lineage(path: Path, payload: dict, max_depth: int = 20) -> tuple[set[str], list[dict], list[str]]:
+    """Every study the weights at `path` were trained on, through each train.init_weights ancestor.
+
+    A checkpoint written by this code stores the union as `lineage_study_ids` and ends the walk;
+    an older one is followed through its `init_source.path` or its config's `train.init_weights`.
+    Returns (studies, one record per checkpoint, problems): a problem is a link whose studies are
+    unknown, an unavailable ancestor, or an ancestor that was itself started unverified.
+    """
+    studies: set[str] = set()
+    links: list[dict] = []
+    problems: list[str] = []
+    visited: set[str] = set()
+    current_path, current = Path(path), payload
+    for _ in range(max_depth):
+        key = str(current_path.resolve())
+        if key in visited:
+            problems.append(f"lineage cycle at {current_path}")
+            break
+        visited.add(key)
+        source = current.get("init_source") or {}
+        if (source.get("leak_check") or {}).get("status") == "unverified":
+            problems.append(f"{current_path} was itself started from an unverified checkpoint")
+        own, origin = _recorded_train_studies(current_path, current)
+        known = set(own or []) | set(str(s) for s in (current.get("lineage_study_ids") or []))
+        if own is None and not known:
+            problems.append(f"{current_path}: training studies unknown")
+        studies |= known
+        links.append({"path": str(current_path), "n_studies": len(known) if known else None, "source": origin,
+                      "_studies": known})
+        if current.get("lineage_study_ids"):
+            break  # this checkpoint already holds its whole ancestry
+        parent = source.get("path") or ((current.get("config") or {}).get("train") or {}).get("init_weights")
+        if not parent:
+            break
+        parent_path = Path(str(parent))
+        if not parent_path.exists():
+            problems.append(f"{current_path}: its train.init_weights {parent} is not available")
+            break
+        try:
+            current = torch.load(str(parent_path), map_location="cpu", weights_only=False, mmap=True)
+        except Exception as error:  # an unreadable ancestor is an unknown link, not a pass
+            problems.append(f"{parent_path}: unreadable ({error.__class__.__name__})")
+            break
+        current_path = parent_path
+    else:
+        problems.append(f"lineage deeper than {max_depth} checkpoints")
+    return studies, links, problems
+
+
 class Trainer:
     def __init__(
         self,
@@ -292,6 +352,9 @@ class Trainer:
         # The studies this run trains on, stored in every checkpoint and in run_dir/train_studies.csv,
         # so a later train.init_weights can prove these weights never saw its validation studies.
         self.train_study_ids = sorted(str(s) for s in (getattr(train_dataset, "study_ids", None) or []))
+        # Plus every study the starting weights were trained on (train.init_weights, load_weights):
+        # what a later fine-tune from this run has to check.
+        self.lineage_study_ids = list(self.train_study_ids)
         if dist_utils.is_main() and self.train_study_ids:
             atomic_write_dataframe(pd.DataFrame({STUDY_ID: self.train_study_ids}), self.run_dir / TRAIN_STUDIES_FILE)
         self._grad_norms: list[float] = []  # pre-clip gradient norms of the current epoch
@@ -966,6 +1029,7 @@ class Trainer:
             "loss_targets": None if self.loss_targets is None else list(self.loss_targets),
             "init_source": self.init_source,
             "train_study_ids": self.train_study_ids,
+            "lineage_study_ids": self.lineage_study_ids,
             "target_order": list(TARGETS),
             "config": self.cfg.to_dict(),
             "model_description": self.model.describe(),
@@ -1042,54 +1106,49 @@ class Trainer:
             )
         return payload
 
-    def _init_leak_check(self, path: Path, payload: dict) -> dict:
+    def _init_leak_check(self, path: Path, payload: dict) -> tuple[dict, set[str]]:
         """train.init_weights must never carry weights that saw this run's validation studies or a
         paths.exclude_from_training_csv study - a hard gate, like the split checks.
 
-        The source's training studies come from the checkpoint (`train_study_ids`) or, for an older
-        checkpoint, from a train_studies.csv beside it or in its run directory (tools/write_train_studies.py).
-        Without either, the start is refused unless train.init_weights_unverified=true.
+        Checked over the whole lineage (`checkpoint_lineage`): the source's own training studies and
+        those of every checkpoint it was fine-tuned from. A seen study always stops the run; a link
+        whose studies are unknown stops it unless train.init_weights_unverified=true.
+        Returns the check record and every study the weights were trained on.
         """
-        source = payload.get("train_study_ids")
-        origin = "checkpoint"
-        if not source:
-            source = None
-            for sidecar in (path.parent / TRAIN_STUDIES_FILE, path.parent.parent / TRAIN_STUDIES_FILE):
-                if sidecar.exists():
-                    source = list(pd.read_csv(sidecar, dtype={STUDY_ID: "string"})[STUDY_ID].dropna().astype(str))
-                    origin = str(sidecar)
-                    break
-        if not source:
-            if not bool(self.cfg.train.get("init_weights_unverified", False)):
-                raise ValueError(
-                    f"train.init_weights={path} does not record its training studies (an older checkpoint), so "
-                    "it cannot be checked against this run's validation studies. Write them with "
-                    "`python tools/write_train_studies.py <its run dir>`, or set train.init_weights_unverified=true "
-                    "if you know it never trained on them (the start is then recorded as unverified)."
-                )
-            LOG.warning(
-                "train.init_weights=%s: its training studies are unknown; NOT checked against the validation "
-                "studies (train.init_weights_unverified=true).",
-                path,
-            )
-            return {"status": "unverified"}
-        trained = set(source)
+        studies, links, problems = checkpoint_lineage(path, payload)
         validation = set(str(s) for s in self.reference.study_ids)
         excluded = load_excluded_training_ids(self.cfg) or set()
-        seen_val, seen_excluded = sorted(trained & validation), sorted(trained & excluded)
-        if seen_val or seen_excluded:
+        forbidden = validation | excluded
+        seen = sorted(studies & forbidden)
+        if seen:
+            culprits = [link["path"] for link in links if link.pop("_studies", set()) & forbidden]
             raise RuntimeError(
-                f"train.init_weights={path} was trained on {len(seen_val)} of this run's validation studies and "
-                f"{len(seen_excluded)} studies of paths.exclude_from_training_csv (e.g. {(seen_val + seen_excluded)[:3]}). "
-                "Fine-tuning from it leaks the evaluation set into the new run; start from a checkpoint whose "
-                "training excluded them."
+                f"train.init_weights={path} carries weights trained on {len(set(seen) & validation)} of this run's "
+                f"validation studies and {len(set(seen) & excluded)} studies of paths.exclude_from_training_csv "
+                f"(e.g. {seen[:3]}), through {culprits}. Fine-tuning from it leaks the evaluation set into the new "
+                "run; start from a checkpoint whose whole lineage excluded them."
             )
+        chain = [{k: v for k, v in link.items() if k != "_studies"} for link in links]
+        if problems:
+            if not bool(self.cfg.train.get("init_weights_unverified", False)):
+                raise ValueError(
+                    f"train.init_weights={path}: the training studies of its lineage are not fully known ({problems}), "
+                    "so it cannot be checked against this run's validation studies. Write the missing "
+                    "train_studies.csv with `python src/tools/write_train_studies.py <run dir>`, or set "
+                    "train.init_weights_unverified=true if you know no link trained on them (recorded as unverified)."
+                )
+            LOG.warning(
+                "train.init_weights=%s: lineage only partly known (%s); the known %d studies pass, the rest is NOT "
+                "checked (train.init_weights_unverified=true).",
+                path, problems, len(studies),
+            )
+            return {"status": "unverified", "chain": chain, "problems": problems, "n_lineage_studies": len(studies)}, studies
         LOG.info(
-            "train.init_weights leak check passed: none of its %d training studies (%s) is among the %d validation "
-            "studies or the %d excluded studies.",
-            len(trained), origin, len(validation), len(excluded),
+            "train.init_weights leak check passed: none of the %d studies its lineage trained on (%d checkpoint(s)) "
+            "is among the %d validation studies or the %d excluded studies.",
+            len(studies), len(chain), len(validation), len(excluded),
         )
-        return {"status": "passed", "source": origin, "n_source_studies": len(trained)}
+        return {"status": "passed", "chain": chain, "n_lineage_studies": len(studies)}, studies
 
     def load_weights(self, path: str | Path) -> None:
         """Fine-tune start (`train.init_weights`): model weights only.
@@ -1104,7 +1163,8 @@ class Trainer:
                 f"train.init_weights={path} is a {stored_backbone} checkpoint but model.backbone={self.model.backbone}. "
                 "Switching the backbone is a new experiment: start it from the backbone's pretrained weights."
             )
-        leak_check = self._init_leak_check(Path(str(path)), payload)
+        leak_check, ancestry = self._init_leak_check(Path(str(path)), payload)
+        self.lineage_study_ids = sorted(set(self.train_study_ids) | ancestry)
         self.model.load_state_dict(payload["model"])
         if self.ema is not None:
             self.ema.reset(self.model)
@@ -1157,7 +1217,8 @@ class Trainer:
         else:
             self.model.load_state_dict(payload["model"])
         self.optimizer.load_state_dict(payload["optimizer"])
-        self.init_source = payload.get("init_source")  # a resumed fine-tune keeps its origin
+        self.init_source = payload.get("init_source")  # a resumed fine-tune keeps its origin and lineage
+        self.lineage_study_ids = list(payload.get("lineage_study_ids") or self.train_study_ids)
         self.scheduler.load_state_dict(payload["scheduler"])
         self.scaler.load_state_dict(payload["scaler"])
         # The stored epoch is the last *completed* one; training continues with the next.
