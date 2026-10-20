@@ -374,7 +374,7 @@ def cmd_merge_oof(args: argparse.Namespace) -> int:
     from .evaluate import merge_oof
 
     cfg = _load(args)
-    path = merge_oof(cfg, args.predictions, out_path=args.out)
+    path = merge_oof(cfg, args.predictions, out_path=args.out, fold_assignments=args.fold_assignments)
     print(str(path))
     return 0
 
@@ -572,6 +572,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = _common(sub.add_parser("merge-oof", help="Merge complete, verified per-fold predictions"))
     p.add_argument("predictions", nargs="+")
     p.add_argument("--out", default=None)
+    p.add_argument(
+        "--fold-assignments",
+        default=None,
+        help="STUDY_ID,fold csv defining the folds instead of splits.csv; predictions in fold order "
+        "(e.g. notebooks/reference_545_manifest.csv for the fixed-holdout runs of run_cv545.sh)",
+    )
     p.set_defaults(func=cmd_merge_oof)
 
     p = _common(sub.add_parser("report", help="Build the offline HTML report for a run directory"))

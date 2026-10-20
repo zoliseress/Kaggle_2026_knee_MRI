@@ -15,7 +15,7 @@ from .constants import CHECKPOINT_VERSION, DEFAULT_BACKBONE, FIXED_INPUT_BACKBON
 from .dataset import StudyBagDataset, check_study_coverage, collate_studies, enforce_coverage_gate
 from .encoders import canonical_encoder_model_id
 from .labels import build_label_table, load_reference_table
-from .metrics import evaluate_predictions, soft_roc_auc
+from .metrics import evaluate_predictions, read_reference_subsets, soft_roc_auc, subset_metrics
 from .model import build_model
 from .preprocess import preprocess_hash
 from .splits import ROLE_REFERENCE_HOLDOUT, ROLE_TRAIN_POOL, fold_study_ids, load_splits
@@ -286,16 +286,49 @@ def evaluate_checkpoint(
     return summary
 
 
-def merge_oof(cfg: Config, fold_prediction_files: Sequence[str | Path], out_path: str | Path | None = None) -> Path:
+def merge_oof(
+    cfg: Config,
+    fold_prediction_files: Sequence[str | Path],
+    out_path: str | Path | None = None,
+    fold_assignments: str | Path | None = None,
+) -> Path:
     """Merge per-fold validation predictions into `oof_predictions.csv`.
 
     Only complete, verified-disjoint coverage is merged: a single held-out fold is not OOF.
+    By default the folds and the study pool come from `splits.csv` (`train_pool` role). With
+    `fold_assignments` (a STUDY_ID, fold csv, e.g. the reference-545 manifest) they come from that
+    table instead: the i-th prediction file is fold i (its own `fold` column - 0 in a fixed-holdout
+    run - is overwritten) and must hold exactly that fold's studies.
     """
-    splits = load_splits(cfg)
-    expected_folds = sorted(int(f) for f in splits[splits["role"] == ROLE_TRAIN_POOL]["fold"].unique())
     frames = [pd.read_csv(path, dtype={STUDY_ID: "string"}) for path in fold_prediction_files]
     if not frames:
         raise ValueError("No prediction files given")
+
+    if fold_assignments is not None:
+        assignment = pd.read_csv(fold_assignments, dtype={STUDY_ID: "string"}, encoding="utf-8-sig")
+        if not assignment[STUDY_ID].is_unique:
+            raise ValueError(f"OOF merge refused: duplicated studies in {fold_assignments}")
+        fold_of = assignment.set_index(STUDY_ID)["fold"].astype(int)
+        expected_folds = sorted(fold_of.unique())
+        if len(frames) != len(expected_folds):
+            raise ValueError(
+                f"OOF merge refused: {len(frames)} prediction files for folds {expected_folds}. "
+                "A single held-out fold is not complete out-of-fold coverage."
+            )
+        for fold, (path, frame) in zip(expected_folds, zip(fold_prediction_files, frames)):
+            got = set(frame[STUDY_ID].astype(str))
+            want = set(fold_of.index[fold_of == fold])
+            if got != want:
+                raise ValueError(
+                    f"OOF merge refused: {path} holds {len(got - want)} studies outside fold {fold} and "
+                    f"misses {len(want - got)} of its studies (files must be given in fold order)."
+                )
+            frame["fold"] = fold
+        pool_studies = set(fold_of.index)
+    else:
+        splits = load_splits(cfg)
+        expected_folds = sorted(int(f) for f in splits[splits["role"] == ROLE_TRAIN_POOL]["fold"].unique())
+        pool_studies = set(splits[splits["role"] == ROLE_TRAIN_POOL][STUDY_ID].astype(str))
     merged = pd.concat(frames, ignore_index=True)
 
     present_folds = sorted(int(f) for f in merged["fold"].unique())
@@ -308,7 +341,6 @@ def merge_oof(cfg: Config, fold_prediction_files: Sequence[str | Path], out_path
     if duplicated:
         raise ValueError(f"OOF merge refused: {duplicated} duplicated (study, target) rows - folds are not disjoint.")
 
-    pool_studies = set(splits[splits["role"] == ROLE_TRAIN_POOL][STUDY_ID].astype(str))
     covered = set(merged[STUDY_ID].astype(str))
     missing = pool_studies - covered
     if missing:
@@ -317,19 +349,48 @@ def merge_oof(cfg: Config, fold_prediction_files: Sequence[str | Path], out_path
     out_path = Path(out_path) if out_path else Path(cfg.paths.output_dir) / "oof_predictions.csv"
     atomic_write_dataframe(merged, out_path)
 
-    pivot_scores = merged.pivot(index=STUDY_ID, columns="target", values="score")[list(TARGETS)].to_numpy()
-    pivot_ref = merged.pivot(index=STUDY_ID, columns="target", values="reference")[list(TARGETS)].to_numpy()
-    pivot_valid = merged.pivot(index=STUDY_ID, columns="target", values="reference_valid")[list(TARGETS)].to_numpy()
-    table, summary = evaluate_predictions(
-        pivot_scores.astype(float),
-        pivot_ref.astype(float),
-        pivot_valid.astype(bool),
-        threshold=float(cfg.eval.threshold),
-        min_support=int(cfg.eval.min_class_support),
-    )
+    def _evaluate(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+        wide = {
+            column: frame.pivot(index=STUDY_ID, columns="target", values=column)[list(TARGETS)].to_numpy()
+            for column in ("score", "reference", "reference_valid")
+        }
+        return evaluate_predictions(
+            wide["score"].astype(float),
+            wide["reference"].astype(float),
+            wide["reference_valid"].astype(bool),
+            threshold=float(cfg.eval.threshold),
+            min_support=int(cfg.eval.min_class_support),
+        )
+
+    table, summary = _evaluate(merged)
     atomic_write_dataframe(table, out_path.with_name("oof_metrics_per_class.csv"))
     atomic_write_json(out_path.with_name("oof_summary.json"), summary)
-    LOG.info("OOF merged: %s (%s)", out_path, summary["defined_fraction"])
+
+    # Per-fold macros next to the pooled OOF value: a different statistic (the pooled one also
+    # mixes the fold models' calibration), so both are reported.
+    fold_rows = []
+    for fold in expected_folds:
+        _, fold_summary = _evaluate(merged[merged["fold"] == fold])
+        fold_rows.append(
+            {"fold": str(fold), "n_studies": fold_summary["n_studies"],
+             "macro_soft_auc": fold_summary["macro_soft_auc"], "macro_roc_auc": fold_summary["macro_roc_auc"]}
+        )
+    metrics = ("macro_soft_auc", "macro_roc_auc")
+    per_fold = pd.DataFrame(fold_rows)
+    fold_rows.append({"fold": "mean", **{m: float(np.nanmean(per_fold[m])) for m in metrics}})
+    fold_rows.append({"fold": "std", **{m: float(np.nanstd(per_fold[m], ddof=1)) for m in metrics}})
+    fold_rows.append({"fold": "pooled_oof", "n_studies": summary["n_studies"], **{m: summary[m] for m in metrics}})
+    fold_table = pd.DataFrame(fold_rows)
+    atomic_write_dataframe(fold_table, out_path.with_name("fold_summary.csv"))
+
+    subsets = read_reference_subsets(cfg.paths.get("reference_subsets_csv"))
+    subset_per_class, subset_summary = subset_metrics(
+        merged, subsets, threshold=float(cfg.eval.threshold), min_support=int(cfg.eval.min_class_support)
+    )
+    atomic_write_dataframe(subset_summary, out_path.with_name("oof_subset_summary.csv"))
+    atomic_write_dataframe(subset_per_class, out_path.with_name("oof_subset_metrics_per_class.csv"))
+    LOG.info("OOF merged: %s (%s)\n%s\n%s", out_path, summary["defined_fraction"],
+             fold_table.to_string(index=False), subset_summary.to_string(index=False))
     return out_path
 
 

@@ -1509,6 +1509,66 @@ def check_subset_metrics(tmp_dir) -> str:
     return "full slice computed directly; subsets share the cell mask; absent subset skipped; one-class subset target NA"
 
 
+def check_merge_oof_fold_assignments(tmp_dir) -> str:
+    """merge-oof --fold-assignments (reference-545 CV of fixed-holdout runs): the i-th file is fold i
+    whatever its own fold column says; complete disjoint coverage merges, with per-fold and subset
+    summaries; a missing fold, a duplicated study or a file in the wrong fold order is refused."""
+    from pathlib import Path
+
+    from .evaluate import merge_oof
+
+    tmp = Path(tmp_dir) / "merge_oof_assignments"
+    tmp.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(7)
+    ids = [f"r{i:02d}" for i in range(30)]
+    folds = np.arange(30) % 3
+    assignments = pd.DataFrame({STUDY_ID: ids, "subset": np.where(np.arange(30) < 15, "old", "new"), "fold": folds})
+    assignments.to_csv(tmp / "assignments.csv", index=False)
+
+    def fold_file(fold: int, study_ids) -> Path:
+        n = len(study_ids)
+        reference = rng.integers(0, 2, size=(n, N_TARGETS)).astype(float)
+        reference[0], reference[1] = 0.0, 1.0
+        frame = pd.DataFrame(
+            {
+                STUDY_ID: np.repeat(study_ids, N_TARGETS),
+                "target": np.tile(TARGETS, n),
+                "fold": 0,  # a fixed-holdout run always writes fold 0
+                "score": np.clip(0.5 * reference + 0.5 * rng.random((n, N_TARGETS)), 0, 1).ravel(),
+                "reference": reference.ravel(),
+                "reference_valid": True,
+            }
+        )
+        path = tmp / f"fold{fold}_{len(list(tmp.iterdir()))}.csv"
+        frame.to_csv(path, index=False)
+        return path
+
+    files = [fold_file(f, [s for s, k in zip(ids, folds) if k == f]) for f in range(3)]
+    cfg = load_config(resolve=False)
+    cfg.paths.reference_subsets_csv = str(tmp / "assignments.csv")
+    out = merge_oof(cfg, files, out_path=tmp / "oof" / "oof_predictions.csv", fold_assignments=tmp / "assignments.csv")
+    merged = pd.read_csv(out, dtype={STUDY_ID: "string"})
+    by_study = merged.groupby(STUDY_ID)["fold"].first()
+    assert (by_study.loc[ids].to_numpy() == folds).all(), "fold column must come from the assignments"
+    fold_summary = pd.read_csv(out.with_name("fold_summary.csv"))
+    assert list(fold_summary["fold"].astype(str)) == ["0", "1", "2", "mean", "std", "pooled_oof"]
+    subsets = pd.read_csv(out.with_name("oof_subset_summary.csv"))
+    assert list(subsets["subset"]) == ["full_30", "old", "new"], subsets["subset"].tolist()
+
+    bad_cases = {
+        "missing fold": files[:2],
+        "wrong order": [files[1], files[0], files[2]],
+        "duplicated study": [files[0], files[1], fold_file(2, [s for s, k in zip(ids, folds) if k == 2] + ["r00"])],
+    }
+    for name, case in bad_cases.items():
+        try:
+            merge_oof(cfg, case, out_path=tmp / "bad" / "oof.csv", fold_assignments=tmp / "assignments.csv")
+        except ValueError:
+            continue
+        raise AssertionError(f"merge_oof must refuse: {name}")
+    return "fold from assignments; per-fold + subset summaries; missing fold, wrong order, duplicate refused"
+
+
 def check_soft_auc_bruteforce() -> str:
     """Continuous reference: the O(n log n) formula matches the explicit pair sum."""
     rng = np.random.default_rng(1)
@@ -4937,6 +4997,7 @@ def run_all_checks(cfg: Config, quick: bool = False) -> list[tuple[str, bool, st
             ("soft_auc_matches_roc_auc", check_soft_auc_matches_roc_auc),
             ("soft_auc_bruteforce", check_soft_auc_bruteforce),
             ("subset_metrics", lambda: check_subset_metrics(tmp_dir)),
+            ("merge_oof_fold_assignments", lambda: check_merge_oof_fold_assignments(tmp_dir)),
             ("nonfinite_scores_rejected", check_nonfinite_scores_rejected),
             ("skipped_amp_step", check_skipped_amp_step),
             ("ema_update_formula", check_ema_update_formula),

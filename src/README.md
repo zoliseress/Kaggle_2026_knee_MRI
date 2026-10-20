@@ -71,6 +71,9 @@ The build scripts have their paths hard-coded (`D = 'F:/Kaggle/data/'`). Older t
 | `train_labeled_450_reference.csv` | `<data>` and `notebooks/` | `run_holdout.*` (`VAL_CSV`, `HOLDOUT=450` default), and `paths.exclude_from_training_csv` — **`train.py` refuses to start when this file is missing** |
 | `train_labeled_242_reference.csv` | `<data>` and `notebooks/` | the 242 new studies of the 450 (subset `new_242`) |
 | `reference_450_manifest.csv` | `<data>` and `notebooks/` | `paths.reference_subsets_csv`: StudyInstanceUID → `original_208` / `new_242` for the per-subset report |
+| `rsna_reference_545_3fold_soft.zip` | `<data>` | input of `notebooks/build_ref545_cv.py` (545 reference, 3 folds, binary + soft radiologist labels) |
+| `train_v12_ref545_{soft,binary}_fold<N>.csv`, `ref545_fold<N>_val.csv` | `<data>` | `run_cv545.sh` (built by `build_ref545_cv.py`) |
+| `train_labeled_545_reference.csv`, `reference_545_manifest.csv` | `notebooks/` | the 545 binary reference; StudyInstanceUID → `subset` (`original_208` / `new_242` / `new_95`), `fold` |
 
 `build_ref208_train_v7.py` writes the 208 file to both places (the 158 plus the 0–4 scores of
 `RSNA_Andrew 50.xlsx`, binarised: 0–1 → 0, 3–4 → 1, 2 / X → empty). There is no build script
@@ -832,6 +835,49 @@ code, true in the shipped configs) every epoch's selected (EMA) weights also go 
 `new_242`, so 449 studies are evaluable and six targets have one positive fewer than the
 package's `label_counts.csv`. Old checkpoints trained on `train_v8` saw the 242 new studies,
 so compare on the 450 only between runs trained with the 450 exclusion.
+
+### Reference-545 3-fold CV (`run_cv545.sh`)
+
+`rsna_reference_545_3fold_soft.zip` extends the reference to 545 studies: the 450 (values
+unchanged cell for cell) + 95 new radiologist-read studies (`new_95`), split into 3 balanced
+folds (182/182/181). Every reference study validates once, against its **binary** radiologist
+labels, and trains in the other two folds with its **soft** radiologist labels (0–4 score →
+0 / 0.15 / masked / 0.85 / 1; the 58 Kaggle-binary studies stay 0/1). The non-reference
+studies train in every fold with their LLM labels.
+
+```bash
+python -I notebooks/build_ref545_cv.py           # once: per-fold train/val CSVs + manifest
+./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320
+LABEL_MODE=binary ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320   # control
+./run_cv545.sh --gpu 2,3 --resume E3_img320_cv545soft_<timestamp> --set data.image_size=320
+```
+
+* **Per fold N a fixed hold-out run**:
+  * Training table `train_v12_ref545_<mode>_foldN.csv`: `train_v11` without all 545 reference
+    studies (3862 LLM rows), plus the radiologist rows of the other two folds.
+  * Validation `ref545_foldN_val.csv`, frozen once as `work/labels/frozen_reference_ref545_foldN.csv`.
+  * The validation studies are absent from the training table under any label source.
+    `check-fixed-split` and `exclude_from_training_csv = VAL_CSV` enforce this.
+* **No refill from the LLM.** A radiologist-masked cell stays unknown (weight 0); it is not
+  filled with the LLM label.
+* **No extra label smoothing** on the 0.15/0.85 targets.
+* **Output and runs.** Output goes to `work/runs/train_v12/` (`RUNS_DIR`). Runs are
+  `<prefix>_cv545<mode>_<timestamp>_fold<N>` (`GROUP` fixes the group name). Resume works like `run_cv.*`.
+* **Parallel folds**, one fold per GPU (3 GPUs cannot run DDP: `accumulation_steps=8` is not
+  divisible by 3): `GROUP=<name> ./run_cv545.sh --gpu 1 --folds 0 ...`, the same for
+  `--gpu 2 --folds 1` and `--gpu 3 --folds 2`. The OOF merge runs when all three folds have
+  finished; the fold that finishes last runs it.
+* **OOF.** `merge-oof --fold-assignments notebooks/reference_545_manifest.csv` takes the i-th
+  file as fold i: a fixed hold-out run writes fold 0. It refuses a missing fold, a wrong order
+  or a duplicated study. It writes:
+  * the pooled OOF (`oof_summary.json`, `oof_metrics_per_class.csv`);
+  * the per-fold macros with mean ± std (`fold_summary.csv`); the pooled value is a different
+    statistic and also mixes the fold models' calibration;
+  * the `full_545` / `original_208` / `new_242` / `new_95` breakdown (`oof_subset_summary.csv`).
+* **Development CV.** Epoch selection uses each fold's own validation set. For the Kaggle test
+  set the three fold models can be averaged. A teacher trained here has seen 2/3 of the
+  reference, so its pseudo-labels must not feed a run validated on the 450/545.
+* **Masked study.** The label-masked rotated study is in fold 1, so 544 studies are evaluable.
 
 ### Keeping the reference out of every training run (teachers included)
 
