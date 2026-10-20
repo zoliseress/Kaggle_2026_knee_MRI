@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="hu">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CV545 és H5 a ref208-on</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column (max 980px); charts and tables full column width, tables scroll inside their own box. */
+:root {
+  --bg: #f7f8f9;
+  --surface: #ffffff;
+  --fg: #12161b;
+  --fg-2: #4b5560;
+  --muted: #7d8791;
+  --grid: #e3e7eb;
+  --axis: #c3cad1;
+  --line: rgba(18, 22, 27, 0.10);
+  --c-v8: #59626c;      /* reference family: neutral ink */
+  --c-cv: #eb6834;      /* CV545: categorical slot 2 */
+  --c-mix: #1baf7a;     /* H5 + CV545: categorical slot 3 */
+  --pos: #2a78d6;       /* diverging: better than H5_v8 */
+  --neg: #e34948;       /* diverging: worse than H5_v8 */
+  --mid: #ffffff;
+  --accent: #2a78d6;
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111417; --surface: #191d21; --fg: #eef1f4; --fg-2: #b9c1c9; --muted: #87909a;
+    --grid: #2a3036; --axis: #3b434b; --line: rgba(255, 255, 255, 0.10);
+    --c-v8: #a7b0ba; --c-cv: #d95926; --c-mix: #199e70;
+    --pos: #3987e5; --neg: #e66767; --mid: #191d21; --accent: #3987e5;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111417; --surface: #191d21; --fg: #eef1f4; --fg-2: #b9c1c9; --muted: #87909a;
+  --grid: #2a3036; --axis: #3b434b; --line: rgba(255, 255, 255, 0.10);
+  --c-v8: #a7b0ba; --c-cv: #d95926; --c-mix: #199e70;
+  --pos: #3987e5; --neg: #e66767; --mid: #191d21; --accent: #3987e5;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--font-sans); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+header { display: grid; gap: 14px; }
+.eyebrow { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+h1 { font-size: clamp(28px, 4.2vw, 40px); line-height: 1.12; margin: 0; font-weight: 600; text-wrap: balance; letter-spacing: -0.01em; }
+h2 { font-size: 21px; margin: 0; font-weight: 600; text-wrap: balance; }
+p { margin: 0; max-width: 68ch; }
+.lead { color: var(--fg-2); font-size: 16.5px; }
+section { display: grid; gap: 16px; min-width: 0; }
+.sub { color: var(--fg-2); max-width: 68ch; }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 8px; }
+.fact { background: var(--surface); padding: 14px 16px; display: grid; gap: 4px; align-content: start; }
+.fact .k { font-size: 12.5px; color: var(--fg-2); }
+.fact .v { font-family: var(--font-mono); font-size: 24px; font-weight: 500; }
+.fact .d { font-size: 12.5px; color: var(--muted); }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+.scroll { overflow-x: auto; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--fg-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.sw.sq { border-radius: 2px; width: 14px; }
+
+svg text { font-family: var(--font-sans); }
+svg .tick { fill: var(--muted); font-size: 11px; font-family: var(--font-mono); }
+svg .lab { fill: var(--fg); font-size: 13px; }
+svg .lab2 { fill: var(--muted); font-size: 11.5px; }
+svg .val { fill: var(--fg-2); font-size: 12px; font-family: var(--font-mono); }
+svg .grp { fill: var(--muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 500; }
+svg .hit { fill: transparent; cursor: default; }
+svg .row:hover .bgrow { fill: var(--grid); }
+
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { font: inherit; font-size: 13px; padding: 6px 12px; border: 0; background: var(--surface); color: var(--fg-2); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 7px 9px; text-align: right; white-space: nowrap; }
+thead th { font-weight: 500; color: var(--fg-2); vertical-align: bottom; border-bottom: 1px solid var(--axis); font-size: 12px; }
+thead th .fam { display: block; width: 100%; height: 3px; border-radius: 2px; margin-bottom: 6px; }
+tbody th, tfoot th { text-align: left; font-weight: 500; }
+tbody td.n, tfoot td.n { color: var(--muted); }
+tbody tr + tr td, tbody tr + tr th { border-top: 1px solid var(--grid); }
+tfoot th, tfoot td { border-top: 1px solid var(--axis); font-weight: 600; }
+td.cell { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+td.best { font-weight: 600; text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1.5px; }
+.scale { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.scale .bar { width: 160px; height: 10px; border-radius: 2px; border: 1px solid var(--line);
+  background: linear-gradient(90deg, var(--neg), var(--mid), var(--pos)); }
+
+.notes { display: grid; gap: 8px; color: var(--fg-2); padding-left: 18px; margin: 0; max-width: 72ch; }
+.tip { position: fixed; z-index: 20; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 12.5px;
+  padding: 8px 10px; border-radius: 6px; max-width: 300px; line-height: 1.45; box-shadow: 0 4px 14px rgba(0,0,0,0.18); }
+.tip b { font-weight: 600; }
+.tip .num { font-size: 12px; }
+@media (max-width: 520px) { .wrap { padding-block: 24px 48px; gap: 36px; } .fact .v { font-size: 21px; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">RSNA Knee · original_208 radiológus-referencia · 2026-10-20</div>
+    <h1>CV545 és H5 a ref208-on</h1>
+    <p class="lead">A radiológus-címkékkel is tanított CV545-modellek (V2S, C0, CNT12) és a 0.945-ös LB-t hozó H5_v8 ensemble tagjai, egyenként és ensemble-ként, makró és kategóriánkénti ROC-AUC-val, ugyanazon a 208 studyn.</p>
+    <div class="facts" id="facts"></div>
+  </header>
+
+  <section aria-labelledby="h-macro">
+    <h2 id="h-macro">Makró ROC-AUC</h2>
+    <p class="sub">A 12 kategória ROC-AUC-jának átlaga. A vonal a study-szintű bootstrap 95%-os intervalluma (<span class="num" id="nboot"></span> újramintavétel). A szaggatott függőleges vonal a H5_v8 szintje.</p>
+    <div class="legend" id="legend-fam"></div>
+    <div class="panel scroll"><svg id="chart-macro" role="img" aria-label="Makró ROC-AUC modellenként, 95%-os intervallummal"></svg></div>
+  </section>
+
+  <section aria-labelledby="h-diff">
+    <h2 id="h-diff">Páros különbségek</h2>
+    <p class="sub">Ugyanazokon a bootstrap-mintákon számolt makró-különbség. Egyedi modelleknél a CV545-öst a v8-as párjával vetjük össze, ensemble-eknél a H5_v8-cal. Ha az intervallum nem metszi a nullát, a különbség szignifikáns.</p>
+    <div class="panel scroll"><svg id="chart-diff" role="img" aria-label="Páros makró-különbségek 95%-os intervallummal"></svg></div>
+  </section>
+
+  <section aria-labelledby="h-per">
+    <h2 id="h-per">Kategóriánkénti ROC-AUC</h2>
+    <p class="sub">A cella színe az eltérés a H5_v8 azonos kategóriájától (±0.03-nál telítődik). Soronként a legjobb érték aláhúzva. Az n a pozitív studyk száma a 208-ból.</p>
+    <div class="controls">
+      <div class="seg" role="group" aria-label="Modellcsoport">
+        <button type="button" id="btn-single" aria-pressed="true">Egyedi modellek</button>
+        <button type="button" id="btn-ens" aria-pressed="false">Ensemble-ök</button>
+      </div>
+      <div class="seg" role="group" aria-label="Megjelenített érték">
+        <button type="button" id="btn-auc" aria-pressed="true">ROC-AUC</button>
+        <button type="button" id="btn-delta" aria-pressed="false">Eltérés a H5_v8-tól</button>
+      </div>
+      <div class="scale"><span>rosszabb</span><span class="bar"></span><span>jobb, mint a H5_v8</span></div>
+    </div>
+    <div class="panel scroll"><table id="tbl"></table></div>
+  </section>
+
+  <section aria-labelledby="h-method">
+    <h2 id="h-method">Hogyan készült</h2>
+    <ul class="notes">
+      <li>Halmaz: az original_208 radiológus-referencia. A v8-as runok (ref208), a CV545 (ref545) referenciája ezen a 208 studyn cellára azonos; a nem értékelhető cellák kimaradnak.</li>
+      <li>H5_v8-tagok: train_v8, a 208 kizárva a tanításból, best epoch a 208-on választva. Ensemble = a tagok sigmoid-átlaga, egyenlő súllyal.</li>
+      <li>CV545: 3 fold a 545 referencia-studyn. Foldonként a train_v12 és a másik két fold radiológus-sorai tanítanak, így a 208 kétharmada a saját foldjától különböző modellekben címkeként szerepel. Minden study jóslatát a saját foldjának modellje adja (OOF, pooled).</li>
+      <li>Beküldéskor a CV545-modellek 3 fold-modelljének átlaga megy; ez valószínűleg kicsit jobb, mint az itt látható OOF-becslés.</li>
+      <li>Tanító és kiértékelő címke itt ugyanabból a radiológusi olvasásból jön, ezért a CV545 előnye részben a „stílus” megtanulása lehet. Az LB dönti el, mennyi vihető át.</li>
+      <li>Forrás: <span class="num">notebooks/cv545_vs_v8.py</span> számításai, ugyanazokkal a runokkal.</li>
+    </ul>
+  </section>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+const DATA = {"targets": ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA", "PF OA", "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"], "n_pos": [40, 15, 84, 53, 45, 32, 74, 70, 63, 47, 31, 38], "n_neg": [164, 191, 118, 149, 158, 174, 130, 135, 134, 157, 175, 170], "n_studies": 208, "n_boot": 1000, "models": [{"key": "v8_R50", "label": "R50", "kind": "single", "family": "v8", "note": "RadImageNet ResNet-50, seed 42", "macro": 0.9240216223956884, "lo": 0.9076998983070566, "hi": 0.9382203557957707, "per": [0.9521341463414634, 0.887260034904014, 0.9438054882970137, 0.9086995061415728, 0.9638537271448664, 0.8473419540229885, 0.8650727650727651, 0.959047619047619, 0.888533522861881, 0.9581244071012333, 0.9612903225806452, 0.9530959752321981]}, {"key": "v8_V2S", "label": "V2S", "kind": "single", "family": "v8", "note": "EfficientNetV2-S, seed 42", "macro": 0.933227364423514, "lo": 0.9189628050386061, "hi": 0.9478682512113344, "per": [0.98125, 0.8837696335078534, 0.96045197740113, 0.9119918956565785, 0.9534458509142053, 0.8556034482758621, 0.8618503118503118, 0.9717460317460317, 0.9039327173655531, 0.9840086732619596, 0.9644239631336405, 0.9662538699690403]}, {"key": "v8_C0s2", "label": "C0 s2", "kind": "single", "family": "v8", "note": "CoAtNet-0, seed 2", "macro": 0.9357948524354206, "lo": 0.9223628255605291, "hi": 0.9493130168045693, "per": [0.9785060975609756, 0.9071553228621292, 0.9509685230024213, 0.9321261238444979, 0.9566807313642757, 0.8897270114942529, 0.8849272349272349, 0.9693121693121693, 0.8791755508173419, 0.960021683154899, 0.9548387096774194, 0.9660990712074303]}, {"key": "v8_CNT12s42", "label": "CNT12 s42", "kind": "single", "family": "v8", "note": "ConvNeXt-T in12k, seed 42", "macro": 0.9346997242750786, "lo": 0.9213681165391893, "hi": 0.9479539880274832, "per": [0.9727134146341463, 0.9144851657940664, 0.9569209039548022, 0.9251614537166012, 0.9531645569620253, 0.8706896551724138, 0.8882536382536382, 0.9630687830687831, 0.884624496564795, 0.980078601436509, 0.9611059907834102, 0.9461300309597523]}, {"key": "v8_CNT12s2", "label": "CNT12 s2", "kind": "single", "family": "v8", "note": "ConvNeXt-T in12k, seed 2", "macro": 0.9314037079097215, "lo": 0.9167369262031609, "hi": 0.9455674051676237, "per": [0.9717987804878049, 0.8963350785340314, 0.9548022598870056, 0.9189565657844752, 0.949929676511955, 0.8530890804597702, 0.8867983367983368, 0.9649735449735449, 0.8909026297085999, 0.9757419704567014, 0.9616589861751152, 0.9518575851393188]}, {"key": "cv_V2S", "label": "V2S", "kind": "single", "family": "cv", "note": "EfficientNetV2-S, seed 123, 3 fold OOF", "macro": 0.9376205646837446, "lo": 0.9245641772456751, "hi": 0.9499115278318119, "per": [0.9846036585365854, 0.8991273996509599, 0.95863599677159, 0.9214891731037103, 0.9510548523206751, 0.8683548850574713, 0.8545738045738046, 0.9809523809523809, 0.9105662165363658, 0.9822469169264127, 0.968479262672811, 0.9713622291021672]}, {"key": "cv_C0", "label": "C0", "kind": "single", "family": "cv", "note": "CoAtNet-0, seed 123, 3 fold OOF", "macro": 0.9347153436212586, "lo": 0.919414481763743, "hi": 0.9496783611831437, "per": [0.9553353658536585, 0.9075043630017452, 0.9495560936238903, 0.9090793972394581, 0.9527426160337553, 0.8591954022988506, 0.8741164241164241, 0.96994708994709, 0.9247808576166785, 0.969508063423228, 0.9734562211981567, 0.9713622291021672]}, {"key": "cv_CNT12", "label": "CNT12", "kind": "single", "family": "cv", "note": "ConvNeXt-T in12k, seed 123, 3 fold OOF", "macro": 0.9316953037817082, "lo": 0.9173941213923906, "hi": 0.9457948384678465, "per": [0.9547256097560975, 0.8596858638743455, 0.9607546408393866, 0.9275674306698747, 0.9464135021097047, 0.866558908045977, 0.8795218295218296, 0.979047619047619, 0.9164889836531628, 0.9737091746849167, 0.9695852534562212, 0.9462848297213622]}, {"key": "H5_v8", "label": "H5_v8", "kind": "ensemble", "family": "v8", "note": "R50 + V2S + C0 s2 + CNT12 s42 + CNT12 s2 (v8, LB 0.945)", "macro": 0.9433271442261003, "lo": 0.930429861478256, "hi": 0.9556711935916756, "per": [0.9797256097560976, 0.9116928446771378, 0.9684221146085553, 0.9338989489679625, 0.9637130801687763, 0.8708692528735632, 0.8958419958419959, 0.9724867724867725, 0.8975361288794125, 0.9872611464968153, 0.9686635944700461, 0.9698142414860681]}, {"key": "cv_3arch", "label": "CV545 3 arch", "kind": "ensemble", "family": "cv", "note": "CV545 V2S + C0 + CNT12 (a cv545_v12 beküldés)", "macro": 0.9433838741776981, "lo": 0.9304910734994445, "hi": 0.9565801920874476, "per": [0.9734756097560976, 0.9057591623036649, 0.9619652945924132, 0.9327592756743067, 0.9552742616033755, 0.8758979885057471, 0.8788981288981289, 0.9829629629629629, 0.9245439469320066, 0.9846862718525545, 0.9736405529953917, 0.9707430340557276]}, {"key": "cv_V2S_C0", "label": "CV545 V2S + C0", "kind": "ensemble", "family": "cv", "note": "CV545 V2S + C0", "macro": 0.9424277382732456, "lo": 0.9298172340187647, "hi": 0.9554404463487493, "per": [0.9789634146341464, 0.9113438045375218, 0.95954398708636, 0.9230087374952514, 0.9538677918424754, 0.8706896551724138, 0.8725571725571726, 0.9797883597883598, 0.9230040274816395, 0.9849573112887925, 0.9740092165898617, 0.9773993808049536]}, {"key": "H5_swap2", "label": "H5, V2S + C0 csere", "kind": "ensemble", "family": "mix", "note": "H5_v8, a V2S és a C0 helyén a CV545-ös", "macro": 0.944217542186072, "lo": 0.9314146632375686, "hi": 0.9572251128172133, "per": [0.9774390243902439, 0.9113438045375218, 0.9666061339790153, 0.9356717740914271, 0.960196905766526, 0.8708692528735632, 0.8896049896049896, 0.977989417989418, 0.9105662165363658, 0.9875321859330533, 0.9714285714285714, 0.9713622291021672]}, {"key": "H5_allcv", "label": "H5-összetétel CV545-tel", "kind": "ensemble", "family": "mix", "note": "H5-összetétel CV545-modellekkel (v8 R50 + CV V2S + C0 + 2× CNT12)", "macro": 0.9435915228765724, "lo": 0.9304314064541584, "hi": 0.9564356622081165, "per": [0.9721036585365853, 0.9029668411867364, 0.966000807102502, 0.9350386222616184, 0.959493670886076, 0.8717672413793104, 0.8858627858627859, 0.9821164021164022, 0.9206349206349206, 0.9863125084699824, 0.9725345622119815, 0.968266253869969]}, {"key": "H5_plus2", "label": "H5 + CV V2S + C0", "kind": "ensemble", "family": "mix", "note": "H5_v8 + CV545 V2S + C0 (7 tag)", "macro": 0.9451581529389504, "lo": 0.9328518780269247, "hi": 0.957695708611106, "per": [0.9807926829268293, 0.9137870855148342, 0.9678167877320419, 0.9352918829935418, 0.9614627285513362, 0.8728448275862069, 0.8905405405405405, 0.9789417989417989, 0.9090262970859986, 0.9872611464968153, 0.9701382488479263, 0.9739938080495356]}, {"key": "H5_plus3", "label": "H5 + CV 3 arch", "kind": "ensemble", "family": "mix", "note": "H5_v8 + CV545 V2S + C0 + CNT12 (8 tag)", "macro": 0.9452834985284481, "lo": 0.9326235753975676, "hi": 0.9577180209817867, "per": [0.9791158536585366, 0.9113438045375218, 0.9679176755447942, 0.9357984044573889, 0.9610407876230661, 0.8751795977011494, 0.8915800415800416, 0.9809523809523809, 0.9112769485903814, 0.9872611464968153, 0.9699539170506912, 0.9719814241486068]}], "pairs": [{"a": "cv_V2S", "b": "v8_V2S", "diff": 0.004393200260230601, "lo": -0.0017488342877610805, "hi": 0.010488154953373768, "p": 0.912}, {"a": "cv_C0", "b": "v8_C0s2", "diff": -0.0010795088141619669, "lo": -0.008596481470389775, "hi": 0.0063193956034097885, "p": 0.38}, {"a": "cv_CNT12", "b": "v8_CNT12s42", "diff": -0.0030044204933704632, "lo": -0.009902842220775643, "hi": 0.003755511140397011, "p": 0.197}, {"a": "cv_CNT12", "b": "v8_CNT12s2", "diff": 0.0002915958719866829, "lo": -0.006973115044814371, "hi": 0.007857588687896879, "p": 0.537}, {"a": "cv_3arch", "b": "H5_v8", "diff": 5.672995159777816e-05, "lo": -0.003841825690451733, "hi": 0.004290199758966889, "p": 0.515}, {"a": "cv_V2S_C0", "b": "H5_v8", "diff": -0.0008994059528547593, "lo": -0.005203240484127408, "hi": 0.003691661712362726, "p": 0.332}, {"a": "H5_swap2", "b": "H5_v8", "diff": 0.0008903979599717005, "lo": -0.0016294423934658242, "hi": 0.003448485277620896, "p": 0.754}, {"a": "H5_allcv", "b": "H5_v8", "diff": 0.00026437865047213016, "lo": -0.002992974952663713, "hi": 0.0036862868803238524, "p": 0.561}, {"a": "H5_plus2", "b": "H5_v8", "diff": 0.0018310087128501351, "lo": 0.00029795669452847286, "hi": 0.003531011190084002, "p": 0.993}, {"a": "H5_plus3", "b": "H5_v8", "diff": 0.0019563543023477514, "lo": 0.000270504153647419, "hi": 0.0038533886661434357, "p": 0.987}]};
+const FAM = { v8: ['v8 (H5-tagok)', '--c-v8'], cv: ['CV545', '--c-cv'], mix: ['H5 + CV545 vegyes', '--c-mix'] };
+const byKey = Object.fromEntries(DATA.models.map(m => [m.key, m]));
+const H5 = byKey['H5_v8'];
+const f4 = v => v.toFixed(4);
+const sg = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(4);
+const NS = 'http://www.w3.org/2000/svg';
+const el = (tag, attrs = {}, parent) => {
+  const n = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (parent) parent.appendChild(n);
+  return n;
+};
+const fullName = m => (m.kind === 'single' ? (m.family === 'cv' ? 'CV545 ' : 'v8 ') : '') + m.label;
+
+// Tooltip shared by the charts and the table
+const tip = document.getElementById('tip');
+function showTip(ev, html) {
+  tip.innerHTML = html; tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = Math.max(8, x) + 'px'; tip.style.top = Math.max(8, y) + 'px';
+}
+const hideTip = () => { tip.hidden = true; };
+
+// Facts
+(function facts() {
+  const best = DATA.models.filter(m => m.kind === 'single').sort((a, b) => b.macro - a.macro)[0];
+  const top = DATA.models.filter(m => m.kind === 'ensemble').sort((a, b) => b.macro - a.macro)[0];
+  const p = DATA.pairs.find(x => x.a === top.key && x.b === 'H5_v8');
+  const cv3 = byKey['cv_3arch'];
+  const items = [
+    ['H5_v8 (LB 0.945)', f4(H5.macro), '5 v8-as modell'],
+    ['CV545 3 arch', f4(cv3.macro), sg(cv3.macro - H5.macro) + ' a H5_v8-hoz'],
+    ['Legjobb ensemble: ' + top.label, f4(top.macro), p ? sg(p.diff) + ' [' + sg(p.lo) + ', ' + sg(p.hi) + ']' : ''],
+    ['Legjobb egyedi: ' + fullName(best), f4(best.macro), sg(best.macro - H5.macro) + ' a H5_v8-hoz'],
+  ];
+  document.getElementById('facts').innerHTML = items.map(([k, v, d]) =>
+    `<div class="fact"><span class="k">${k}</span><span class="v">${v}</span><span class="d num">${d}</span></div>`).join('');
+  document.getElementById('nboot').textContent = DATA.n_boot;
+  document.getElementById('legend-fam').innerHTML = Object.values(FAM).map(([n, c]) =>
+    `<span><i class="sw" style="background:var(${c})"></i>${n}</span>`).join('');
+})();
+
+// Generic dot + interval chart
+function dotChart(svg, groups, opts) {
+  const W = 860, labW = 250, valW = 150, top = 26, rowH = 30, gapH = 30;
+  const n = groups.reduce((s, g) => s + g.rows.length, 0);
+  const H = top + n * rowH + groups.length * gapH + 8;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.style.width = '100%'; svg.style.minWidth = '640px'; svg.style.display = 'block';
+  const x0 = labW, x1 = W - valW;
+  const sx = v => x0 + (v - opts.min) / (opts.max - opts.min) * (x1 - x0);
+  for (let t = opts.min; t <= opts.max + 1e-9; t += opts.step) {
+    el('line', { x1: sx(t), x2: sx(t), y1: top - 6, y2: H - 4, stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+    el('text', { x: sx(t), y: 12, 'text-anchor': 'middle', class: 'tick' }, svg).textContent = opts.fmt(t);
+  }
+  if (opts.ref != null) el('line', { x1: sx(opts.ref), x2: sx(opts.ref), y1: top - 6, y2: H - 4,
+    stroke: opts.refSolid ? 'var(--axis)' : 'var(--fg-2)', 'stroke-width': opts.refSolid ? 1.5 : 1,
+    'stroke-dasharray': opts.refSolid ? '' : '4 3' }, svg);
+  let y = top;
+  for (const g of groups) {
+    y += gapH;
+    el('text', { x: 0, y: y - 10, class: 'grp' }, svg).textContent = g.name;
+    for (const r of g.rows) {
+      const cy = y + rowH / 2;
+      const row = el('g', { class: 'row' }, svg);
+      el('rect', { x: 0, y, width: W, height: rowH, class: 'bgrow', fill: 'transparent', rx: 3 }, row);
+      el('text', { x: 8, y: cy + 4.5, class: 'lab' }, row).textContent = r.label;
+      const color = `var(${FAM[r.family][1]})`;
+      el('line', { x1: sx(r.lo), x2: sx(r.hi), y1: cy, y2: cy, stroke: color, 'stroke-width': 2, 'stroke-linecap': 'round' }, row);
+      el('circle', { cx: sx(r.v), cy, r: 5, fill: color, stroke: 'var(--surface)', 'stroke-width': 2 }, row);
+      el('text', { x: W - 4, y: cy + 4, 'text-anchor': 'end', class: 'val' }, row).textContent = r.valText;
+      const hit = el('rect', { x: 0, y, width: W, height: rowH, class: 'hit' }, row);
+      hit.addEventListener('mousemove', ev => showTip(ev, r.tip));
+      hit.addEventListener('mouseleave', hideTip);
+      y += rowH;
+    }
+  }
+}
+
+// Macro chart
+(function macro() {
+  const mk = m => ({ label: fullName(m), family: m.family, v: m.macro, lo: m.lo, hi: m.hi,
+    valText: f4(m.macro),
+    tip: `<b>${fullName(m)}</b><br>${m.note}<br><span class="num">${f4(m.macro)} [${f4(m.lo)}, ${f4(m.hi)}]</span><br>` +
+      (m.key === 'H5_v8' ? 'referencia' : `<span class="num">${sg(m.macro - H5.macro)}</span> a H5_v8-hoz`) });
+  const singles = DATA.models.filter(m => m.kind === 'single');
+  const ens = DATA.models.filter(m => m.kind === 'ensemble');
+  const all = DATA.models.flatMap(m => [m.lo, m.hi]);
+  const min = Math.floor(Math.min(...all) * 200) / 200, max = Math.ceil(Math.max(...all) * 200) / 200;
+  dotChart(document.getElementById('chart-macro'), [
+    { name: 'Egyedi modellek', rows: singles.map(mk) },
+    { name: 'Ensemble-ök', rows: ens.map(mk) },
+  ], { min, max, step: 0.005, fmt: v => v.toFixed(3), ref: H5.macro });
+})();
+
+// Paired difference chart
+(function diff() {
+  const mk = p => {
+    const a = byKey[p.a], b = byKey[p.b];
+    const sig = p.lo > 0 || p.hi < 0;
+    return { label: `${fullName(a)} − ${fullName(b)}`, family: a.family, v: p.diff, lo: p.lo, hi: p.hi,
+      valText: `${sg(p.diff)}${sig ? ' *' : ''}`,
+      tip: `<b>${fullName(a)} − ${fullName(b)}</b><br><span class="num">${sg(p.diff)} [${sg(p.lo)}, ${sg(p.hi)}]</span><br>` +
+        `P(${fullName(a)} jobb) = <span class="num">${p.p.toFixed(3)}</span>${sig ? '<br>szignifikáns' : ''}` };
+  };
+  const singles = DATA.pairs.filter(p => byKey[p.a].kind === 'single');
+  const ens = DATA.pairs.filter(p => byKey[p.a].kind === 'ensemble');
+  const ext = Math.max(...DATA.pairs.flatMap(p => [Math.abs(p.lo), Math.abs(p.hi)]));
+  const lim = Math.ceil(ext * 200) / 200;
+  dotChart(document.getElementById('chart-diff'), [
+    { name: 'CV545 a v8-as párjához képest', rows: singles.map(mk) },
+    { name: 'Ensemble a H5_v8-hoz képest', rows: ens.map(mk) },
+  ], { min: -lim, max: lim, step: 0.005, fmt: v => (Math.abs(v) < 1e-9 ? '0' : sg(v).replace(/0+$/, '').replace(/\.$/, '')), ref: 0, refSolid: true });
+})();
+
+// Per-target table
+const state = { group: 'single', mode: 'auc' };
+function heat(d) {
+  const t = Math.max(-1, Math.min(1, d / 0.03));
+  const pct = Math.round(Math.abs(t) * 55);
+  return `color-mix(in oklab, var(${t >= 0 ? '--pos' : '--neg'}) ${pct}%, var(--mid))`;
+}
+function renderTable() {
+  const cols = DATA.models.filter(m => m.kind === (state.group === 'single' ? 'single' : 'ensemble'));
+  const showDelta = state.mode === 'delta';
+  const head = '<thead><tr><th style="text-align:left">Kategória</th><th>n</th>' + cols.map(m =>
+    `<th><span class="fam" style="background:var(${FAM[m.family][1]})"></span>${fullName(m).replace(' + ', ' +<br>')}</th>`).join('') + '</tr></thead>';
+  const rows = DATA.targets.map((t, j) => {
+    const vals = cols.map(m => m.per[j]);
+    const best = Math.max(...vals);
+    return `<tr><th>${t}</th><td class="n num">${DATA.n_pos[j]}</td>` + cols.map((m, i) => {
+      const v = vals[i], d = v - H5.per[j];
+      const txt = showDelta ? (m.key === 'H5_v8' ? '—' : sg(d)) : f4(v);
+      return `<td class="cell${v === best ? ' best' : ''}" style="background:${heat(d)}" data-t="${j}" data-m="${m.key}">${txt}</td>`;
+    }).join('') + '</tr>';
+  }).join('');
+  const mbest = Math.max(...cols.map(m => m.macro));
+  const foot = `<tfoot><tr><th>Makró</th><td class="n num">${DATA.n_studies}</td>` + cols.map(m => {
+    const d = m.macro - H5.macro;
+    const txt = showDelta ? (m.key === 'H5_v8' ? '—' : sg(d)) : f4(m.macro);
+    return `<td class="cell${m.macro === mbest ? ' best' : ''}" style="background:${heat(d)}" data-t="-1" data-m="${m.key}">${txt}</td>`;
+  }).join('') + '</tr></tfoot>';
+  const tbl = document.getElementById('tbl');
+  tbl.innerHTML = head + '<tbody>' + rows + '</tbody>' + foot;
+}
+document.getElementById('tbl').addEventListener('mousemove', ev => {
+  const td = ev.target.closest('td.cell');
+  if (!td) return hideTip();
+  const m = byKey[td.dataset.m], j = +td.dataset.t;
+  const v = j < 0 ? m.macro : m.per[j], ref = j < 0 ? H5.macro : H5.per[j];
+  const name = j < 0 ? 'Makró' : `${DATA.targets[j]} (n+ ${DATA.n_pos[j]}, n− ${DATA.n_neg[j]})`;
+  showTip(ev, `<b>${fullName(m)}</b><br>${name}<br>ROC-AUC <span class="num">${f4(v)}</span>` +
+    (m.key === 'H5_v8' ? '' : `<br><span class="num">${sg(v - ref)}</span> a H5_v8-hoz`));
+});
+document.getElementById('tbl').addEventListener('mouseleave', hideTip);
+function bindSeg(a, b, key, va, vb) {
+  const A = document.getElementById(a), B = document.getElementById(b);
+  const set = v => { state[key] = v; A.setAttribute('aria-pressed', v === va); B.setAttribute('aria-pressed', v === vb);
+    try { localStorage.setItem('cv545h5-' + key, v); } catch (e) {} renderTable(); };
+  A.addEventListener('click', () => set(va)); B.addEventListener('click', () => set(vb));
+  let saved = null; try { saved = localStorage.getItem('cv545h5-' + key); } catch (e) {}
+  if (saved === va || saved === vb) { state[key] = saved; A.setAttribute('aria-pressed', saved === va); B.setAttribute('aria-pressed', saved === vb); }
+}
+bindSeg('btn-single', 'btn-ens', 'group', 'single', 'ensemble');
+bindSeg('btn-auc', 'btn-delta', 'mode', 'auc', 'delta');
+renderTable();
+</script>
+
+</html>
