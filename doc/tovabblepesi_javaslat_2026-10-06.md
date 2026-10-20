@@ -1,6 +1,6 @@
 # Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-19), a saját memórialogjaim alapján
 
-A dokumentum az 1–14. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
+A dokumentum az 1–15. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
 
 ## Kontextus – hol tartunk (2026-10-19)
 - **Validáció:** 2026-10-15-től az elsődleges validáció a **holdout450** (eredeti 208 + 242 új), a tanítóhalmaz a **train_v11** (3957 study). A riport külön adja a full_450, original_208 és new_242 eredményt (13. pont). Az 1–12. és a 14. pont még holdout208-ra (a 9. pont ref220-ra) vonatkozik. A v8-as modellek a 242-n tanultak, ezért velük csak az original_208 vethető össze.
@@ -29,6 +29,7 @@ A dokumentum az 1–14. pontban időrendben gyűjti a kísérleteket. A pontok a
   - ConvNeXt fb22k / DINOv3 / regularizált / lehűtés (8. pont);
   - R50 és CNT22 ötödik tagként a v11-en (13. pont);
   - label mask kikapcsolása (13. pont, felhasználói döntés).
+  - V2S ImageNet-normalizációval (15. pont, seed-zajon belül; az ensemble-hatás nincs mérve).
 - **Mérési korlát:** egy modell seed-szórása a 208-on ~0.002–0.003 (C0, 10 run: 0.9292–0.9380), két run páros különbségének SE-je ~0.0034. Az azonos seed sem reprodukál (~0.003). A full_450-en a C0 seed-szórása csak 0.0004. Lokálisan ~0.008 alatt nem döntünk, ensemble-szinten és LB-vel kell megerősíteni. A H5 LB-nyeresége (+0.002) a +0.003-as lokális szabály alatt jött.
 - **A modellek jobbak, mint a címkék** (208: H3_v8 0.939 vs. a train_v8 címke 0.893). A címkezaj a szűk keresztmetszet.
 - **v11 vs. v8:** a mostani kóddal mérve a 242 study kiesésének ára a C0-nál ~−0.001, seed-zajon belül (13. pont vége). A korábbi −0.004 főleg a régi v8-as C0 s2 szerencsés seedjéből jött. Nyitott, hogy mi magyarázza a holdout6_v11 (0.941) és a H5 (0.945) LB-különbségét; az összetétel is eltér (R50, seedek).
@@ -1145,6 +1146,41 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   hígítja a pooling-ot és a head-et, miközben a FS-szekvenciák információját nem egészíti ki.
 - **Döntés:** **lezárva**. Extra slotot a jelenlegi architektúrával nem javaslok. A `<sík>_second`
   szűrő a kódban marad (selftest `second_slot_selection`).
+
+### 15. V2S ImageNet-normalizációval (train_v11, holdout450, 2026-10-19): seed-zajon belül, az mri_scalar marad
+- **Kérdés:** a V2S (torchvision `IMAGENET1K_V1`) eddig a projekt alapértékével, `mri_scalar`
+  normalizációval tanult (mean 0.5, std 0.25 csatornánként). Az előtanított súlyok az ImageNet-statisztikát
+  várják. Segít-e, ha azt kapják? Kapcsoló: `--set data.encoder_normalization=imagenet`.
+- **Runok** (V2S E3 img320, Linux, 1 GPU/run, label mask be, minden más bitre azonos a
+  2026-10-16-i V2S párokkal):
+  - s7, GPU 2: `V2S_E3_img320_s7_trainv11_imgnet_holdout450_20261019_102334`, best ep8, 12 epoch;
+  - s123, GPU 3: `V2S_E3_img320_s123_trainv11_imgnet_holdout450_20261019_102334`, best ep8, 12 epoch;
+  - párok: `V2S_E3_img320_s7_trainv11_holdout450_20261016_201830` (best ep9),
+    `V2S_E3_img320_s123_trainv11_holdout450_20261016_201834` (best ep8).
+- **Eredmény** (macro soft AUC, best.pt EMA, `subset_summary.csv`):
+
+| | full_450 | original_208 | new_242 |
+|---|---|---|---|
+| mri_scalar s7 | 0.9232 | 0.9319 | 0.9174 |
+| mri_scalar s123 | 0.9193 | 0.9309 | 0.9111 |
+| **mri_scalar átlag** | **0.9213** | **0.9314** | **0.9142** |
+| imagenet s7 | 0.9198 | 0.9272 | 0.9154 |
+| imagenet s123 | 0.9247 | 0.9349 | 0.9165 |
+| **imagenet átlag** | **0.9223** | **0.9311** | **0.9160** |
+| imagenet − mri_scalar | +0.0010 | −0.0003 | +0.0018 |
+
+  - A seeden belüli különbség ellentétes előjelű: s7-en az mri_scalar jobb (−0.0034), s123-on az imagenet
+    (+0.0055). A két seed között azonos normalizáción belül 0.004–0.005 a full_450 különbség, ez nagyobb, mint
+    a normalizáció hatása.
+  - Targetenként (ROC-AUC, 2 seed átlaga, imagenet − mri_scalar): Fracture +0.011, Baker's +0.006, ACL +0.005,
+    PF OA +0.004, Medial OA +0.003; Lateral Meniscus −0.015, Medial Meniscus −0.003; a többi ±0.002-n belül.
+    Targetenként két mérés van, ezért ezek is lehetnek zajok.
+- **Értelmezés:** a BN-es CNN (frozen BN running stats mellett is) gyakorlatilag ugyanúgy alkalmazkodik a két
+  bemeneti skálához. A 3 csatorna szomszédos MRI-szelet, nem RGB, így a csatornánkénti ImageNet-statisztikának
+  nincs valódi jelentése.
+- **Döntés:** a V2S-nél az `mri_scalar` marad (projekt-alapérték, nincs config-változás). **Nyitott:** a
+  targetenkénti eltérő mintázat miatt az imagenet-es V2S esetleg ensemble-diverzitást adhat. A 4 run átlagolt
+  predikciója (`validation_predictions.csv`) még nincs kiértékelve.
 
 ### Mérési protokoll (minden lépésre)
 - 2026-10-15-től: elsődleges a **full_450** (holdout450, train_v11), mellette külön az original_208 és a new_242.

@@ -98,6 +98,10 @@ def test_subset_metrics(tmp_path):
     selftest.check_subset_metrics(tmp_path)
 
 
+def test_merge_oof_fold_assignments(tmp_path):
+    selftest.check_merge_oof_fold_assignments(tmp_path)
+
+
 def test_soft_auc_bruteforce():
     selftest.check_soft_auc_bruteforce()
 
