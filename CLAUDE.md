@@ -44,6 +44,7 @@ frozen reference, resolve the output dir, and support `--gpu 0,1` for DDP via to
 ```bash
 ./run_holdout.sh [--gpu N] <prefix> --set data.image_size=320   # train_v11 trains, 450 reference validates
 ./run_cv.sh      [--gpu N] <prefix> --set data.image_size=320   # 3-fold CV + merge-oof
+./run_cv545.sh   [--gpu N] <prefix> --set data.image_size=320   # 3-fold CV on the 545 reference (LABEL_MODE=soft|binary)
 ```
 
 Linux uses `src/config.linux.yaml`; `src/config.yaml` is the Windows config (paths like
@@ -91,6 +92,10 @@ Size batch/memory and DDP commands accordingly.
   original 208 + 242 new, from `rsna_reference_450_package.zip`) is the evaluation set and
   must never enter training (incl. CV teachers). Enforced via `paths.exclude_from_training_csv`,
   `check-splits`, `check-fixed-split`. Report full_450, original_208 and new_242 separately.
+  Exception: the reference-545 3-fold CV (`run_cv545.sh`, inputs from `notebooks/build_ref545_cv.py`)
+  trains each fold on the other two folds' radiologist soft labels and validates on its own fold's
+  binary labels; a study's own fold never sees it. Models/pseudo-labels from that CV must not feed
+  a run validated on the 450/545. Report full_545, original_208, new_242, new_95 there.
 - Studies in `notebooks/label_mask_studies.csv` (bilateral / rotated scans) have all labels masked.
 - `splits.csv` is immutable once created; folds are patient-group disjoint.
 - Failure gates (see `src/README.md` → *Failure gates*) stop runs on purpose; don't weaken them to

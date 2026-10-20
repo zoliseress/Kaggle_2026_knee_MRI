@@ -291,6 +291,7 @@ def merge_oof(
     fold_prediction_files: Sequence[str | Path],
     out_path: str | Path | None = None,
     fold_assignments: str | Path | None = None,
+    reference_csv: str | Path | None = None,
 ) -> Path:
     """Merge per-fold validation predictions into `oof_predictions.csv`.
 
@@ -299,6 +300,9 @@ def merge_oof(
     `fold_assignments` (a STUDY_ID, fold csv, e.g. the reference-545 manifest) they come from that
     table instead: the i-th prediction file is fold i (its own `fold` column - 0 in a fixed-holdout
     run - is overwritten) and must hold exactly that fold's studies.
+    With `reference_csv` (a wide STUDY_ID + 12 targets csv, empty = masked) the predictions are
+    re-scored against that reference instead of the one the runs validated on: a cell stays
+    valid only if it was valid in the run (label mask) and is non-empty in the csv.
     """
     frames = [pd.read_csv(path, dtype={STUDY_ID: "string"}) for path in fold_prediction_files]
     if not frames:
@@ -330,6 +334,18 @@ def merge_oof(
         expected_folds = sorted(int(f) for f in splits[splits["role"] == ROLE_TRAIN_POOL]["fold"].unique())
         pool_studies = set(splits[splits["role"] == ROLE_TRAIN_POOL][STUDY_ID].astype(str))
     merged = pd.concat(frames, ignore_index=True)
+    if reference_csv is not None:
+        override = pd.read_csv(reference_csv, dtype={STUDY_ID: "string"}, encoding="utf-8-sig")
+        long = override.melt(id_vars=STUDY_ID, value_vars=list(TARGETS), var_name="target", value_name="_ref")
+        missing_ref = set(merged[STUDY_ID].astype(str)) - set(override[STUDY_ID].astype(str))
+        if missing_ref:
+            raise ValueError(f"{reference_csv}: {len(missing_ref)} predicted studies are missing")
+        merged = merged.merge(long, on=[STUDY_ID, "target"], how="left", validate="many_to_one")
+        if not merged["_ref"].dropna().isin([0.0, 1.0]).all():
+            raise ValueError(f"{reference_csv}: reference values must be 0, 1 or empty")
+        merged["reference_valid"] = merged["reference_valid"].astype(bool) & merged["_ref"].notna()
+        merged["reference"] = merged["_ref"].fillna(0.0)
+        merged = merged.drop(columns="_ref")
 
     present_folds = sorted(int(f) for f in merged["fold"].unique())
     if present_folds != expected_folds:

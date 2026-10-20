@@ -1555,6 +1555,24 @@ def check_merge_oof_fold_assignments(tmp_dir) -> str:
     subsets = pd.read_csv(out.with_name("oof_subset_summary.csv"))
     assert list(subsets["subset"]) == ["full_30", "old", "new"], subsets["subset"].tolist()
 
+    # --reference-csv: re-score against another wide reference; the runs' label mask stays.
+    masked = pd.read_csv(files[0], dtype={STUDY_ID: "string"})
+    masked.loc[(masked[STUDY_ID] == "r00") & (masked["target"] == TARGETS[-1]), "reference_valid"] = False
+    masked.to_csv(tmp / "fold0_masked.csv", index=False)
+    wide = merged.pivot(index=STUDY_ID, columns="target", values="reference")[list(TARGETS)]
+    wide.loc["r00", TARGETS[0]] = 1.0 - wide.loc["r00", TARGETS[0]]
+    wide.loc["r01", TARGETS[1]] = np.nan
+    wide.reset_index().to_csv(tmp / "override.csv", index=False)
+    out2 = merge_oof(
+        cfg, [tmp / "fold0_masked.csv", *files[1:]], out_path=tmp / "oof_override" / "oof_predictions.csv",
+        fold_assignments=tmp / "assignments.csv", reference_csv=tmp / "override.csv",
+    )
+    rescored = pd.read_csv(out2, dtype={STUDY_ID: "string"}).set_index([STUDY_ID, "target"])
+    assert rescored.loc[("r00", TARGETS[0]), "reference"] == wide.loc["r00", TARGETS[0]], "override value used"
+    assert not rescored.loc[("r01", TARGETS[1]), "reference_valid"], "an empty override cell is masked"
+    assert not rescored.loc[("r00", TARGETS[-1]), "reference_valid"], "the run's label mask is kept"
+    assert int(rescored["reference_valid"].sum()) == 30 * N_TARGETS - 2
+
     bad_cases = {
         "missing fold": files[:2],
         "wrong order": [files[1], files[0], files[2]],
@@ -1566,7 +1584,10 @@ def check_merge_oof_fold_assignments(tmp_dir) -> str:
         except ValueError:
             continue
         raise AssertionError(f"merge_oof must refuse: {name}")
-    return "fold from assignments; per-fold + subset summaries; missing fold, wrong order, duplicate refused"
+    return (
+        "fold from assignments; per-fold + subset summaries; reference override keeps the run mask; "
+        "missing fold, wrong order, duplicate refused"
+    )
 
 
 def check_soft_auc_bruteforce() -> str:

@@ -874,6 +874,18 @@ LABEL_MODE=binary ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320  
   * the per-fold macros with mean ± std (`fold_summary.csv`); the pooled value is a different
     statistic and also mixes the fold models' calibration;
   * the `full_545` / `original_208` / `new_242` / `new_95` breakdown (`oof_subset_summary.csv`).
+* **`LABEL_MODE=soft2`** (score-2 variant). The radiologist score 2 is masked in `soft` and
+  `binary`. Here it is 0.5 in training (`train_v12_ref545_soft2_fold<N>.csv`) and 0, i.e.
+  negative, in validation (`ref545_fold<N>_val_two0.csv`, frozen as
+  `work/labels/frozen_reference_ref545_two0_fold<N>.csv`). That is 100 cells in 85 studies; the
+  58 Kaggle-binary studies have none.
+  * **Training exclusion.** The studies of `notebooks/train_exclude_studies.csv` leave the soft2
+    training tables, both LLM and radiologist rows, but stay in validation. Now one `new_95`
+    study with a strong metal artifact.
+  * **Selection and comparison.** `best.pt` is selected on the two0 reference. The runner merges
+    the OOF a second time with `--reference-csv notebooks/train_labeled_545_reference.csv` into
+    `<group>_oof/origref/`. There a score-2 cell is masked again and the run's label mask is
+    kept, so the numbers compare with the `soft` runs.
 * **Development CV.** Epoch selection uses each fold's own validation set. For the Kaggle test
   set the three fold models can be averaged. A teacher trained here has seen 2/3 of the
   reference, so its pseudo-labels must not feed a run validated on the 450/545.

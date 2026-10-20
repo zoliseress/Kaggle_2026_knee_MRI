@@ -17,6 +17,10 @@
 #  Hasznalat:
 #     ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320
 #     LABEL_MODE=binary ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320   # kontroll
+#     LABEL_MODE=soft2 ...   # a radiologus 2-es pontszama: tanitasban 0.5, validacioban 0
+#                            # (ref545_fold<N>_val_two0.csv); a notebooks/train_exclude_studies.csv
+#                            # studyjai nem tanitanak. Az OOF az eredeti binaris referencian is:
+#                            # <group>_oof/origref/
 #  Probafuttatas (--n-studies N): a tanitas az elso N studyn, a validacio
 #  foldonkent az elso N/2 studyn fut (N >= 364 eseten a teljes fold, ekkor az
 #  OOF merge is lefut). max_epochs > warmup_epochs (2) kell:
@@ -36,7 +40,7 @@
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
 #     GPU        (alap: ures; a --gpu kapcsolo felulirja)
 #     DATA_ROOT  (alap: /ai-storage/Temp/SZ/kaggle_knee/data)
-#     LABEL_MODE (alap: soft) soft | binary: a radiologus-tanitocimkek fajtaja
+#     LABEL_MODE (alap: soft) soft | binary | soft2: a radiologus-tanitocimkek fajtaja
 #     MANIFEST   (alap: notebooks/reference_545_manifest.csv) subset + fold
 #     GROUP      (alap: ures = <prefix>_cv545<LABEL_MODE>_<idobelyeg>) fix run-group nev
 #     RUNS_DIR   (alap: work/runs/train_v12)
@@ -56,10 +60,15 @@ LAST=$((NFOLDS - 1))
 RUNS_DIR="${RUNS_DIR:-$ROOT/work/runs/train_v12}"
 GROUP="${GROUP-}"
 
-if [[ "$LABEL_MODE" != "soft" && "$LABEL_MODE" != "binary" ]]; then
-    echo "[HIBA] LABEL_MODE soft vagy binary legyen, kapott: $LABEL_MODE"
-    exit 1
-fi
+case "$LABEL_MODE" in
+    soft|binary) VAL_TAG="" ;;
+    soft2) VAL_TAG="_two0" ;;
+    *)
+        echo "[HIBA] LABEL_MODE soft, binary vagy soft2 legyen, kapott: $LABEL_MODE"
+        exit 1
+        ;;
+esac
+ORIG_REF="$ROOT/notebooks/train_labeled_545_reference.csv"
 
 # --gpu N / --gpu=N es --n-studies N / --n-studies=N kiszedese (barhol
 # allhat), a tobbi argumentum marad
@@ -177,12 +186,12 @@ COMMON=(
 fold_paths() {
     local f="$1"
     TRAIN_CSV="$DATA_ROOT/train_v12_ref545_${LABEL_MODE}_fold${f}.csv"
-    VAL_CSV="$DATA_ROOT/ref545_fold${f}_val.csv"
+    VAL_CSV="$DATA_ROOT/ref545_fold${f}_val${VAL_TAG}.csv"
     FOLD_PATHS=(
         "${COMMON[@]}"
         --set "paths.train_csv=$TRAIN_CSV"
         --set "paths.splits_csv=$ROOT/work/splits/ref545_${LABEL_MODE}_fold${f}/splits.csv"
-        --set "paths.frozen_reference_csv=$ROOT/work/labels/frozen_reference_ref545_fold${f}.csv"
+        --set "paths.frozen_reference_csv=$ROOT/work/labels/frozen_reference_ref545${VAL_TAG}_fold${f}.csv"
         --set "paths.reference_csv=$VAL_CSV"
         --set "paths.exclude_from_training_csv=$VAL_CSV"
     )
@@ -205,7 +214,7 @@ for ((F = 0; F <= LAST; F++)); do
         fi
     done
     SPLITS="$ROOT/work/splits/ref545_${LABEL_MODE}_fold${F}/splits.csv"
-    FROZEN_REF="$ROOT/work/labels/frozen_reference_ref545_fold${F}.csv"
+    FROZEN_REF="$ROOT/work/labels/frozen_reference_ref545${VAL_TAG}_fold${F}.csv"
     if [[ ! -f "$SPLITS" ]]; then
         echo "[INFO] Fix split keszitese (fold $F): $SPLITS"
         if ! python -m knee_mri.cli make-fixed-split --config "$CONFIG" "${FOLD_PATHS[@]}" \
@@ -252,9 +261,9 @@ fail() {
 echo "======================================================================"
 echo " Run group  : $GROUP"
 [[ -n "$RESUME" ]] && echo " Mod        : folytatas (kesz fold kihagyva, last.pt-bol folytatva)"
-echo " Cimkek     : radiologus $LABEL_MODE tanitas, binaris validacio"
+echo " Cimkek     : radiologus $LABEL_MODE tanitas, binaris validacio${VAL_TAG:+ (2-es pontszam = 0)}"
 echo " Tanitas    : $DATA_ROOT/train_v12_ref545_${LABEL_MODE}_fold<N>.csv"
-echo " Validacio  : $DATA_ROOT/ref545_fold<N>_val.csv"
+echo " Validacio  : $DATA_ROOT/ref545_fold<N>_val${VAL_TAG}.csv"
 echo " Config     : $CONFIG"
 echo " GPU        : ${CUDA_VISIBLE_DEVICES:-(alapertelmezett)}$( (( NPROC > 1 )) && echo "  ($NPROC processz, DDP)")"
 echo " Extra args : ${EXTRA[*]:-}"
@@ -318,9 +327,20 @@ if ! python -m knee_mri.cli merge-oof --config "$CONFIG" "${COMMON[@]}" "${EXTRA
     echo "[FIGYELEM] Az OOF merge nem sikerult, de mindharom fold lefutott."
     echo "           A per-fold eredmenyek megvannak a run mappakban."
 fi
+# soft2: ugyanazok a predikciok az eredeti binaris referencian (2-es = maszkolt),
+# a korabbi CV545 runokkal osszevetheto szamok
+if [[ -n "$VAL_TAG" ]]; then
+    mkdir -p "$OOFDIR/origref"
+    if ! python -m knee_mri.cli merge-oof --config "$CONFIG" "${COMMON[@]}" "${EXTRA[@]}" "${PREDS[@]}" \
+            --fold-assignments "$MANIFEST" --reference-csv "$ORIG_REF" \
+            --out "$OOFDIR/origref/oof_predictions.csv"; then
+        echo "[FIGYELEM] Az OOF merge az eredeti referencian nem sikerult."
+    fi
+fi
 
 echo
 echo "======================================================================"
 echo " KESZ. Mind a $NFOLDS fold lefutott: $GROUP"
 echo " OOF        : $OOFDIR  (oof_summary.json, fold_summary.csv, oof_subset_summary.csv)"
+[[ -n "$VAL_TAG" ]] && echo " OOF eredeti referencian (2-es = maszkolt): $OOFDIR/origref"
 echo "======================================================================"

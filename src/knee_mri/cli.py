@@ -374,7 +374,10 @@ def cmd_merge_oof(args: argparse.Namespace) -> int:
     from .evaluate import merge_oof
 
     cfg = _load(args)
-    path = merge_oof(cfg, args.predictions, out_path=args.out, fold_assignments=args.fold_assignments)
+    path = merge_oof(
+        cfg, args.predictions, out_path=args.out, fold_assignments=args.fold_assignments,
+        reference_csv=args.reference_csv,
+    )
     print(str(path))
     return 0
 
@@ -577,6 +580,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="STUDY_ID,fold csv defining the folds instead of splits.csv; predictions in fold order "
         "(e.g. notebooks/reference_545_manifest.csv for the fixed-holdout runs of run_cv545.sh)",
+    )
+    p.add_argument(
+        "--reference-csv",
+        default=None,
+        help="Re-score against this wide binary reference (StudyInstanceUID + 12 targets, empty = masked) "
+        "instead of the runs' own validation reference; the runs' label mask is kept",
     )
     p.set_defaults(func=cmd_merge_oof)
 
