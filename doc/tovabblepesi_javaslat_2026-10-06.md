@@ -1,14 +1,15 @@
-# Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-19), a saját memórialogjaim alapján
+# Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-20), a saját memórialogjaim alapján
 
-A dokumentum az 1–15. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
+A dokumentum az 1–17. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
 
-## Kontextus – hol tartunk (2026-10-19)
+## Kontextus – hol tartunk (2026-10-20)
 - **Validáció:** 2026-10-15-től az elsődleges validáció a **holdout450** (eredeti 208 + 242 új), a tanítóhalmaz a **train_v11** (3957 study). A riport külön adja a full_450, original_208 és new_242 eredményt (13. pont). Az 1–12. és a 14. pont még holdout208-ra (a 9. pont ref220-ra) vonatkozik. A v8-as modellek a 242-n tanultak, ezért velük csak az original_208 vethető össze.
 - **LB legjobb: 0.945** = `holdout5_v8_cnt12` (train_v8, holdout208, E3, régi laterality-vel): R50 + V2S + C0 s2 + CNT12 s42 + CNT12 s2 (lásd 8. pont, „LB-próba”). A korábbiak:
   - `holdout4_v8_c0` 0.943 (H3_v8 + CoAtNet-0, 7. pont);
   - `holdout3_v8` 0.942 és `holdout3_v8_c48` 0.942;
-  - `holdout6_v11` 0.941, `holdout4_v10_cnt12` 0.941 (CNT12 × 2 + V2S + C0, train_v10, 2026-10-14) és `holdout3_v9_v2sv8` 0.941;
-  - H3_v6 0.936.- **Lokális viszonyítási pontok:**
+  - `holdout5_v11` 0.941 (a H5 összetétele és seedjei v11-es modellekből, 2026-10-20), `holdout6_v11` 0.941, `holdout4_v10_cnt12` 0.941 (CNT12 × 2 + V2S + C0, train_v10, 2026-10-14) és `holdout3_v9_v2sv8` 0.941;
+  - H3_v6 0.936.
+- **Lokális viszonyítási pontok:**
   - **original_208:** H4 0.9417; a H5-höz legközelebbi mért változat (B0 → a két CNT12 seed átlaga) 0.9433.
   - **full_450 (csak v11):** V2S + C0 + CNT12 minden seeddel (12 checkpoint) 0.9309, a 208-on 0.9414.
   - **Egyedi archok a full_450-en** (összes seed átlaga): V2S 0.9285, CNT12 0.9251, C0 0.9250, CNT22 0.9233, R50 0.9084.
@@ -32,7 +33,9 @@ A dokumentum az 1–15. pontban időrendben gyűjti a kísérleteket. A pontok a
   - V2S ImageNet-normalizációval (15. pont, seed-zajon belül; az ensemble-hatás nincs mérve).
 - **Mérési korlát:** egy modell seed-szórása a 208-on ~0.002–0.003 (C0, 10 run: 0.9292–0.9380), két run páros különbségének SE-je ~0.0034. Az azonos seed sem reprodukál (~0.003). A full_450-en a C0 seed-szórása csak 0.0004. Lokálisan ~0.008 alatt nem döntünk, ensemble-szinten és LB-vel kell megerősíteni. A H5 LB-nyeresége (+0.002) a +0.003-as lokális szabály alatt jött.
 - **A modellek jobbak, mint a címkék** (208: H3_v8 0.939 vs. a train_v8 címke 0.893). A címkezaj a szűk keresztmetszet.
-- **v11 vs. v8:** a mostani kóddal mérve a 242 study kiesésének ára a C0-nál ~−0.001, seed-zajon belül (13. pont vége). A korábbi −0.004 főleg a régi v8-as C0 s2 szerencsés seedjéből jött. Nyitott, hogy mi magyarázza a holdout6_v11 (0.941) és a H5 (0.945) LB-különbségét; az összetétel is eltér (R50, seedek).
+- **v11 vs. v8:** a mostani kóddal mérve a 242 study kiesésének ára a C0-nál ~−0.001, seed-zajon belül (13. pont vége). A korábbi −0.004 főleg a régi v8-as C0 s2 szerencsés seedjéből jött.
+  - **LB-n viszont a v11-es modellek vesztenek** (2026-10-20): a `holdout5_v11` (a H5 összetétele és seedjei) 0.941, a H5 0.945. Az összetétel tehát nem magyarázat. A 208 ezt jelezte: H5_v8 − H5_v11 = +0.0027 [−0.0007, +0.0062], P(≤0) = 0.06; az OA-trión +0.0075 [+0.0004, +0.0150], a MCL-en +0.013.
+  - Négy nem-v8-as beküldés (v9 keverék, v10, v11 × 2) mind 0.941, a három v8-as 0.942–0.945. A v8-as modellek a 242 (v10: 220) referencia-studyn is tanultak, a régi laterality-kerettel, és a 208-on választott epochon.
 
 ## Javasolt sorrend
 
@@ -1182,6 +1185,231 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   targetenkénti eltérő mintázat miatt az imagenet-es V2S esetleg ensemble-diverzitást adhat. A 4 run átlagolt
   predikciója (`validation_predictions.csv`) még nincs kiértékelve.
 
+### 16. Kategóriacsoport-specialista: OA-trió (2026-10-19/20): a v11-es base-en nyer, a v8-as H5-ön (LB 0.945) nem
+- **Brief:** `doc/claude_meniscus_specialista_implementacio.md` (eredetileg meniscusra). A célcsoport a v11-es mérések alapján **Medial OA + Lateral OA + PF OA** lett. Ensemble: V2S + C0 + CNT12, 13 ckpt, full_450 makró 0.9309.
+  - Itt a leggyengébb a modell: Lateral OA 0.852, PF OA 0.873, Medial OA 0.922, a new_242-n 0.897. A Medial Meniscus már 0.965, a meniscus-pár hiányzó AUC-ja (1 − AUC) összesen 0.10, az OA-trióé 0.36.
+  - A v11 vesztesége is itt volt (C0: PF OA −0.019, Lateral OA −0.015).
+  - Az MCL kimarad: 26 pozitív, az AUC SE ~0.03.
+  - Kockázat (heurisztika): a new_242-n a train_v8 LLM-címke és a radiológus közötti AUC a Lateral OA-n 0.820, a modellé 0.847. Ez az ACL után a legkisebb előny, vagyis lehet, hogy itt a címke a plafon.
+- **Implementáció:**
+  - `train.loss_targets`: csak ezek a targetek kerülnek a lossba. A többi súlya 0 a batchekben és a global nevezőkben, így `|C+|` = 3.
+  - `eval.selection_targets`: a választás és az early stopping a csoportátlagon (`group_soft_auc`) történik.
+  - A `best.pt` tárolja a `loss_targets` és `selection_targets` listát és az `init_source`-t. Új oszlopok: `grad_norm_median` és `grad_clip_fraction` (a fix `grad_clip` miatt).
+  - Keverés: `knee_mri/blend.py`. Értékelés: `notebooks/specialist_blend_eval.py` (base, base+kontroll, base+specialista, páros bootstrap, 3 subset).
+  - Részletek: `src/README.md` → *Training options*.
+- **Tanítás nélküli előteszt** (s7/s123 V2S/C0/CNT12 epoch-predikciók; base = ugyanezek s42 + s2-vel):
+  - **Az OA-csoport csúcsa 0–3 epochhal későbbi, mint a makróé.** Mind a 6 runban így van, és mindkét subseten ugyanaz az epoch jön ki.
+  - Az OA szerint választott epoch keverése (α = 0.5, az egyik subseten választva, a másikon mérve) a makró-best keveréséhez képest az OA-átlagon +0.0023 (242), illetve +0.0021 (208). A makróban ez ≈ +0.0005; bootstrap nem készült.
+  - Ez felső becslés arra, mennyit hoz az „OA-ra választott extra tag” rész. Azt mutatja, hogy az OA-nak több tanítás kell, mint a többi targetnek.
+- **Kísérlet (előre rögzítve):**
+  - Indulás a V2S s42 és a V2S s2 v11-es `best.pt`-jéből (`train.init_weights`), a saját seedjükkel.
+  - Közös beállítások: 6 epoch, warmup 1, `encoder_lr` 3e-5, `head_lr` 1e-4, patience 6 (minden epoch lefut).
+  - Két kar: **kontroll** (12 target a lossban, OA-szelekció) és **specialista** (OA-trió a lossban, OA-szelekció).
+  - Elsődleges mérés: a **fix utolsó epoch** (`--epoch 5`). A csoport szerint választott best csak másodlagos, mert optimista.
+  - Base = a `holdout5_v11` tagjai.
+  - Siker: `base+spec` > `base+kontroll` az OA-átlagon, mindkét seeden és mindkét subseten azonos előjellel, a makró pedig nem romlik. LB csak ezután.
+- **Eredmény (2026-10-19, RTX 5080, 4 × ~1.5 óra):**
+  - A runok: `V2S_FTctrl_s42_…_163659`, `V2S_FToa_s42_…_180933`, `V2S_FTctrl_s2_…_194221`, `V2S_FToa_s2_…_211509`.
+  - Az utolsó run 22:17-kor betelt H:-n leállt, és a `last.pt`-ből resume-olt. A resume pontos volt: a megismételt epoch ugyanazt a pontszámot adta.
+  - **Egyedi runok, ep5, OA-átlag a 450-en** (a kiinduló V2S s42 / s2: 0.8748 / 0.8749):
+
+    | run | OA-átlag | makró |
+    |---|---|---|
+    | kontroll s42 | 0.8701 | 0.9159 |
+    | kontroll s2 | 0.8737 | 0.9173 |
+    | specialista s42 | 0.8773 | 0.9179 |
+    | specialista s2 | 0.8822 | 0.9185 |
+
+    - A 12 targetes finomhangolás a best epochról mindkét mutatón ront.
+    - A specialista az OA-n javít, és szinte minden lépésben klippel (99%, a kontroll 83%).
+    - A kontrollok OA-csúcsa a 2. epochon volt. A specialisták görbéje a 2. epoch után lapos.
+  - **Keverés** (`work/specialist_eval_oa/`, base = `holdout5_v11`, α = 0.5, ep5, 1000 bootstrap):
+
+    | subset | base+spec − base+kontroll, OA | ugyanez, makró | base+spec − base, OA | ugyanez, makró |
+    |---|---|---|---|---|
+    | full_450 | **+0.0055** [+0.0029, +0.0086] | +0.0014 | **+0.0064** [+0.0013, +0.0123] | **+0.0016** (0.9301 → 0.9317) |
+    | original_208 | **+0.0066** [+0.0020, +0.0118] | +0.0017 | +0.0033 (n.s.) | +0.0008 |
+    | new_242 | **+0.0041** [−0.0007, +0.0086] | +0.0010 | **+0.0101** [+0.0016, +0.0199] | +0.0025 |
+
+    - Seedenként mindkét subseten a `spec > kontroll` teljesül → **a siker-kritérium teljesült.**
+    - A nyereség zöme a Lateral OA-n jön: 0.8453 → 0.8608. A 208-on a PF OA a base-hez képest gyengébb, 0.8930 → 0.8821 (a kontroll is: 0.8786).
+  - **Fenntartás:** a célcsoportot a 450-en mért gyengeség alapján választottuk, ez enyhe szelekciós torzítás. Az epoch, az α és a hiperparaméterek viszont előre rögzítettek voltak.
+  - **Következő lépés:** a notebookban a specialista szerepének megvalósítása (csak a `loss_targets` oszlopok, α-keverés), utána LB-próba, például `holdout5_v11` + 2 OA-specialista. Előtte javítandó a két review-észrevétel: az `init_weights` szivárgás-ellenőrzése, és a `loss_targets` ↔ `selection_targets` keresztellenőrzése.
+- **A v8-as H5 tetején nem hoz semmit (2026-10-20, csak original_208,** scratchpad `spec_on_h5v8.py`, ugyanaz az α = 0.5 és ep5):
+
+  | | makró | OA-átlag | Medial / Lateral / PF OA |
+  |---|---|---|---|
+  | H5_v8 (LB 0.945) | 0.9433 | 0.9101 | 0.9637 / 0.8709 / 0.8958 |
+  | H5_v8 + spec | 0.9431 | 0.9093 | 0.9589 / 0.8831 / 0.8860 |
+  | H5_v8 + kontroll | 0.9415 | 0.9029 | 0.9595 / 0.8678 / 0.8814 |
+  | H5_v11 (LB 0.941) | 0.9407 | 0.9027 | 0.9592 / 0.8558 / 0.8930 |
+  | H5_v11 + spec | 0.9415 | 0.9060 | 0.9570 / 0.8790 / 0.8821 |
+
+  - H5_v8 + spec − H5_v8: makró −0.0002 [−0.0019, +0.0016], OA −0.0008. A spec > kontroll itt is áll (+0.0064 OA), de csak azért, mert a kontroll ront.
+  - A specialista a Lateral OA-n javít (+0.012), a PF OA-n és a Medial OA-n ront. A v11-es base-en szerzett nyeresége nagyrészt azt pótolja, amit a v11 a v8-hoz képest az OA-n elvesztett.
+  - **Döntés (javaslat):** a 0.945-ös base-re LB-próbát nem érdemes építeni; a notebook-szerep addig várhat, amíg egy v8-szintű base-en nem nyer.
+- **A CV545-ös base-eken (2026-10-21, `notebooks/cv545_specialist_eval.py`).** Ugyanaz a protokoll: ep5, α = 0.5, csak az OA-trió, a két seed átlaga, kontroll-karral.
+
+  | base | subset | base makró | +spec | +spec − base, makró | +spec − base, OA-átlag |
+  |---|---|---|---|---|---|
+  | CV3 (`cv545_v12`, LB 0.945) | full_450 | 0.9379 | 0.9385 | +0.0006 [−0.0006, +0.0018] | +0.0023 [−0.0024, +0.0071] |
+  | CV3 | original_208 | 0.9434 | 0.9439 | +0.0005 [−0.0012, +0.0022] | +0.0019 |
+  | CV3 | new_242 | 0.9338 | 0.9344 | +0.0006 [−0.0010, +0.0025] | +0.0025 |
+  | H5_v8 + CV V2S + C0 | original_208 | 0.9452 | 0.9452 | +0.0000 | +0.0001 |
+
+  - A spec > kontroll mindenhol áll (makró +0.0007…+0.0015, a 450-en és a 208-on szignifikáns). Ez azonban a kontroll romlásából jön; a base-hez képest egyik nyereség sem szignifikáns.
+  - Az α-sweep (csak tájékoztató) lapos: 0.2–0.5 között ±0.0002.
+  - A nyereség zöme a Lateral OA-ból jön, a PF OA a 208-on ront (−0.004).
+  - **Beépítéshez** a notebookban külön specialista-szerep kellene: a base-átlag OA-oszlopait α-val a specialisták átlaga felé kell keverni (`knee_mri.blend`). Ehhez az `epoch_checkpoints/ep05.pt` kell, nem a `best.pt` (ep4, illetve ep2, OA szerint választva), és az exportnak is tudnia kell ezt a fájlt.
+  - **Döntés (javaslat):** +0.0006 a 0.008-as LB-szabály és az LB 0.001-es felbontása alatt van, ezért most nem éri meg a notebook-munkát. Ha a CV545-ös modellekből (foldonként, OOF-fal mérhetően) készülne OA-specialista, újra mérlegelhető.
+- **3 foldos OA-specialista a CV545 V2S fold-modellekből (2026-10-21, Windows, RTX 5080, 3 × ~1.5 óra).**
+  - Run-group: `V2S_FToa_s123_cv545soft_20261021_0045_{fold0,1,2,oof}`, kiértékelés: `notebooks/cv545_ftoa_eval.py`.
+  - Foldonként a fold-k `best.pt`-ből indul, ugyanazon a tanítóhalmazon tanul és ugyanazon a validáción mér. A leak check átment. A Windows-os fold-CSV-k studyra azonosak a Linuxosakkal.
+  - Protokoll: 6 epoch, ep5, α = 0.5. A validáció batch-mérete 2 volt; a 16 GB-on a PyTorch memória-figyelmeztetést adott, de újrapróbálkozással folytatta.
+
+  | subset | base CV3 makró | +spec | Δ makró | Δ OA-átlag |
+  |---|---|---|---|---|
+  | full_545 | 0.9276 | 0.9279 | +0.0003 [−0.0009, +0.0016] | +0.0012 [−0.0037, +0.0066] |
+  | full_450 | 0.9379 | 0.9389 | +0.0011 [−0.0003, +0.0023] | +0.0042 [−0.0010, +0.0090] |
+  | original_208 | 0.9434 | 0.9437 | +0.0004 | +0.0014 |
+  | new_242 | 0.9338 | 0.9350 | +0.0012 | +0.0047 |
+  | new_95 | 0.8934 | 0.8890 | **−0.0044** [−0.0101, +0.0006] | **−0.0176** (Lateral OA 0.809 → 0.753) |
+
+  - A formális kritérium (OA pozitív az 545-ön, a 208-on és a 242-n, a makró nem romlik) teljesül, de egyik különbség sem szignifikáns.
+  - Foldonként vegyes: a fold0-n az OA-átlag 0.8661 → 0.8635, a fold1-en és a fold2-n javul.
+  - A régi v11-es specialistáknál nem jobb: 208 −0.0001, 450 +0.0005 (n.s.).
+  - Az OA szerint választott `best.pt` (csak tájékoztató) +0.0010 az 545-ön.
+  - **Döntés:** a radiológus-címkés alapból tanított specialista sem hoz LB-n is látható nyereséget (az 545-ön a makró +0.0003). **Az OA-specialista iránya lezárva**, a notebook-szerepet nem építjük meg.
+  - **Más arch specialistaként? Tanítás nélküli becslés** (scratchpad `late_epoch_proxy.py`). A CV3 base OA-oszlopait α = 0.5-tel ugyanannak az archnak a későbbi epochja felé keverjük (foldonként best + d, a saját OOF epoch-predikcióiból).
+    - **A becslés kalibrálva:** V2S best+3 az 545-ön OA +0.0020, makró +0.0005; a valódi V2S-specialista OA +0.0013, makró +0.0003.
+    - **C0:** best+2 OA +0.0029, makró +0.0007; a 208-on viszont −0.0017 OA.
+    - **CNT12:** d = 0…3 mellett az 545-ön mindig negatív (OA −0.0016…−0.0046).
+    - Más archgal sem várható +0.001 fölötti makró-nyereség; ez a lezárást megerősíti.
+  - **R50 és tiszta tanítás? Becslés a 450-en** (scratchpad `r50_fresh_proxy.py`). A CV3 base OA-oszlopait α = 0.5-tel a v11-es runok felé keverjük, a két seed átlagával. Az OA-átlag változása a 450-en:
+    - **Függetlenül tanított, 12 targetes modellek:** mind rontanak. R50 −0.0022, V2S −0.0027, C0 −0.0051, CNT12 −0.0052.
+    - **Finomhangolt specialisták:** mind javítanak. v11 V2S FToa +0.0023, CV545 V2S FToa +0.0043.
+    - **Tanulság:** a specialista nyeresége a finomhangolásból jön, nem az új nézőpontból. Egy tiszta, csak OA-lossos tanítás várhatóan a független modelleknél is gyengébb lenne.
+    - **R50:** OA-n a leggyengébb önálló modell (0.8702). Mint független modell csak kb. 0.0005-tel jobb a V2S-nél. 12 targetes tagként a CV3-hoz: makró −0.0010.
+    - Egy R50-specialista várhatóan a V2S-specialista szintjén lenne, makró kb. +0.001.
+
+### 17. Radiológus-címkék a tanításban: CV545 (train_v12, V2S s123, 2026-10-20): +0.012 a 450-en
+- **Felállás:** 3-fold CV a 545 referencia-studyn (208 + 242 + 95 új). Foldonként a tanítóhalmaz a `train_v12` és a másik két fold radiológus-sorai: 3957 − 95 + 363 = 4225 study. A validáció a saját 182 study (`frozen_reference_ref545_fold<k>`).
+  - Run: `work/runs/train_v12/V2S_E3_img320_s123_cv545soft_20261020_010445_{fold0,1,2,oof}`, Linux, 1× 3090. Best epoch 8/9/9, a v11-es V2S-ével azonos.
+  - Összevetés: `notebooks/cv545_compare.py`, a v11-es holdout450 V2S runokkal (s123 = azonos seed, s2/s42/s7).
+  - A v11-es runok a 95 újon LLM-címkével tanultak, ezért a páros mérés csak a 450-en van. A 450-en a ref545 és a ref450 referencia cellára azonos.
+- **Eredmény, makró ROC-AUC a 450-en** (pooled OOF; a foldonkénti átlag ±0.002-n belül ugyanez):
+
+  | | full_450 | original_208 | new_242 |
+  |---|---|---|---|
+  | CV545 (V2S s123) | **0.9310** | **0.9376** | **0.9250** |
+  | v11 V2S s123 | 0.9193 | 0.9309 | 0.9111 |
+  | v11 V2S 4 seed átlaga | 0.9285 | 0.9374 | 0.9214 |
+  | CV545 + v11 s123 (átlag) | 0.9293 | 0.9386 | 0.9220 |
+
+  - Páros bootstrap (1000), CV545 − v11 s123: full **+0.0117** [+0.0072, +0.0161], 208 **+0.0066** [+0.0012, +0.0120], 242 **+0.0140** [+0.0075, +0.0214].
+  - CV545 − v11 4 seed átlaga: full +0.0025 [−0.0017, +0.0064], 208 +0.0002, 242 +0.0035. **Egyetlen CV545-modell ≈ 4 v11-es seed ensemble-je.**
+  - **Nem epoch-szelekciós műtermék:** fix epochon (ep4–ep11) a CV545 minden epochon +0.007…+0.013-mal jobb, mint a v11 s123 és a v11 s7. Ep9: 0.9306 vs 0.9178 / 0.9232.
+  - Targetenként a legnagyobb nyereség a v11 s123-hoz képest: MCL +0.032, Synovitis +0.028, Effusion +0.017, Lateral OA +0.016, ACL +0.014. A 4 seed átlagához képest a PF OA −0.015, a Baker's −0.008, a Lateral Meniscus −0.007.
+  - A v11 s123-mal átlagolva romlik (0.9310 → 0.9293), a v11-es tag hígít.
+  - A new_95-ön a CV545 0.885 (foldonként 0.902 / 0.854 / 0.890; a fold1-ben az MCL nem értékelhető). Ez jóval a 208/242 alatt van, v11-es összevetés hozzá nincs.
+- **Fenntartások:**
+  - A tanító és a kiértékelő címke ugyanabból a radiológusi olvasásból jön, ezért a nyereség részben a radiológus „stílusának” megtanulása lehet. Ez az LB-címkékre nem feltétlenül vihető át. **LB-próba kell.**
+  - 1 seed, 1 architektúra.
+  - Beküldéshez két út van: (a) a 3 fold-modell együtt (OOF-fal validált, mindegyik a referencia 2/3-át látta), vagy (b) újratanítás mind az 545-tel, ehhez lokális validáció már nem marad. Ez a CLAUDE.md „a 450 nem kerülhet a tanításba” invariánsával szembemegy, ezt tudatosan kell eldönteni.
+- **Összevetés a v8-cal (H5_v8 = `holdout5_v8_cnt12`, LB 0.945), csak az original_208-on**, `notebooks/cv545_vs_v8.py`. A v8-as runok a 242-n és a 95-ön LLM-címkével tanultak; a három referencia a 208-on cellára azonos.
+
+  | makró, original_208 | |
+  |---|---|
+  | v8 V2S (az egyetlen, seed 42) | 0.9332 |
+  | v11 V2S s42 / s123 | 0.9342 / 0.9309 |
+  | **CV545 (V2S s123)** | **0.9376** |
+  | H5_v8 | 0.9433 |
+  | H5_v8, a V2S helyett CV545 | 0.9441 |
+  | H5_v8 + CV545 (6 tag) | 0.9440 |
+  | H5_v8 + CV545 × 2 | 0.9446 |
+
+  - CV545 − v8 V2S: +0.0043 [−0.0017, +0.0105], P>0 = 0.91, nem szignifikáns. Nyer az MCL-en (+0.015), a Lateral OA-n (+0.013) és a Lateral Meniscuson (+0.010); veszít a PF OA-n (−0.007).
+  - A V2S-nél a v8 ≈ v11 azonos seeden (s42: 0.9332 vs 0.9342). A H5_v8 előnye tehát nem a V2S-tagból jön.
+  - Egyetlen CV545-modell a H5_v8 alatt van: −0.0057 [−0.0119, +0.0005].
+  - Az ensemble-ben a V2S cseréje +0.0008 [−0.0007, +0.0023], a hozzáadása +0.0007, a kétszeres súly +0.0013 [−0.0007, +0.0033]. Mind n.s. és mind a 0.008-as LB-szabály alatt.
+  - A 208-on a CV545 nyeresége eleve kisebb (+0.0066 a v11 s123-hoz), mint a 242-n (+0.014), és a 242-n a v8 nem mérhető.
+  - Az OOF fold-modellenként egy jóslat. Beküldéskor a 3 fold-modell átlaga megy, ami valószínűleg valamivel jobb, mint ez a lokális becslés.
+- **C0 CV545 (s123, `C0_E3_img320_s123_cv545soft_20261020_065853`, 2026-10-20).**
+  - Mindkét script többarchitektúrás lett: `cv545_compare.py` V2S + C0 vs. v11, `cv545_vs_v8.py` V2S + C0 vs. v8/H5.
+  - A C0 best epochja foldonként 13/12/12, 16–17 epoch futott. A v11-es C0-é 8–11 volt, tehát a radiológus-sorokkal a C0 tovább tanul.
+  - **A 450-en, a v11-hez képest:**
+
+    | makró | full_450 | original_208 | new_242 |
+    |---|---|---|---|
+    | CV545 C0 | 0.9286 | 0.9347 | 0.9241 |
+    | v11 C0 s123 | 0.9190 | 0.9271 | 0.9115 |
+    | v11 C0, 4 seed átlaga | 0.9250 | 0.9357 | 0.9159 |
+    | **CV545 V2S + C0** | **0.9374** | **0.9424** | **0.9339** |
+    | v11 V2S + C0 s123 | 0.9251 | 0.9352 | 0.9167 |
+    | v11 V2S + C0, 8 modell átlaga | 0.9298 | 0.9396 | 0.9220 |
+
+    - CV545 C0 − v11 C0 s123: full **+0.0097** [+0.0041, +0.0160], 208 +0.0073, 242 +0.0122. A 4 seed átlagához képest +0.0038 (n.s.).
+    - Fix epochon (ep4–11) is végig jobb: ep11-en 0.9285 vs 0.9159 (s123) / 0.9185 (s7).
+    - **CV545 V2S + C0 − v11 8 modell átlaga: full +0.0076 [+0.0040, +0.0115], 242 +0.0117 [+0.0052, +0.0193]**, 208 +0.0027 (n.s.). Két CV545-modell tehát 8 v11-es modellt ver.
+    - Targetenként a C0 (vs. v11 s123) a Medial OA-n (+0.036), a PF OA-n (+0.035), az MCL-en (+0.027) és a Lateral OA-n (+0.016) nyer; a Medial Meniscuson veszít (−0.011).
+    - new_95: C0 0.880, V2S + C0 0.8875.
+  - **A 208-on, a v8-hoz képest:**
+    - CV545 C0 − v8 C0 s2 (a H5-tag): −0.0011 [−0.0086, +0.0063]; − v8 C0 s42: +0.0031. A v8 C0 s2 a szerencsés seed (memória). Targetenként nagy szórás: Synovitis +0.046, Lateral OA −0.031, ACL −0.023, Lateral Meniscus −0.023.
+    - CV545 V2S + C0 0.9424 vs. v8 V2S + C0 s2 0.9396 (+0.0027, n.s.), és vs. H5_v8 0.9433 (−0.0009, n.s.). **Két CV545-modell ≈ az 5 tagú H5_v8.**
+    - A H5_v8-ban mindkét tag cseréje: 0.9442 (+0.0009, n.s.).
+    - **H5_v8 + CV545 V2S + C0 (7 tag): 0.9452, +0.0018 [+0.0003, +0.0035], P>0 = 0.993.** Az első H5-öt szignifikánsan javító változat, de a 0.008-as LB-szabály alatt.
+- **CNT12 CV545** (s123, `CNT12_E3_img320_s123_cv545soft_20261020_150528`, 2026-10-20): ugyanaz a konfiguráció, mint a v11-es CNT12 s123-é (in12k, encoder_lr 4e-5). A best epoch foldonként 10/12/7, szórtabb, mint a többi arché.
+  - **A 450-en (pooled | foldonkénti átlag):**
+
+    | makró | full_450 | original_208 | new_242 |
+    |---|---|---|---|
+    | CV545 CNT12 | 0.9260 \| 0.9279 | 0.9317 \| 0.9353 | 0.9212 \| 0.9237 |
+    | v11 CNT12 s123 | 0.9211 | 0.9318 | 0.9128 |
+    | v11 CNT12, 4 seed átlaga | 0.9251 | 0.9367 | 0.9146 |
+    | **CV545 V2S + C0 + CNT12** | **0.9379** | **0.9434** | **0.9338** |
+    | v11 3 arch, s123 | 0.9275 | 0.9383 | 0.9186 |
+    | v11 3 arch, 12 modell átlaga | 0.9309 | 0.9414 | 0.9220 |
+
+    - **A CNT12 nyeresége a leggyengébb a három arch közül.** CV545 − v11 s123: full +0.0049 [+0.0001, +0.0098], 208 −0.0001, 242 +0.0085 [+0.0021, +0.0152].
+    - A pooled és a foldonkénti nézet között itt a legnagyobb a rés: a 208-on −0.0036. Ezt a foldok eltérő kalibrációja okozza (best ep 7–12). Beküldéskor a 3 fold-modell átlaga megy, ott ez a hatás nem jelentkezik.
+    - Fix epochon ep10: 0.9271 vs 0.9197 (s123) / 0.9197 (s7).
+    - **CV545 3 arch − v11 12 modell átlaga: full +0.0071 [+0.0038, +0.0106], 242 +0.0118**, 208 +0.0019 (n.s.).
+    - A V2S + C0-hoz a CNT12 alig ad hozzá: +0.0005 (n.s.). A new_95-ön 0.8875 → 0.8934.
+  - **A 208-on, a v8-hoz képest:**
+    - CV545 CNT12 − v8 CNT12 s42 / s2: −0.0029 / +0.0004 (n.s.).
+    - **CV545 3 arch = H5_v8: 0.9434 vs 0.9433.**
+    - H5-összetétel CV545-modellekkel (v8 R50 + CV V2S + CV C0 + CV CNT12 × 2): 0.9436 (+0.0003).
+    - H5_v8 + CV 3 arch (8 tag): 0.9453, +0.0019 [+0.0003, +0.0039]. Ez ≈ a H5_v8 + CV V2S + C0 (0.9452, a különbség +0.0001).
+- **Következő lépés (javaslat): két LB-próba.**
+  1. **CV545 V2S + C0 + CNT12, önmagában** (9 checkpoint). Tiszta teszt: az archok ugyanazok, mint a `holdout6_v11`-ben (LB 0.941), csak a tanítás más (v11 vs. CV545). Lokálisan a 450-en +0.0071 a 12 modelles v11-es átlaghoz képest. Ez dönti el, hogy a radiológus-címkés tanítás LB-n is hoz-e.
+  2. **H5_v8 + CV545 V2S + C0** (11 checkpoint, tagonként 1/7 súly). Ez a gyakorlati legjobb jelölt: a 208-on 0.9452. A CNT12 hozzáadása (8 tag, 14 checkpoint) lokálisan nem ad többet.
+- **Beküldésre kész (2026-10-20): `cv545_v12`** (`python notebooks/build_04_notebook.py --ensemble cv545_v12`), az 1. próba.
+  - 9 checkpoint egyenlő súllyal, archonként 1/3.
+  - **Export:** `work/export_v12/`, 3948 MB → 990 MB, a forrásokkal ellenőrizve. Az `export_checkpoints.py` mostantól a fold-os tagokat is kezeli: `<run>_fold<k>` → `<dataset>-fold<k>`.
+  - **Datasetek (9 db):** `{v2s,c0,cnt12}-s123-e3-cv545-v12-fold{0,1,2}`.
+  - **Lokális próba** a 3 publikus teszt studyn, az exportált checkpointokkal: rendben. 9 checkpoint, 3 input-csoport (imagenet / inception / mri_scalar), prep hash 9b43435e7ac6, 0.35 perc.
+  - A CNT12 `mri_scalar` normalizálása nem hiba: minden eddigi CNT12-run így tanult, a H5_v8 tagjai is.
+  - **LB (2026-10-20): 0.945**, holtversenyben a legjobbal (`holdout5_v8_cnt12`).
+    - Ugyanezzel a három architektúrával a v11-es tanítás (`holdout6_v11`) 0.941-et hozott. **A radiológus-címkés tanítás az LB-n is +0.004.** A „stílus”-kockázat így nem valósult meg, legalábbis nem teljesen.
+    - A lokális 208 jól jelezte előre: CV545 3 arch 0.9434 vs. H5_v8 0.9433, mindkettő LB 0.945.
+    - 3 modell (9 checkpoint, 1 seed) éri el azt, amire a H5_v8-nak 5 modell kellett, és a train_v8 nélkül.
+
+### 18. OA-hibaelemzés a CV545 OOF-on (2026-10-21): telephely-csoport + riport-konvenció
+- Script: `notebooks/oa_error_analysis.py`. Esetlista: `work/analysis/oa_error_cases.csv`. Részletek: `problemas_esetek.md` B9.
+- **Fő lelet:** a Philips-szerű `PDW_TSE_SPAIR` / `pd_tse_fs_sag` protokollú telephely-csoport (a 4407 study 29%-a, a new_95 egésze) riportjai rosszul egyeznek a radiológussal. LLM-vs-radiológus AUC 0.72–0.78 (a többi telephelyen 0.86–0.88).
+  - Ugyanitt a modell OA-ja a leggyengébb: PF OA a 208-on 0.704 vs 0.929.
+  - A new_95 gyengesége (OA 0.79–0.86) is ebből jön. A pozitívjai többsége 4-es fokozatú, tehát nem enyhe esetek.
+- **Nem okozza:**
+  - a sorozatválasztás (PD-axiális csak 9 studyban volt elérhető);
+  - a laterality (nincs erős Medial / Lateral felcserélés);
+  - a coronal / sagittal szekvencia (97%-ban PD-FS).
+- **Kísérlet: „oacal” (2026-10-21, előkészítve).** A súlyozás kódmódosítást igényelne (a betöltő minden kitöltött cellának 1.0 súlyt ad), ezért kalibrálás helyette.
+  - A csoport LLM-sorainak (foldonként 1023) OA-értékei Platt-leképezéssel a radiológushoz kalibrálva. Az illesztés foldonként, a csoport tanító-referenciáin történik (141–149 study, a train_v8 LLM-értéke vs a radiológus), így a validációs fold nem szivárog be.
+  - A 0.92-es LLM-érték 0.38–0.68 lesz, a 0.02-es 0.08–0.13. A címketömeg 427/342/484-ről kb. 320–396/201–241/353–355-re csökken.
+  - Fájlok: `notebooks/build_ref545_oacal.py`, `notebooks/oa_site_group_studies.csv` (1288 study), a `run_cv545.sh` új módja `LABEL_MODE=oacal`, kiértékelés: `notebooks/cv545_oacal_eval.py`.
+  - Futás: V2S s123, a CV545 V2S run saját configjával (`CONFIG=<…_fold0/config.yaml>`). A Linuxon 3 GPU-n párhuzamosan fut.
+  - Siker: az OA-átlag javul az 545-ön, a 208-on és a 242-n, a makró nem romlik. Ha teljesül: LB-próba a `cv545_v12` V2S-foldjainak cseréjével.
+
 ### Mérési protokoll (minden lépésre)
 - 2026-10-15-től: elsődleges a **full_450** (holdout450, train_v11), mellette külön az original_208 és a new_242.
 - Korábban: elsődleges a new-100, mellette 208/158/58/Andrew50, OOF predikciókból, páros bootstrap, curve mean ep6–10.
@@ -1197,15 +1425,18 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   - `notebooks/build_ref450_train_v11.py` (ref450 + train_v11, 13. pont).
 - `run_holdout.bat/.sh`: TRAIN_CSV, alapból HOLDOUT=450; a kimeneti mappa nevét a TRAIN_CSV-ből képzi.
 - `notebooks/build_04_notebook.py`: LB-próbához ensemble-bejegyzés (`--ensemble <név>`). Feltöltés előtt mindig `src/tools/export_checkpoints.py --ensemble <név> --out work/export_<ver>`.
-- Összevető scriptek: `notebooks/{c0_check,coatnet_compare,convnext_compare,slot5_compare,compare_v8_v9}.py`; a v11-esek és az eval a scratchpadben (`compare_v11*.py`, `eval_holdout.py`).
+- Összevető scriptek: `notebooks/{c0_check,coatnet_compare,convnext_compare,slot5_compare,compare_v8_v9,cv545_compare}.py`; a v11-esek és az eval a scratchpadben (`compare_v11*.py`, `eval_holdout.py`).
 - Kapcsolódó dokumentumok:
   - `doc/E1_E2_E3_architektura.pdf` (a mostani modellkonfiguráció);
   - `doc/problemas_esetek.md` (adat- és címkehibák);
   - `doc/coatnet_vs_cnn_trainings.md`, `doc/v8_vs_v9_trainings.md`, `doc/slice_coverage_check.md`.
 
-## Hol tartunk, mi a következő lépés (2026-10-19)
-- **Beküldésre kész legjobb:** `holdout5_v8_cnt12` (LB 0.945). Minden v11-es összetétel lokálisan ez alatt van (~−0.002 a 208-on).
+## Hol tartunk, mi a következő lépés (2026-10-20)
+- **Beküldésre kész legjobb:** `holdout5_v8_cnt12` (LB 0.945). Minden v11-es összetétel lokálisan ez alatt van (~−0.002 a 208-on), és LB-n is (`holdout5_v11` 0.941).
+- **`cv545_v12` LB 0.945 (2026-10-20), holtverseny a H5_v8-cal.** A radiológus-címkés tanítás LB-n is működik: azonos archokkal a v11-es tanítás 0.941 volt.
+- **Előzmény (17. pont):** a radiológus-sorok a tanításban (CV545, train_v12) a 450-en a v11-es azonos seedhez képest V2S-sel +0.012-t, C0-val +0.010-t adnak. A CV545 V2S + C0 a 8 modelles v11-es átlagot is veri. A CNT12 kevesebbet nyer (+0.005), és az ensemble-hez alig ad hozzá. A CV545 3 arch a 208-on = H5_v8 (0.9434). A H5_v8 + CV545 V2S + C0 0.9452 (+0.0018, szignifikáns). LB-próba még nincs.
 - **Nyitott kérdések:**
+  - **Részben megválaszolva (2026-10-20):** a `holdout5_v11` 0.941 → nem az összetétel (és nem a R50 hiánya), hanem a v11-es modellek. Az alábbi kérdésből a (b) kiesett, az (a) mellett a laterality-keret és a 208-on választott epoch maradt jelölt.
   - Mi okozza a H5 (0.945) és a két nem-v8-as beküldés közötti −0.004 LB-különbséget? A két beküldés: `holdout6_v11` 0.941 és `holdout4_v10_cnt12` 0.941. Mindkettő ugyanúgy V2S + C0 + CNT12, R50 nélkül, és mindkettő referencia-studykat vesztett a tanításból (v11: −242, v10: nettó −220). Két, egymást ki nem záró magyarázat van:
     - **(a) a kiesett tanítóstudyk:** a C0-abláció szerint ez lokálisan csak ~−0.001;
     - **(b) a R50 hiánya:** lokálisan a R50 a v11-es ensemble-hez csak +0.0002-t ad.
@@ -1213,6 +1444,7 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
     Eltér a laterality is: a H5 a régi kerettel tanult, a v11 az újjal; a v10-es runok ebből a szempontból nincsenek ellenőrizve.
   - A saját címkéző pipeline LLM-je és API-ja (3. pont).
 - **Kipróbálatlan, de rögzített ötletek:**
+  - **OA-trió specialista** (16. pont): a v11-es base-en lokálisan sikeres (full_450 +0.0016 makró), de a v8-as H5-höz a 208-on −0.0002 → LB-próba most nem javasolt.
   - **Lateral OA (és PF OA) LLM-prompt** (3. pont, a terv kész, nem indult el). A címke az eddigi legnagyobb hatású tényező, és a Lateral OA a leggyengébb modell-target.
   - Self-distillation H3-OOF teacherrel, egyetlen modell helyett (2. pont döntése).
   - Enyhe intenzitás-TTA (4a. pont).
@@ -1227,9 +1459,15 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
     - CNT12 s2 `CNT12_lr4e-5_E3_img320_s2_trainv11_holdout450_20261016_012610`.
   - **Lokálisan** (scratchpad `score_h5_v11.py`; a holdout6_v11 0.9303 / 0.9403 / 0.9215-öt pontosan visszaadja): full_450 0.9301, original_208 0.9407, new_242 0.9215. A H6_v11-hez képest a különbség full −0.0002 [−0.0016, +0.0012], 208 +0.0004 [−0.0019, +0.0027]. R50 nélkül 0.9294 / 0.9403 / 0.9200.
     - Lokálisan tehát nincs mit magyarázni. Ha az LB 0.945 körül lesz, a különbség az összetételből jön, és ezt a lokális mérés nem látja. Ha 0.941 marad, a v8-as modellekből.
+    - **LB (2026-10-20): 0.941** → a v8-as modellekből. Utólag a 208 is ezt mutatta a H5_v8-cal szemben: +0.0027 [−0.0007, +0.0062] a v8 javára, főleg OA-trió és MCL (16. pont vége).
   - **Export:** `work/export_v11/` (`export_checkpoints.py --ensemble holdout5_v11`), 2269 MB → 568 MB, a forrásokkal ellenőrizve.
     - **Új dataset-névkonvenció (2026-10-19-től):** `<arch>-s<seed>-<fej>-holdout<N>-<train>`, pl. `cnt12-s42-e3-holdout450-v11`.
     - Az öt dataset: `r50-s42-`, `v2s-s42-`, `c0-s2-`, `cnt12-s42-`, `cnt12-s2-e3-holdout450-v11`. Mind az ötöt (újra) fel kell tölteni.
     - A `holdout6_v11` bejegyzés a régi (`knee-*-holdout-v11`) dataset-neveken marad, mert úgy vannak fent a Kaggle-ön.
     - A `work/export_v11/`-ben csak az öt új mappa maradt. A régiek helyben törölve; szükség esetén `export_checkpoints.py --ensemble holdout6_v11` újra előállítja őket a run-mappákból.
   - **Lokális próba** a 3 publikus teszt studyn: rendben (5 checkpoint, 3 input-csoport, prep hash 9b43435e7ac6, 0.3 perc).
+  - **Kaggle: kétszer „Out of Memory” (2026-10-19/20, a második ~2 óra után), LB nincs.** Ok: host-RAM-szivárgás a 2 GPU-s
+    inferenciaútban (chunkonként és csoportonként új CUDA-szálak, ~6 MB/szál; a 3 csoport miatt itt gyorsabban nőtt,
+    mint a 2 csoportos holdout6_v11-nél). Javítva: tartós GPU-szálak (`GpuWorkers`), mérve vízszintes, predikció bitre
+    azonos (problemas_esetek C). A `holdout5_v11` notebook újragenerálva.
+  - **Harmadik beküldés a javított notebookkal: lefutott, LB 0.941** (2026-10-20).

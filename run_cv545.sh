@@ -17,6 +17,9 @@
 #  Hasznalat:
 #     ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320
 #     LABEL_MODE=binary ./run_cv545.sh --gpu 2,3 E3_img320 --set data.image_size=320   # kontroll
+#     LABEL_MODE=oacal ...   # a soft valtozat, de egy telephely-csoport (notebooks/oa_site_group_studies.csv)
+#                            # LLM-sorainak OA-cimkei a radiologushoz kalibralva (Platt, foldonkent a
+#                            # fold tanito-referenciain illesztve; notebooks/build_ref545_oacal.py)
 #     LABEL_MODE=soft2 ...   # a radiologus 2-es pontszama: tanitasban 0.5, validacioban 0
 #                            # (ref545_fold<N>_val_two0.csv); a notebooks/train_exclude_studies.csv
 #                            # studyjai nem tanitanak. Az OOF az eredeti binaris referencian is:
@@ -40,7 +43,7 @@
 #     CONDA_ENV  (alap: kaggle_2026; ures ertek = nincs aktivalas)
 #     GPU        (alap: ures; a --gpu kapcsolo felulirja)
 #     DATA_ROOT  (alap: /ai-storage/Temp/SZ/kaggle_knee/data)
-#     LABEL_MODE (alap: soft) soft | binary | soft2: a radiologus-tanitocimkek fajtaja
+#     LABEL_MODE (alap: soft) soft | binary | soft2 | oacal: a radiologus-tanitocimkek fajtaja
 #     MANIFEST   (alap: notebooks/reference_545_manifest.csv) subset + fold
 #     GROUP      (alap: ures = <prefix>_cv545<LABEL_MODE>_<idobelyeg>) fix run-group nev
 #     RUNS_DIR   (alap: work/runs/train_v12)
@@ -61,10 +64,10 @@ RUNS_DIR="${RUNS_DIR:-$ROOT/work/runs/train_v12}"
 GROUP="${GROUP-}"
 
 case "$LABEL_MODE" in
-    soft|binary) VAL_TAG="" ;;
+    soft|binary|oacal) VAL_TAG="" ;;
     soft2) VAL_TAG="_two0" ;;
     *)
-        echo "[HIBA] LABEL_MODE soft, binary vagy soft2 legyen, kapott: $LABEL_MODE"
+        echo "[HIBA] LABEL_MODE soft, binary, oacal vagy soft2 legyen, kapott: $LABEL_MODE"
         exit 1
         ;;
 esac
