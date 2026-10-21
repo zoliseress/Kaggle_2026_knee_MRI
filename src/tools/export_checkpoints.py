@@ -34,7 +34,11 @@ from knee_mri.evaluate import load_checkpoint_for_inference  # noqa: E402
 
 
 def ensemble_members(name: str) -> list[tuple[str, str]]:
-    """(run dir under work/runs, Kaggle dataset name) of a single-run ensemble in build_04_notebook."""
+    """(run dir under work/runs, Kaggle dataset name) per checkpoint of an ensemble in build_04_notebook.
+
+    A fold member (no SINGLE marker) expands to its three folds, named as the notebook globs them:
+    run `<run>_fold<k>` -> dataset `<dataset>-fold<k>`.
+    """
     spec = importlib.util.spec_from_file_location("build_04_notebook", REPO / "notebooks" / "build_04_notebook.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
@@ -42,9 +46,10 @@ def ensemble_members(name: str) -> list[tuple[str, str]]:
         raise SystemExit(f"unknown ensemble {name!r}; choose from {sorted(builder.ENSEMBLES)}")
     members = []
     for run, dataset, *kind in builder.ENSEMBLES[name]["members"]:
-        if kind != [builder.SINGLE]:
-            raise SystemExit(f"{run}: fold members are not supported, export each fold run separately")
-        members.append((run, dataset))
+        if kind == [builder.SINGLE]:
+            members.append((run, dataset))
+        else:
+            members += [(f"{run}_fold{fold}", f"{dataset}-fold{fold}") for fold in range(3)]
     return members
 
 
@@ -101,7 +106,7 @@ def main() -> int:
     for run, dataset in ensemble_members(args.ensemble):
         before, after = export_one(Path(args.runs_dir) / run, out / dataset)
         total_in, total_out = total_in + before, total_out + after
-        print(f"{dataset:28s} {before:7.0f} MB -> {after:6.0f} MB   ({run})")
+        print(f"{dataset:30s} {before:7.0f} MB -> {after:6.0f} MB   ({run})")
     print(f"total {total_in:.0f} MB -> {total_out:.0f} MB; verified against the sources; written to {out}")
     return 0
 
