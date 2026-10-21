@@ -1,6 +1,6 @@
-# Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-20), a saját memórialogjaim alapján
+# Továbblépési javaslat és kísérleti napló (indult 2026-10-06, frissítve 2026-10-21), a saját memórialogjaim alapján
 
-A dokumentum az 1–17. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
+A dokumentum az 1–19. pontban időrendben gyűjti a kísérleteket. A pontok a saját korukban érvényes viszonyítási alapot használják. Az aktuális állás ebben a szakaszban és a végén („Hol tartunk, mi a következő lépés”) olvasható.
 
 ## Kontextus – hol tartunk (2026-10-20)
 - **Validáció:** 2026-10-15-től az elsődleges validáció a **holdout450** (eredeti 208 + 242 új), a tanítóhalmaz a **train_v11** (3957 study). A riport külön adja a full_450, original_208 és new_242 eredményt (13. pont). Az 1–12. és a 14. pont még holdout208-ra (a 9. pont ref220-ra) vonatkozik. A v8-as modellek a 242-n tanultak, ezért velük csak az original_208 vethető össze.
@@ -31,6 +31,7 @@ A dokumentum az 1–17. pontban időrendben gyűjti a kísérleteket. A pontok a
   - R50 és CNT22 ötödik tagként a v11-en (13. pont);
   - label mask kikapcsolása (13. pont, felhasználói döntés).
   - V2S ImageNet-normalizációval (15. pont, seed-zajon belül; az ensemble-hatás nincs mérve).
+  - a radiológus 2-es pontszáma címkeként, tanításban 0.5, validációban 0 (CV545 soft2, 19. pont): V2S −0.0075, V2S + C0 −0.0052 a full_450-en.
 - **Mérési korlát:** egy modell seed-szórása a 208-on ~0.002–0.003 (C0, 10 run: 0.9292–0.9380), két run páros különbségének SE-je ~0.0034. Az azonos seed sem reprodukál (~0.003). A full_450-en a C0 seed-szórása csak 0.0004. Lokálisan ~0.008 alatt nem döntünk, ensemble-szinten és LB-vel kell megerősíteni. A H5 LB-nyeresége (+0.002) a +0.003-as lokális szabály alatt jött.
 - **A modellek jobbak, mint a címkék** (208: H3_v8 0.939 vs. a train_v8 címke 0.893). A címkezaj a szűk keresztmetszet.
 - **v11 vs. v8:** a mostani kóddal mérve a 242 study kiesésének ára a C0-nál ~−0.001, seed-zajon belül (13. pont vége). A korábbi −0.004 főleg a régi v8-as C0 s2 szerencsés seedjéből jött.
@@ -1410,6 +1411,33 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
   - Futás: V2S s123, a CV545 V2S run saját configjával (`CONFIG=<…_fold0/config.yaml>`). A Linuxon 3 GPU-n párhuzamosan fut.
   - Siker: az OA-átlag javul az 545-ön, a 208-on és a 242-n, a makró nem romlik. Ha teljesül: LB-próba a `cv545_v12` V2S-foldjainak cseréjével.
 
+### 19. A radiológus 2-es pontszáma címkeként: CV545 „soft2” (V2S + C0 s123, 2026-10-20/21): rosszabb, lezárva
+- **Felállás:** `LABEL_MODE=soft2` a `run_cv545.sh`-ban, a bemenetet a `notebooks/build_ref545_cv.py` állítja elő. A 0–4-es radiológusi skálán a 2-es („bizonytalan”) eddig mindkét oldalon maszkolt volt. Itt:
+  - **tanításban 0.5** soft cél (`train_v12_ref545_soft2_fold<k>.csv`);
+  - **validációban 0**, azaz negatív (`ref545_fold<k>_val_two0.csv`, `frozen_reference_ref545_two0_fold<k>`).
+  - Ez 100 cellát érint 85 studyban (a 101 maszkolt cellából 100-at). Validációs foldonként 35/35/30 cella, a 58 Kaggle-bináris studyban nincs 2-es. Célonként a legtöbb: Synovitis 20, Lateral Meniscus 14, Baker's 13, Effusion 10. Minden más cella azonos a `soft` változattal.
+  - **Új kizárás:** a `notebooks/train_exclude_studies.csv` studyjai kimaradnak a soft2 tanításból. Most egy darab: `…090102217` (new_95, erős fémműtermék). A fold 2-ben validál.
+  - A best.pt a two0-referencián választ. A `merge-oof --reference-csv notebooks/train_labeled_545_reference.csv` ugyanezeket a predikciókat az eredeti referencián is pontozza (`<group>_oof/origref/`). Itt a 2-es megint maszkolt, így a szám összevethető a `soft` runokkal.
+- **Runok:** `work/runs/train_v12/V2S_E3_img320_s123_cv545soft2_20261020_233254` (best ep 6/9/9) és `C0_E3_img320_s123_cv545soft2_20261021_042336` (best ep 10/7/12). Konfiguráció mint a 17. pontban, Linux, 3 GPU-n párhuzamosan, foldonként 1 GPU.
+- **Eredmény, makró ROC-AUC az eredeti referencián** (pooled OOF):
+
+  | | full_450 | original_208 | new_242 | new_95 | full_545 |
+  |---|---|---|---|---|---|
+  | V2S soft (17. pont) | **0.9310** | **0.9376** | **0.9250** | 0.8850 | **0.9208** |
+  | V2S soft2 | 0.9234 | 0.9300 | 0.9192 | 0.8925 | 0.9149 |
+  | C0 soft (17. pont) | **0.9286** | 0.9347 | **0.9241** | 0.8800 | **0.9181** |
+  | C0 soft2 | 0.9276 | **0.9379** | 0.9178 | 0.8849 | 0.9169 |
+  | V2S + C0 soft | **0.9374** | **0.9424** | **0.9339** | 0.8875 | **0.9267** |
+  | V2S + C0 soft2 | 0.9322 | 0.9401 | 0.9251 | 0.8971 | 0.9227 |
+
+  - Páros bootstrap (1000), soft2 − soft, full_450: V2S **−0.0075** [−0.0125, −0.0030]; C0 −0.0010 [−0.0074, +0.0053] (n.s.); **V2S + C0 −0.0052** [−0.0092, −0.0015]. A full_545-ön ugyanez: −0.0059 / −0.0012 / −0.0041.
+  - A two0-validáción (2-es = negatív) a soft2 még gyengébb: V2S 0.9114, C0 0.9135 (full_545).
+  - **Nem epochválasztási műtermék:** a V2S minden epoch-predikcióját az eredeti referencián pontozva a legjobb epoch foldonként ugyanaz, mint a two0-n választott. A soft2-görbe a fold 0-ban és a fold 1-ben már az 1–2. epochtól 0.005–0.01-gyel a soft alatt fut, a fold 2-ben szinte azonos.
+  - **A veszteség nem ott van, ahol a 2-esek.** A V2S legnagyobb esése az MCL-en (−0.027; csak 2 darab 2-es cella) és a Medial OA-n (−0.012). A sok 2-est tartalmazó targeteken alig változik: Synovitis −0.002, Baker's −0.001, Effusion −0.003. A V2S-veszteség egy része ezért seed-zaj lehet: azonos seed sem reprodukál, ~0.003, és a bootstrap ezt nem tartalmazza. Az irány viszont mindkét archnál és az ensemble-ben is ugyanaz.
+  - A new_95 mindkét archnál javul (+0.005–0.010), pedig a new_95-ben nincs 2-es cella. Ez 95 studyn ingadozásnak tekintendő.
+  - A soft és a soft2 modellek négyes átlaga a full_545-ön 0.9270, gyakorlatilag ugyanannyi, mint a V2S + C0 soft (0.9267).
+- **Döntés:** a 2-es pontszám maradjon maszkolt (`LABEL_MODE=soft`); a soft2 irány lezárva. A `train_exclude_studies.csv` csak a soft2-ben hatott, a `soft` táblák változatlanok.
+
 ### Mérési protokoll (minden lépésre)
 - 2026-10-15-től: elsődleges a **full_450** (holdout450, train_v11), mellette külön az original_208 és a new_242.
 - Korábban: elsődleges a new-100, mellette 208/158/58/Andrew50, OOF predikciókból, páros bootstrap, curve mean ep6–10.
@@ -1435,6 +1463,7 @@ Linuxon a két új CSV-t át kell másolni a DATA_ROOT-ba: `HOLDOUT=220 TRAIN_CS
 - **Beküldésre kész legjobb:** `holdout5_v8_cnt12` (LB 0.945). Minden v11-es összetétel lokálisan ez alatt van (~−0.002 a 208-on), és LB-n is (`holdout5_v11` 0.941).
 - **`cv545_v12` LB 0.945 (2026-10-20), holtverseny a H5_v8-cal.** A radiológus-címkés tanítás LB-n is működik: azonos archokkal a v11-es tanítás 0.941 volt.
 - **Előzmény (17. pont):** a radiológus-sorok a tanításban (CV545, train_v12) a 450-en a v11-es azonos seedhez képest V2S-sel +0.012-t, C0-val +0.010-t adnak. A CV545 V2S + C0 a 8 modelles v11-es átlagot is veri. A CNT12 kevesebbet nyer (+0.005), és az ensemble-hez alig ad hozzá. A CV545 3 arch a 208-on = H5_v8 (0.9434). A H5_v8 + CV545 V2S + C0 0.9452 (+0.0018, szignifikáns). LB-próba még nincs.
+- **CV545 soft2 (19. pont, 2026-10-21): lezárva.** A radiológus 2-es pontszáma címkeként (tanításban 0.5, validációban 0) a V2S-nél és a V2S + C0 ensemble-ben szignifikánsan rosszabb (full_450 −0.0075, illetve −0.0052), a C0-nál semleges. A 2-es maszkolt marad.
 - **Nyitott kérdések:**
   - **Részben megválaszolva (2026-10-20):** a `holdout5_v11` 0.941 → nem az összetétel (és nem a R50 hiánya), hanem a v11-es modellek. Az alábbi kérdésből a (b) kiesett, az (a) mellett a laterality-keret és a 208-on választott epoch maradt jelölt.
   - Mi okozza a H5 (0.945) és a két nem-v8-as beküldés közötti −0.004 LB-különbséget? A két beküldés: `holdout6_v11` 0.941 és `holdout4_v10_cnt12` 0.941. Mindkettő ugyanúgy V2S + C0 + CNT12, R50 nélkül, és mindkettő referencia-studykat vesztett a tanításból (v11: −242, v10: nettó −220). Két, egymást ki nem záró magyarázat van:
